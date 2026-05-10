@@ -1,0 +1,8 @@
+# Netscape HTTP Cookie File
+# Export your YouTube session cookies here using:
+# "Get cookies.txt LOCALLY" Chrome/Firefox extension
+# while logged into youtube.com
+#
+# Format: domain  flag  path  secure  expiry  name  value
+# Example line (replace with real cookies):
+# .youtube.com	TRUE	/	TRUE	1999999999	CONSENT	YES+cb

@@ -1,34 +1,34 @@
-# ── Base ──────────────────────────────────────────────────────────────────────
+# ── Stage: final image ────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
-# ── System packages: FFmpeg + curl ────────────────────────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
-
-# ── App directory ─────────────────────────────────────────────────────────────
 WORKDIR /app
 
-# ── Python dependencies ───────────────────────────────────────────────────────
-# Install pinned deps first (layer-cached), then force-upgrade yt-dlp to HEAD
-# so the latest YouTube bot-detection patches are always present at build time.
+# Install curl + Telegram local bot API server binary dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download the official Telegram Bot API server binary
+RUN curl -L https://github.com/tdlib/telegram-bot-api/releases/download/v7.3/telegram-bot-api-amd64-linux.zip \
+    -o /tmp/tgapi.zip \
+    && unzip /tmp/tgapi.zip -d /usr/local/bin/ \
+    && chmod +x /usr/local/bin/telegram-bot-api \
+    && rm /tmp/tgapi.zip
+
+# Python deps
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt \
- && pip install --no-cache-dir --upgrade yt-dlp
+RUN pip install --no-cache-dir -r requirements.txt
 
-# ── Application code ──────────────────────────────────────────────────────────
-COPY bot.py .
+# App source
+COPY . .
 
-# ── Optional: cookies file (Netscape format) ──────────────────────────────────
-# Uncomment the line below if you include cookies.txt in the build context.
-# COPY cookies.txt .
-
-# ── Temp downloads directory ──────────────────────────────────────────────────
-RUN mkdir -p /app/downloads
-
-# ── Health-check port ─────────────────────────────────────────────────────────
+# Health check port (for Render)
 EXPOSE 8080
 
-# ── Start bot ─────────────────────────────────────────────────────────────────
-CMD ["python", "-u", "bot.py"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Entrypoint starts local Bot API server then the Python bot
+CMD ["python", "main.py"]

@@ -1,569 +1,289 @@
-"""
-Advanced Telegram YouTube Downloader Bot
-python-telegram-bot v21 | yt-dlp | FFmpeg | Render deployment
-
-Bot-detection bypass layers:
-  1. cookies.txt  (Netscape – strongest, optional)
-  2. player_client chain: web → android_music → ios
-  3. Randomised User-Agent rotation
-  4. Extractor / fragment / file retries (10x)
-  5. sleep_interval to mimic human pacing
-"""
-
-import os, asyncio, time, logging, re, threading, random, urllib.request
+import os
+import re
+import logging
+import asyncio
+import tempfile
+import shutil
+import urllib.parse
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters,
-)
+import gdown
+import requests
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError, ExtractorError
 
-# ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-                    level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# ── Config ───────────────────────────────────────────────────────────────────
-BOT_TOKEN    = os.environ["BOT_TOKEN"]
-DOWNLOAD_DIR = Path("downloads")
-COOKIES_FILE = "cookies.txt"
-DOWNLOAD_DIR.mkdir(exist_ok=True)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+# Local Bot API server runs on port 8081 inside Docker
+LOCAL_API_URL = "http://localhost:8081/bot"
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+GDRIVE_PATTERNS = [
+    r"https://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)",
+    r"https://drive\.google\.com/open\?id=([a-zA-Z0-9_-]+)",
+    r"https://drive\.google\.com/uc\?id=([a-zA-Z0-9_-]+)",
+    r"https://docs\.google\.com/.*?/d/([a-zA-Z0-9_-]+)",
+    r"id=([a-zA-Z0-9_-]+)",
 ]
 
-DEFAULT_SETTINGS = {"quality": "720p", "mode": "manual", "cleanup_minutes": 10}
-user_settings:    dict[int, dict]  = {}
-cleanup_registry: dict[str, float] = {}
+FOLDER_PATTERNS = [
+    r"https://drive\.google\.com/drive/folders/([a-zA-Z0-9_-]+)",
+]
+
+# 2GB limit with local bot API server
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
 
 
-# ── yt-dlp base options with full bypass stack ───────────────────────────────
-def ydl_opts_base() -> dict:
-    opts = {
-        "quiet": True, "no_warnings": True, "noplaylist": True,
-        "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
-        # Retries
-        "retries": 10, "fragment_retries": 10,
-        "extractor_retries": 5, "file_access_retries": 5,
-        "socket_timeout": 30,
-        # Pacing
-        "sleep_interval_requests": 1,
-        "sleep_interval": 2,
-        "max_sleep_interval": 5,
-        # Spoofed headers
-        "http_headers": {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-        # Client fallback chain:
-        # web         → normal desktop path
-        # android_music → bypasses sign-in wall for most videos
-        # ios          → tertiary fallback
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["web", "android_music", "ios"],
-            }
-        },
+def extract_file_id(url):
+    for pattern in FOLDER_PATTERNS:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1), "folder"
+    for pattern in GDRIVE_PATTERNS:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1), "file"
+    return None, "unknown"
+
+
+def get_real_filename(file_id):
+    try:
+        url = f"https://drive.google.com/uc?id={file_id}&export=download"
+        resp = requests.head(url, allow_redirects=True, timeout=10)
+        cd = resp.headers.get("Content-Disposition", "")
+        m = re.search(r'filename\*?=["\']?(?:UTF-8\'\')?([^"\';\n]+)', cd, re.IGNORECASE)
+        if m:
+            name = urllib.parse.unquote(m.group(1).strip().strip('"\''))
+            if name:
+                return name
+        ct = resp.headers.get("Content-Type", "")
+        ext = content_type_to_ext(ct)
+        if ext:
+            return f"file{ext}"
+    except Exception as e:
+        logger.warning(f"Filename fetch failed: {e}")
+    return None
+
+
+def content_type_to_ext(ct):
+    ct = ct.split(";")[0].strip().lower()
+    return {
+        "application/pdf": ".pdf",
+        "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+        "video/mp4": ".mp4", "video/x-matroska": ".mkv", "video/quicktime": ".mov",
+        "video/x-msvideo": ".avi", "video/webm": ".webm",
+        "audio/mpeg": ".mp3", "audio/ogg": ".ogg", "audio/wav": ".wav", "audio/flac": ".flac",
+        "application/zip": ".zip", "application/x-rar-compressed": ".rar",
+        "application/x-7z-compressed": ".7z", "application/x-tar": ".tar", "application/gzip": ".gz",
+        "application/vnd.ms-excel": ".xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+        "application/msword": ".doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/vnd.ms-powerpoint": ".ppt",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+        "text/plain": ".txt", "text/csv": ".csv", "application/json": ".json", "text/html": ".html",
+    }.get(ct, "")
+
+
+def sniff_extension(filepath):
+    sigs = {
+        b"%PDF": ".pdf", b"\x89PNG": ".png", b"\xff\xd8\xff": ".jpg",
+        b"GIF8": ".gif", b"PK\x03\x04": ".zip", b"Rar!": ".rar",
+        b"\x1f\x8b": ".gz", b"ID3": ".mp3", b"fLaC": ".flac",
     }
-    if os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 200:
-        opts["cookiefile"] = COOKIES_FILE
-        logger.info("Using cookies.txt for YouTube auth")
-    else:
-        logger.debug("No cookies.txt – relying on client fallback chain")
-    return opts
+    try:
+        with open(filepath, "rb") as f:
+            h = f.read(8)
+        for magic, ext in sigs.items():
+            if h.startswith(magic):
+                return ext
+    except Exception:
+        pass
+    return ""
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-def get_settings(uid: int) -> dict:
-    if uid not in user_settings:
-        user_settings[uid] = DEFAULT_SETTINGS.copy()
-    return user_settings[uid]
+def human_size(b):
+    if b < 1024 * 1024:
+        return f"{b/1024:.1f} KB"
+    elif b < 1024 ** 3:
+        return f"{b/(1024**2):.1f} MB"
+    return f"{b/(1024**3):.2f} GB"
 
 
-def quality_to_format(q: str) -> str:
-    m = {
-        "360p":  "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]",
-        "480p":  "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]",
-        "720p":  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "1080p": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "best":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-    }
-    return m.get(q, m["720p"])
-
-
-def register_for_cleanup(path: str, minutes: int):
-    cleanup_registry[path] = 0.0 if minutes == 0 else time.time() + minutes * 60
-
-
-def is_youtube_url(text: str) -> bool:
-    return bool(re.match(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+", text.strip()))
-
-
-def friendly_error(e: Exception) -> str:
-    msg = str(e).lower()
-    if "sign in" in msg or "not a bot" in msg or "confirm" in msg:
-        return (
-            "🔒 *YouTube is blocking this download.*\n\n"
-            "The server needs fresh browser cookies to bypass this check.\n\n"
-            "*How to fix (admin):*\n"
-            "1. Install *'Get cookies.txt LOCALLY'* in Chrome/Firefox\n"
-            "2. Log into youtube.com\n"
-            "3. Export → save as `cookies.txt`\n"
-            "4. Place `cookies.txt` next to `bot.py` and redeploy\n\n"
-            "_This is a YouTube anti-bot measure, not a code bug._"
-        )
-    if "private" in msg:
-        return "🔒 This video is *private*."
-    if "unavailable" in msg or "not available" in msg:
-        return "❌ Video *unavailable* — may be region-blocked or removed."
-    if "age" in msg:
-        return "🔞 *Age-restricted.* Provide cookies from a verified account."
-    if "copyright" in msg or "blocked" in msg:
-        return "⛔ Blocked due to *copyright restrictions*."
-    if "404" in msg or "deleted" in msg:
-        return "🗑 Video *deleted* or does not exist."
-    if "ffmpeg" in msg:
-        return "⚙️ *FFmpeg error.* Try a lower quality or check FFmpeg install."
-    if "fragment" in msg:
-        return "🌐 *Network fragment error.* Please retry."
-    return f"❌ Download failed:\n`{str(e)[:350]}`"
-
-
-# ── Core yt-dlp async wrappers ───────────────────────────────────────────────
-async def extract_info(url: str, download: bool = False, extra_opts: dict | None = None) -> dict:
-    opts = ydl_opts_base()
-    if extra_opts:
-        opts.update(extra_opts)
-    loop = asyncio.get_event_loop()
-    def _run():
-        with YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=download)
-    return await loop.run_in_executor(None, _run)
-
-
-async def do_download(url: str, extra_opts: dict, progress_cb) -> dict:
-    opts = ydl_opts_base()
-    opts.update(extra_opts)
-    opts["progress_hooks"] = [progress_cb]
-    loop = asyncio.get_event_loop()
-    def _run():
-        with YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=True)
-    return await loop.run_in_executor(None, _run)
-
-
-def build_progress_hook(loop, status_msg, _chat_id, _bot):
-    last_edit = [0.0]
-    def hook(d):
-        if d["status"] != "downloading":
-            return
-        now = time.time()
-        if now - last_edit[0] < 3:
-            return
-        last_edit[0] = now
-        pct   = d.get("_percent_str",  "?%").strip()
-        speed = d.get("_speed_str",    "?").strip()
-        eta   = d.get("_eta_str",      "?").strip()
-        text  = f"⬇️ *Downloading…*\n`{pct}` | 🚀 `{speed}` | ⏱ ETA `{eta}`"
-        asyncio.run_coroutine_threadsafe(
-            status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN), loop)
-    return hook
-
-
-# ── Background cleanup ────────────────────────────────────────────────────────
-async def cleanup_worker():
-    while True:
-        await asyncio.sleep(60)
-        now = time.time()
-        for path in list(cleanup_registry):
-            t = cleanup_registry[path]
-            if t != 0.0 and t < now:
-                try:
-                    Path(path).unlink(missing_ok=True)
-                    del cleanup_registry[path]
-                    logger.info("Auto-deleted: %s", path)
-                except Exception as exc:
-                    logger.warning("Cleanup failed %s: %s", path, exc)
-
-
-# ── Health-check server (Render) ─────────────────────────────────────────────
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
-    def log_message(self, *_): pass
-
-def start_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info("Health server on :%d", port)
-    server.serve_forever()
-
-
-# ── Commands ─────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *Welcome to YT Downloader Bot!*\n\n"
-        "Send me:\n"
-        "• A *YouTube URL* → download video / audio / thumbnail\n"
-        "• A *song or video name* → search YouTube (top 5 results)\n\n"
-        "⚙️ /settings – Your preferences\n"
-        "❓ /help – This message",
+        "👋 *Google Drive Downloader Bot*\n\n"
+        "Send me any Google Drive link and I'll send the file directly to you!\n\n"
+        "✅ Supports files up to *2GB*\n"
+        "✅ Files, folders, docs, sheets\n"
+        "⚠️ File must be set to *'Anyone with the link'*",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await cmd_start(update, ctx)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *How to use:*\n\n"
+        "1. Open Google Drive → right-click file → Share\n"
+        "2. Set to *'Anyone with the link'*\n"
+        "3. Copy & paste the link here\n"
+        "4. Bot downloads and sends the file directly to you ✅",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
-# ── Settings ──────────────────────────────────────────────────────────────────
-def settings_keyboard(uid: int) -> InlineKeyboardMarkup:
-    s = get_settings(uid)
-    mode_lbl  = "Fixed ✅" if s["mode"] == "fixed" else "Manual 🎛"
-    timer_lbl = "♾ Never"  if s["cleanup_minutes"] == 0 else f"{s['cleanup_minutes']} min"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🎬 Default Quality: {s['quality'].upper()}", callback_data="s:quality")],
-        [InlineKeyboardButton(f"🔁 Download Mode: {mode_lbl}",               callback_data="s:mode")],
-        [InlineKeyboardButton(f"🧹 Cleanup Timer: {timer_lbl}",              callback_data="s:cleanup")],
-        [InlineKeyboardButton("❌ Close",                                     callback_data="s:close")],
-    ])
-
-async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    await update.message.reply_text("⚙️ *Your Settings*\nTap an option to change it:",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=settings_keyboard(uid))
-
-async def settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; uid = q.from_user.id; await q.answer()
-    parts = q.data.split(":")
-
-    if parts[1] == "close":
-        await q.message.delete(); return
-
-    if parts[1] == "back":
-        await q.message.edit_text("⚙️ *Your Settings*", parse_mode=ParseMode.MARKDOWN,
-            reply_markup=settings_keyboard(uid)); return
-
-    if parts[1] == "quality" and len(parts) == 2:
-        await q.message.edit_text("🎬 *Select Default Video Quality:*",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("360p", callback_data="s:set:quality:360p"),
-                 InlineKeyboardButton("480p", callback_data="s:set:quality:480p")],
-                [InlineKeyboardButton("720p", callback_data="s:set:quality:720p"),
-                 InlineKeyboardButton("1080p",callback_data="s:set:quality:1080p")],
-                [InlineKeyboardButton("⭐ Best Available", callback_data="s:set:quality:best")],
-                [InlineKeyboardButton("⬅️ Back",           callback_data="s:back")],
-            ])); return
-
-    if parts[1] == "mode" and len(parts) == 2:
-        await q.message.edit_text(
-            "🔁 *Download Mode:*\n\n"
-            "• *Fixed* – always use default quality, no menu shown\n"
-            "• *Manual* – choose quality each time",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Fixed Quality",    callback_data="s:set:mode:fixed")],
-                [InlineKeyboardButton("🎛 Manual Selection", callback_data="s:set:mode:manual")],
-                [InlineKeyboardButton("⬅️ Back",             callback_data="s:back")],
-            ])); return
-
-    if parts[1] == "cleanup" and len(parts) == 2:
-        await q.message.edit_text(
-            "🧹 *Auto-Cleanup Timer:*\nFiles are deleted after this delay.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("5 min",   callback_data="s:set:cleanup:5"),
-                 InlineKeyboardButton("10 min",  callback_data="s:set:cleanup:10")],
-                [InlineKeyboardButton("15 min",  callback_data="s:set:cleanup:15"),
-                 InlineKeyboardButton("30 min",  callback_data="s:set:cleanup:30")],
-                [InlineKeyboardButton("♾ Never", callback_data="s:set:cleanup:0")],
-                [InlineKeyboardButton("⬅️ Back",  callback_data="s:back")],
-            ])); return
-
-    if parts[1] == "set" and len(parts) == 4:
-        key, value = parts[2], parts[3]
-        s = get_settings(uid)
-        if key == "quality":           s["quality"] = value
-        elif key == "mode":            s["mode"] = value
-        elif key == "cleanup":         s["cleanup_minutes"] = int(value)
-        await q.message.edit_text("✅ *Setting saved!*", parse_mode=ParseMode.MARKDOWN,
-            reply_markup=settings_keyboard(uid))
-
-
-# ── Message handler ───────────────────────────────────────────────────────────
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    if is_youtube_url(text):
-        await handle_youtube_url(update, ctx, text)
-    else:
-        await handle_search(update, ctx, text)
 
+    if "drive.google.com" not in text and "docs.google.com" not in text:
+        await update.message.reply_text("❓ Please send a Google Drive link. Use /help for instructions.")
+        return
 
-async def handle_youtube_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
-    msg = await update.message.reply_text("🔍 Fetching video info…")
+    file_id, link_type = extract_file_id(text)
+    if not file_id:
+        await update.message.reply_text("❌ Couldn't extract file ID from that link.")
+        return
+
+    status_msg = await update.message.reply_text("⏳ Starting download...")
+    tmp_dir = tempfile.mkdtemp()
+
     try:
-        info = await extract_info(url)
-    except (DownloadError, ExtractorError) as e:
-        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
+        if link_type == "folder":
+            await handle_folder(update, file_id, tmp_dir, status_msg)
+        else:
+            await handle_file(update, file_id, tmp_dir, status_msg)
     except Exception as e:
-        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
+        logger.error(f"Error: {e}", exc_info=True)
+        await status_msg.edit_text(
+            f"❌ *Error:* {str(e)}\n\nMake sure the file is publicly shared.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    title    = info.get("title", "Unknown")
-    duration = info.get("duration", 0)
-    dur_str  = f"{duration // 60}m {duration % 60}s" if duration else "?"
-    ctx.user_data["url"] = url
-    ctx.user_data["info"] = info
 
-    await msg.edit_text(
-        f"📹 *{title}*\n⏱ `{dur_str}`\n\nWhat would you like?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎬 Video",     callback_data="dl:video")],
-            [InlineKeyboardButton("🎵 Audio MP3", callback_data="dl:audio")],
-            [InlineKeyboardButton("🖼 Thumbnail", callback_data="dl:thumb")],
-            [InlineKeyboardButton("❌ Cancel",    callback_data="dl:cancel")],
-        ]),
+async def handle_file(update, file_id, tmp_dir, status_msg):
+    await status_msg.edit_text("⬇️ Downloading from Google Drive...")
+    loop = asyncio.get_event_loop()
+
+    real_name = await loop.run_in_executor(None, lambda: get_real_filename(file_id))
+    url = f"https://drive.google.com/uc?id={file_id}&export=download"
+    downloaded = await loop.run_in_executor(
+        None, lambda: gdown.download(url, output=tmp_dir + "/", quiet=False, fuzzy=True)
     )
 
+    if not downloaded or not os.path.exists(downloaded):
+        raise Exception("Download failed. File may be private or link is invalid.")
 
-# ── Download callbacks ────────────────────────────────────────────────────────
-async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; uid = q.from_user.id; await q.answer()
-    parts = q.data.split(":")
-    action = parts[1]
+    fp = Path(downloaded)
+    is_generic = fp.name == file_id or fp.name == "downloaded_file" or "." not in fp.name
 
-    if action == "cancel":
-        await q.message.edit_text("❌ Download cancelled."); return
-    if action == "thumb":
-        await do_thumbnail(q, ctx, uid); return
-    if action == "audio":
-        await do_audio(q, ctx, uid); return
-    if action == "video":
-        s = get_settings(uid)
-        if s["mode"] == "fixed":
-            await do_video(q, ctx, uid, s["quality"])
-        else:
-            await show_quality_menu(q, ctx)
-        return
-    if action == "quality" and len(parts) == 3:
-        await do_video(q, ctx, uid, parts[2]); return
-    if action == "search" and len(parts) == 3:
-        results = ctx.user_data.get("search_results", [])
-        idx = int(parts[2])
-        if idx < len(results):
-            entry = results[idx]
-            ctx.user_data["url"]  = entry.get("webpage_url") or entry.get("url", "")
-            ctx.user_data["info"] = entry
-            await q.message.edit_text(
-                f"🎵 *{entry.get('title', '?')}*\n\nChoose download type:",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎬 Video",     callback_data="dl:video")],
-                    [InlineKeyboardButton("🎵 Audio MP3", callback_data="dl:audio")],
-                    [InlineKeyboardButton("🖼 Thumbnail", callback_data="dl:thumb")],
-                    [InlineKeyboardButton("❌ Cancel",    callback_data="dl:cancel")],
-                ]),
-            )
+    if is_generic and real_name:
+        new = fp.parent / real_name
+        fp.rename(new); fp = new
+    elif is_generic:
+        ext = sniff_extension(str(fp))
+        if ext:
+            new = fp.parent / f"file{ext}"
+            fp.rename(new); fp = new
+
+    file_size = fp.stat().st_size
+
+    if file_size > MAX_FILE_SIZE:
+        raise Exception(f"File is {human_size(file_size)} — exceeds 2GB limit.")
+
+    await send_file(update, status_msg, fp, loop)
 
 
-async def show_quality_menu(q, ctx):
-    info    = ctx.user_data.get("info", {})
-    formats = info.get("formats", [])
-    heights = sorted(set(
-        f["height"] for f in formats
-        if f.get("height") and f.get("vcodec") not in (None, "none")
-    ))
-    if not heights:
-        await do_video(q, ctx, q.from_user.id, "best"); return
+async def send_file(update, status_msg, fp, loop):
+    file_size = fp.stat().st_size
+    filename = fp.name
 
-    rows, row = [], []
-    for h in heights:
-        row.append(InlineKeyboardButton(f"{h}p", callback_data=f"dl:quality:{h}p"))
-        if len(row) == 3:
-            rows.append(row); row = []
-    if row: rows.append(row)
-    rows.append([InlineKeyboardButton("⭐ Best Available", callback_data="dl:quality:best")])
-    rows.append([InlineKeyboardButton("❌ Cancel",         callback_data="dl:cancel")])
-    await q.message.edit_text("🎬 *Select video quality:*",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
+    await status_msg.edit_text(
+        f"📤 Sending *{filename}* ({human_size(file_size)})...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # Use send_document with read_timeout & write_timeout for large files
+    with open(fp, "rb") as f:
+        await update.message.reply_document(
+            document=f,
+            filename=filename,
+            caption=f"✅ *{filename}*\n📦 {human_size(file_size)}",
+            parse_mode=ParseMode.MARKDOWN,
+            read_timeout=300,
+            write_timeout=300,
+            connect_timeout=60,
+        )
+
+    if status_msg:
+        await status_msg.delete()
 
 
-# ── Video download ────────────────────────────────────────────────────────────
-async def do_video(q, ctx, uid: int, quality: str):
-    url = ctx.user_data.get("url")
-    if not url:
-        await q.message.edit_text("❌ No URL stored. Please resend the link."); return
+async def handle_folder(update, folder_id, tmp_dir, status_msg):
+    url = f"https://drive.google.com/drive/folders/{folder_id}"
+    await status_msg.edit_text("⬇️ Fetching folder contents...")
 
-    status = await q.message.edit_text(f"⬇️ *Starting download ({quality})…*",
-        parse_mode=ParseMode.MARKDOWN)
+    folder_dir = os.path.join(tmp_dir, "folder")
+    os.makedirs(folder_dir, exist_ok=True)
     loop = asyncio.get_event_loop()
-    hook = build_progress_hook(loop, status, q.message.chat_id, ctx.bot)
-    try:
-        info = await do_download(url, {
-            "format": quality_to_format(quality),
-            "merge_output_format": "mp4",
-        }, hook)
-    except (DownloadError, ExtractorError) as e:
-        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
-    except Exception as e:
-        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
 
-    files = list(DOWNLOAD_DIR.glob(f"{info.get('id', '')}.*"))
-    if not files:
-        await status.edit_text("❌ File not found after download."); return
-    filepath = str(files[0])
-    await status.edit_text("📤 *Uploading to Telegram…*", parse_mode=ParseMode.MARKDOWN)
-    try:
-        with open(filepath, "rb") as f:
-            await ctx.bot.send_document(
-                chat_id=q.message.chat_id, document=f,
-                filename=Path(filepath).name,
-                caption=f"🎬 {info.get('title', '')} [{quality}]",
-            )
-        await status.delete()
-    except Exception as e:
-        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-    register_for_cleanup(filepath, get_settings(uid)["cleanup_minutes"])
+    await loop.run_in_executor(
+        None, lambda: gdown.download_folder(url, output=folder_dir, quiet=True, remaining_ok=True)
+    )
 
+    all_files = sorted(
+        [f for f in Path(folder_dir).rglob("*") if f.is_file()],
+        key=lambda f: f.name.lower()
+    )
 
-# ── Audio download ────────────────────────────────────────────────────────────
-async def do_audio(q, ctx, uid: int):
-    url = ctx.user_data.get("url")
-    if not url:
-        await q.message.edit_text("❌ No URL stored."); return
+    if not all_files:
+        raise Exception("No files found or folder is private.")
 
-    status = await q.message.edit_text("⬇️ *Extracting audio…*", parse_mode=ParseMode.MARKDOWN)
-    loop = asyncio.get_event_loop()
-    hook = build_progress_hook(loop, status, q.message.chat_id, ctx.bot)
-    try:
-        info = await do_download(url, {
-            "format": "bestaudio/best",
-            "postprocessors": [{"key": "FFmpegExtractAudio",
-                                "preferredcodec": "mp3",
-                                "preferredquality": "192"}],
-        }, hook)
-    except (DownloadError, ExtractorError) as e:
-        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
-    except Exception as e:
-        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
+    await status_msg.edit_text(f"📦 Found {len(all_files)} file(s). Sending one by one...")
 
-    vid_id = info.get("id", "")
-    files  = list(DOWNLOAD_DIR.glob(f"{vid_id}.mp3")) or list(DOWNLOAD_DIR.glob(f"{vid_id}.*"))
-    if not files:
-        await status.edit_text("❌ Audio file not found after download."); return
-    filepath = str(files[0])
-    await status.edit_text("📤 *Uploading MP3…*", parse_mode=ParseMode.MARKDOWN)
-    try:
-        with open(filepath, "rb") as f:
-            await ctx.bot.send_document(
-                chat_id=q.message.chat_id, document=f,
-                filename=f"{info.get('title', 'audio')}.mp3",
-                caption=f"🎵 {info.get('title', '')}",
-            )
-        await status.delete()
-    except Exception as e:
-        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-    register_for_cleanup(filepath, get_settings(uid)["cleanup_minutes"])
+    for i, fp in enumerate(all_files, 1):
+        name = fp.name
+        if "." not in name:
+            ext = sniff_extension(str(fp))
+            if ext:
+                new = fp.parent / (name + ext)
+                fp.rename(new); fp = new
+
+        size = fp.stat().st_size
+        await status_msg.edit_text(
+            f"📤 {i}/{len(all_files)}: *{fp.name}* ({human_size(size)})",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await send_file(update, None, fp, loop)
+
+    await status_msg.edit_text(f"✅ Done! Sent all {len(all_files)} file(s).")
 
 
-# ── Thumbnail download ────────────────────────────────────────────────────────
-async def do_thumbnail(q, ctx, uid: int):
-    info      = ctx.user_data.get("info", {})
-    thumb_url = info.get("thumbnail")
-    if not thumb_url:
-        await q.message.edit_text("❌ No thumbnail found."); return
-
-    status  = await q.message.edit_text("🖼 *Downloading thumbnail…*", parse_mode=ParseMode.MARKDOWN)
-    outpath = DOWNLOAD_DIR / f"{info.get('id', 'thumb')}_thumb.jpg"
-    try:
-        urllib.request.urlretrieve(thumb_url, outpath)
-    except Exception as e:
-        await status.edit_text(f"❌ Thumbnail fetch failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-    try:
-        with open(outpath, "rb") as f:
-            await ctx.bot.send_document(
-                chat_id=q.message.chat_id, document=f,
-                filename=f"{info.get('title', 'thumbnail')}.jpg",
-                caption=f"🖼 {info.get('title', '')}",
-            )
-        await status.delete()
-    except Exception as e:
-        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-    register_for_cleanup(str(outpath), get_settings(uid)["cleanup_minutes"])
-
-
-# ── Search ────────────────────────────────────────────────────────────────────
-async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
-    msg = await update.message.reply_text(f"🔎 Searching for: *{query}*…",
-        parse_mode=ParseMode.MARKDOWN)
-    try:
-        results_info = await extract_info(f"ytsearch5:{query}", download=False,
-            extra_opts={"extract_flat": True})
-    except Exception as e:
-        await msg.edit_text(f"❌ Search failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-
-    entries = results_info.get("entries", [])
-    if not entries:
-        await msg.edit_text("😕 No results found."); return
-
-    ctx.user_data["search_results"] = entries
-    buttons = []
-    for i, entry in enumerate(entries[:5]):
-        title   = entry.get("title", "Unknown")[:52]
-        dur     = entry.get("duration", 0)
-        dur_str = f"{dur // 60}:{dur % 60:02d}" if dur else "?"
-        buttons.append([InlineKeyboardButton(
-            f"{i+1}. {title} [{dur_str}]", callback_data=f"dl:search:{i}")])
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")])
-    await msg.edit_text("🎵 *Top results — tap to select:*",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
-
-
-# ── Error handler ─────────────────────────────────────────────────────────────
-async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
-    logger.error("Unhandled exception:", exc_info=ctx.error)
-    if isinstance(update, Update) and update.message:
-        await update.message.reply_text("⚠️ An unexpected error occurred. Please try again.")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    threading.Thread(target=start_health_server, daemon=True).start()
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN environment variable not set!")
 
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("help",     cmd_help))
-    app.add_handler(CommandHandler("settings", cmd_settings))
-    app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^s:"))
-    app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:"))
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .base_url(LOCAL_API_URL)          # Use local bot API server
+        .base_file_url("http://localhost:8081/file/bot")
+        .local_mode(True)                 # Enables large file support
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error_handler)
 
-    async def post_init(application: Application):
-        await application.bot.set_my_commands([
-            BotCommand("start",    "Welcome message"),
-            BotCommand("help",     "Help & usage"),
-            BotCommand("settings", "Manage preferences"),
-        ])
-        asyncio.create_task(cleanup_worker())
-
-    app.post_init = post_init
-    logger.info("Bot started — polling for updates")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot started with local API server (2GB limit).")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

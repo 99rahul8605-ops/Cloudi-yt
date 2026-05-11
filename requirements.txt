@@ -1,3 +1,2 @@
 python-telegram-bot==21.3
 yt-dlp>=2024.8.6
-aiohttp>=3.9.5

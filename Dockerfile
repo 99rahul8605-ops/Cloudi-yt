@@ -1,7 +1,7 @@
-# ── Base image ────────────────────────────────────────────────────────────────
+# ── Base ──────────────────────────────────────────────────────────────────────
 FROM python:3.11-slim
 
-# ── System dependencies (FFmpeg + curl for health checks) ────────────────────
+# ── System packages: FFmpeg + curl ────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         curl \
@@ -11,20 +11,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # ── Python dependencies ───────────────────────────────────────────────────────
+# Install pinned deps first (layer-cached), then force-upgrade yt-dlp to HEAD
+# so the latest YouTube bot-detection patches are always present at build time.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+ && pip install --no-cache-dir --upgrade yt-dlp
 
 # ── Application code ──────────────────────────────────────────────────────────
 COPY bot.py .
 
-# Optional: copy cookies file if present (Netscape format)
+# ── Optional: cookies file (Netscape format) ──────────────────────────────────
+# Uncomment the line below if you include cookies.txt in the build context.
 # COPY cookies.txt .
 
-# ── Downloads directory ───────────────────────────────────────────────────────
+# ── Temp downloads directory ──────────────────────────────────────────────────
 RUN mkdir -p /app/downloads
 
-# ── Expose health-check port ──────────────────────────────────────────────────
+# ── Health-check port ─────────────────────────────────────────────────────────
 EXPOSE 8080
 
-# ── Entrypoint ────────────────────────────────────────────────────────────────
-CMD ["python", "bot.py"]
+# ── Start bot ─────────────────────────────────────────────────────────────────
+CMD ["python", "-u", "bot.py"]

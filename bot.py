@@ -781,19 +781,24 @@ async def show_quality_menu(q, ctx):
     info    = ctx.user_data.get("info", {})
     formats = info.get("formats", [])
 
-    # Guard: height must be a real positive int; filter out None / 0 / "none"
-    heights = sorted(set(
+    # Heights actually reported by yt-dlp for this video
+    actual_heights = set(
         int(f["height"]) for f in formats
         if f.get("height")
         and isinstance(f["height"], (int, float))
         and int(f["height"]) > 0
         and f.get("vcodec") not in (None, "none")
-    ))
+    )
 
-    # Common standard heights to offer even if yt-dlp returned none
-    # (happens when using tv_embedded / android_music clients)
-    if not heights:
-        heights = [360, 480, 720, 1080, 1440, 2160]
+    # Always show standard options regardless of what yt-dlp reports.
+    # tv_embedded/mweb clients often return only 360p in the manifest,
+    # but yt-dlp can still fetch higher streams at download time.
+    # pick_best_formats already handles graceful fallback if a height
+    # isn't truly available — it picks the closest one below.
+    STANDARD = {360, 480, 720, 1080, 1440, 2160}
+
+    # Merge actual + standard so we never show fewer than 6 options
+    heights = sorted(actual_heights | STANDARD)
 
     rows, row = [], []
     for h in heights:

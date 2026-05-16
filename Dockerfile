@@ -1,39 +1,30 @@
-FROM python:3.13
+FROM node:20-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies: ffmpeg, yt-dlp, python3 (yt-dlp needs it)
 RUN apt-get update && apt-get install -y \
     curl \
     ffmpeg \
-    git \
-    unzip \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install deno (JS runtime for yt-dlp EJS challenge solver)
-RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+# Install latest yt-dlp binary directly (faster and always up-to-date)
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+    -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Node dependencies
+COPY package*.json ./
+RUN npm ci --omit=dev
 
-# Always upgrade yt-dlp to the absolute latest at build time.
-# YouTube extractor patches ship WEEKLY — stale yt-dlp = bot detection fails.
-RUN pip install --no-cache-dir --upgrade yt-dlp
+# Copy app
+COPY bot.js .
 
-# Copy application code
-COPY . .
-
-# Ensure downloads directory exists
+# Downloads directory
 RUN mkdir -p /app/downloads
 
-# Expose port (Health server runs on port 8080)
 EXPOSE 8080
 
-# Environment variables
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
+ENV NODE_ENV=production
 
-# Default command
-CMD ["python3", "bot.py"]
+CMD ["node", "bot.js"]

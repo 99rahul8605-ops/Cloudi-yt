@@ -487,7 +487,11 @@ async def settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def get_all_heights(url: str) -> list[int]:
-    """Fetch all available video heights using the 'web' client (not limited by tv_embedded)."""
+    """
+    Fetch all available video heights using the 'web' client.
+    Filters out audio-only formats (vcodec == 'none').
+    Returns sorted list of unique heights, e.g., [360, 480, 720, 1080].
+    """
     opts = ydl_opts_base(use_cookies=True)
     # Override client chain to only 'web' – this returns all formats
     opts["extractor_args"] = {
@@ -496,23 +500,34 @@ async def get_all_heights(url: str) -> list[int]:
             "player_skip": ["webpage", "configs"],
         }
     }
-    # Do NOT use extract_flat – we need the full formats list
     opts["extract_flat"] = False
     opts["quiet"] = True
     try:
         info = await extract_info(url, extra_opts=opts)
         heights = set()
         for f in info.get("formats", []):
+            # Skip audio-only formats
+            vcodec = f.get("vcodec", "")
+            if vcodec == "none" or not vcodec:
+                continue
             h = f.get("height")
             if not h and f.get("resolution"):
                 res = f.get("resolution")
                 if "x" in res:
-                    h = int(res.split("x")[1])
+                    try:
+                        h = int(res.split("x")[1])
+                    except ValueError:
+                        pass
             if h and isinstance(h, int) and h > 0:
                 heights.add(h)
         if not heights:
+            # Fallback to common heights if none found
             return [360, 480, 720, 1080]
-        return sorted(heights)
+        # Filter to show at least 360p and above (but keep lower if that's all there is)
+        # However we want to show 480p,720p,1080p if available.
+        result = sorted(heights)
+        logger.info(f"Detected video heights: {result}")
+        return result
     except Exception as e:
         logger.error(f"Failed to get full heights: {e}")
         return [360, 480, 720, 1080]  # safe fallback
@@ -627,14 +642,20 @@ async def show_quality_menu(q, ctx):
         await q.message.edit_text("❌ No URL found. Please send the link again.")
         return
 
-    # Always fetch fresh heights using web client (reliable)
+    # Fetch all real video heights (filtered, no audio-only)
     heights = await get_all_heights(url)
     # Remove duplicates and sort
     heights = sorted(set(heights))
 
+    # Optional: filter to only show heights >= 360, but if none, show all
+    filtered_heights = [h for h in heights if h >= 360]
+    if not filtered_heights:
+        filtered_heights = heights  # fallback
+
+    # Build buttons
     rows = []
     row = []
-    for h in heights:
+    for h in filtered_heights:
         row.append(InlineKeyboardButton(f"{h}p", callback_data=f"dl:quality:{h}p"))
         if len(row) == 3:
             rows.append(row)

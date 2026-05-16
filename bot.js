@@ -12,11 +12,15 @@ const execPromise = util.promisify(exec);
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN env var');
 
+// Custom Bot API server (set this to your local server URL, e.g., http://localhost:8081)
+// If not set, defaults to public Telegram API (50MB limit)
+const LOCAL_BOT_API_URL = process.env.LOCAL_BOT_API_URL || 'https://api.telegram.org';
+
 const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 const COOKIE_PATH = '/app/cookies.txt';
 fs.ensureDirSync(DOWNLOAD_DIR);
 
-const YTDLP_TIMEOUT = 120000; // 2 minutes for large videos
+const YTDLP_TIMEOUT = 120000; // 2 minutes
 
 // User settings
 const userSettings = new Map();
@@ -26,7 +30,7 @@ const BOT_START_TIME = Date.now();
 
 // ---------- Pending downloads (with TTL) ----------
 const pendingDownloads = new Map();
-const PENDING_TTL = 10 * 60 * 1000; // 10 minutes
+const PENDING_TTL = 10 * 60 * 1000;
 setInterval(() => {
   const now = Date.now();
   for (const [chatId, entries] of pendingDownloads.entries()) {
@@ -71,7 +75,7 @@ async function getCookieArg() {
   return (await cookieExists()) ? `--cookies "${COOKIE_PATH}"` : '';
 }
 
-// ---------- yt-dlp wrapper with all optimizations ----------
+// ---------- yt-dlp wrapper with optimizations ----------
 async function runYtdlp(args, timeout = YTDLP_TIMEOUT) {
   const cookieArg = await getCookieArg();
   const opts = [
@@ -81,7 +85,7 @@ async function runYtdlp(args, timeout = YTDLP_TIMEOUT) {
     '--remote-components ejs:github',
   ].join(' ');
   const fullArgs = `${cookieArg} ${opts} ${args}`;
-  console.log(`[yt-dlp] ${fullArgs.substring(0, 150)}...`);
+  console.log(`[yt-dlp] Running: ${fullArgs.substring(0, 200)}...`);
   try {
     const { stdout, stderr } = await execPromise(`yt-dlp ${fullArgs}`, { timeout });
     if (stderr && !stderr.includes('WARNING') && !stderr.includes('[youtube]')) {
@@ -96,16 +100,19 @@ async function runYtdlp(args, timeout = YTDLP_TIMEOUT) {
   }
 }
 
-// ---------- Core functions ----------
+// ---------- Get all available video heights (including video-only) ----------
 async function getAvailableQualities(url) {
   try {
-    const stdout = await runYtdlp(`-J --flat-playlist "${url}"`);
+    const stdout = await runYtdlp(`-J "${url}"`);
     const data = JSON.parse(stdout);
     const heights = new Set();
     for (const f of data.formats || []) {
-      if (f.height && f.vcodec !== 'none') heights.add(f.height);
+      if (f.height && f.vcodec && f.vcodec !== 'none') {
+        heights.add(f.height);
+      }
     }
     const sorted = Array.from(heights).sort((a, b) => a - b);
+    console.log(`Available qualities: ${sorted.join(', ')}`);
     return sorted.length ? sorted : [360, 480, 720, 1080];
   } catch (err) {
     console.error('getAvailableQualities error:', err.message);
@@ -113,6 +120,7 @@ async function getAvailableQualities(url) {
   }
 }
 
+// ---------- Download video (separate video+audio, then merge) ----------
 async function downloadVideo(url, quality) {
   const infoJson = await runYtdlp(`-J "${url}"`);
   const info = JSON.parse(infoJson);
@@ -120,16 +128,18 @@ async function downloadVideo(url, quality) {
   const videoId = info.id;
   const outputPath = path.join(DOWNLOAD_DIR, `${videoId}.mp4`);
 
-  let formatSpec = '';
+  let formatArg = '';
   if (quality !== 'best') {
     const target = parseInt(quality);
     if (!isNaN(target)) {
-      formatSpec = `-f "bestvideo[height<=${target}]+bestaudio/best[height<=${target}]"`;
+      formatArg = `-f 'bestvideo[height<=${target}]+bestaudio/best[height<=${target}]'`;
     }
   } else {
-    formatSpec = '-f "bestvideo+bestaudio/best"';
+    formatArg = `-f 'bestvideo+bestaudio/best'`;
   }
-  await runYtdlp(`${formatSpec} -o "${outputPath}" --merge-output-format mp4 "${url}"`);
+  const cmd = `${formatArg} -o "${outputPath}" --merge-output-format mp4 --verbose "${url}"`;
+  console.log(`Download command: yt-dlp ${cmd}`);
+  await runYtdlp(cmd);
   return { outputPath, title, videoId, info };
 }
 
@@ -218,8 +228,13 @@ function formatUptime(ms) {
   return parts.join(' ');
 }
 
-// ---------- Telegram bot ----------
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// ---------- Telegram bot with custom API server ----------
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: true,
+  apiRoot: LOCAL_BOT_API_URL   // <-- use local server for 2GB uploads
+});
+
+console.log(`Bot using API root: ${LOCAL_BOT_API_URL}`);
 
 // ---------- Inline keyboards ----------
 function settingsKeyboard(userId) {
@@ -255,12 +270,39 @@ function qualityKeyboard(qualities) {
 // ---------- Command handlers ----------
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id,
-    `👋 *Welcome to YT Downloader Bot (Optimized)*\n\n` +
+    `👋 *Welcome to YT Downloader Bot (2GB Upload Ready)*\n\n` +
     `Send me a YouTube URL.\n` +
     `⚙️ /settings – Preferences\n` +
-    `📊 /stats – Bot statistics`,
+    `📊 /stats – Bot statistics\n` +
+    `🔍 /formats <url> – Debug available qualities`,
     { parse_mode: 'Markdown' }
   );
+});
+
+// Debug command to list all available formats
+bot.onText(/\/formats (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const url = match[1];
+  const processing = await bot.sendMessage(chatId, '🔍 Fetching formats...');
+  try {
+    const stdout = await runYtdlp(`-J "${url}"`);
+    const data = JSON.parse(stdout);
+    const formats = data.formats || [];
+    const lines = [];
+    for (const f of formats) {
+      if (f.height && f.vcodec !== 'none') {
+        lines.push(`${f.height}p (${f.ext}, vcodec: ${f.vcodec.split('.')[0]}, acodec: ${f.acodec || 'none'})`);
+      }
+    }
+    if (lines.length === 0) {
+      await bot.editMessageText('❌ No video formats found.', { chat_id: chatId, message_id: processing.message_id, parse_mode: 'Markdown' });
+    } else {
+      const text = `📺 *Available video heights:*\n${lines.join('\n')}`;
+      await bot.editMessageText(text, { chat_id: chatId, message_id: processing.message_id, parse_mode: 'Markdown' });
+    }
+  } catch (err) {
+    await bot.editMessageText(`❌ Error: \`${err.message}\``, { chat_id: chatId, message_id: processing.message_id, parse_mode: 'Markdown' });
+  }
 });
 
 bot.onText(/\/stats/, async (msg) => {
@@ -282,6 +324,7 @@ bot.onText(/\/stats/, async (msg) => {
       `🔧 *yt-dlp version*: \`${ytVersion}\`\n` +
       `🍪 *Cookies*: ${cookiePresent ? '✅ Present' : '❌ Missing'}\n` +
       `🚀 *Optimizations*: concurrent fragments=50, geo-bypass, deno runtime\n` +
+      `📤 *Upload limit*: ${LOCAL_BOT_API_URL !== 'https://api.telegram.org' ? '2GB (custom API server)' : '50MB (public API)'}\n` +
       `⏱ *Uptime*: ${uptime}\n` +
       `👥 *Active users*: ${activeUsers}\n` +
       `💻 *Node.js*: ${nodeVersion}\n` +
@@ -301,14 +344,14 @@ bot.onText(/\/settings/, async (msg) => {
   });
 });
 
-// ---------- Callback queries (fixed: answer immediately, then work) ----------
+// ---------- Callback queries (answer immediately, then work) ----------
 bot.on('callback_query', async (callbackQuery) => {
   const chatId = callbackQuery.message.chat.id;
   const messageId = callbackQuery.message.message_id;
   const userId = callbackQuery.from.id;
   const data = callbackQuery.data;
 
-  // Always answer the callback query first to avoid "query is too old" error
+  // Always answer first
   await bot.answerCallbackQuery(callbackQuery.id);
 
   function removePendingEntry() {
@@ -319,15 +362,13 @@ bot.on('callback_query', async (callbackQuery) => {
     }
   }
 
-  // Helper to edit messages safely (catch errors)
   async function safeEdit(text, replyMarkup = null) {
     try {
       const options = { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' };
       if (replyMarkup) options.reply_markup = replyMarkup;
       await bot.editMessageText(text, options);
     } catch (err) {
-      // If the message no longer exists, just log it
-      console.log(`Edit error: ${err.message}`);
+      console.log(`Edit error (ignored): ${err.message}`);
     }
   }
 
@@ -423,7 +464,6 @@ bot.on('callback_query', async (callbackQuery) => {
       const statusMsg = await bot.sendMessage(chatId, `⬇️ *Downloading (${s.quality})…*`, { parse_mode: 'Markdown' });
       await startVideoDownload(chatId, userId, url, s.quality, statusMsg.message_id);
     } else {
-      // Manual mode – show quality menu (keep pending entry)
       const heights = await getAvailableQualities(url);
       await safeEdit('🎬 *Select video quality:*', qualityKeyboard(heights));
     }
@@ -577,4 +617,4 @@ bot.on('message', async (msg) => {
 
 // ---------- Start cleanup worker and bot ----------
 cleanupWorker();
-console.log('✅ Bot started with fixed callback handling and format selection');
+console.log('✅ Bot started with custom Bot API server (2GB upload support)');

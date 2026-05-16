@@ -1,30 +1,33 @@
-FROM node:20-slim
+FROM debian:bullseye-slim
 
-WORKDIR /app
-
-# Install system dependencies: ffmpeg, yt-dlp, python3 (yt-dlp needs it)
+# Install system dependencies: Deno, yt-dlp, ffmpeg, Python (for yt-dlp), curl
 RUN apt-get update && apt-get install -y \
     curl \
     ffmpeg \
     python3 \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install latest yt-dlp binary directly (faster and always up-to-date)
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-    -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp
+# Install Deno
+RUN curl -fsSL https://deno.land/x/install/install.sh | sh
+ENV DENO_INSTALL="/root/.deno"
+ENV PATH="${DENO_INSTALL}/bin:${PATH}"
 
-# Install Node dependencies
-COPY package*.json ./
-RUN npm install --omit=dev
+# Install yt-dlp via pip (or direct binary)
+RUN pip3 install yt-dlp
 
-# Copy app
-COPY bot.js .
+WORKDIR /app
 
-# Downloads directory
-RUN mkdir -p /app/downloads
+# Copy bot source
+COPY bot.ts .
+
+# Pre-cache Deno dependencies
+RUN deno cache bot.ts --reload
+
+# Create downloads directory
+RUN mkdir -p downloads
 
 EXPOSE 8080
 
-ENV NODE_ENV=production
-
-CMD ["node", "bot.js"]
+# Run the bot
+CMD ["deno", "run", "--allow-net", "--allow-read", "--allow-write", "--allow-env", "--allow-run", "bot.ts"]

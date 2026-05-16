@@ -229,7 +229,8 @@ def pick_best_formats(formats: list, quality: str) -> tuple[str, str]:
 
     Returns ("none", "none") only when the format list is completely empty.
     """
-    target_h = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080}.get(quality)
+    target_h = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080,
+                "1440p": 1440, "2160p": 2160, "4k": 2160}.get(quality)
 
     # ── Bucket formats ────────────────────────────────────────────────────
     video_only, audio_only, muxed = [], [], []
@@ -653,6 +654,8 @@ async def settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("480p",  callback_data="s:set:quality:480p")],
                 [InlineKeyboardButton("720p",  callback_data="s:set:quality:720p"),
                  InlineKeyboardButton("1080p", callback_data="s:set:quality:1080p")],
+                [InlineKeyboardButton("🟣 1440p (2K)", callback_data="s:set:quality:1440p"),
+                 InlineKeyboardButton("🔵 2160p (4K)", callback_data="s:set:quality:2160p")],
                 [InlineKeyboardButton("⭐ Best Available", callback_data="s:set:quality:best")],
                 [InlineKeyboardButton("⬅️ Back",           callback_data="s:back")],
             ])); return
@@ -790,11 +793,12 @@ async def show_quality_menu(q, ctx):
     # Common standard heights to offer even if yt-dlp returned none
     # (happens when using tv_embedded / android_music clients)
     if not heights:
-        heights = [360, 480, 720, 1080]
+        heights = [360, 480, 720, 1080, 1440, 2160]
 
     rows, row = [], []
     for h in heights:
-        row.append(InlineKeyboardButton(f"{h}p", callback_data=f"dl:quality:{h}p"))
+        label = f"🔵 4K ({h}p)" if h == 2160 else (f"🟣 2K ({h}p)" if h == 1440 else f"{h}p")
+        row.append(InlineKeyboardButton(label, callback_data=f"dl:quality:{h}p"))
         if len(row) == 3:
             rows.append(row); row = []
     if row:
@@ -855,7 +859,9 @@ async def send_file(
     """
     file_size = os.path.getsize(filepath)
     size_mb   = file_size / (1024 * 1024)
-    use_pyro  = file_size > LARGE_FILE_THRESHOLD
+    # Use Pyrogram for ALL video uploads when available (no 50 MB cap, faster)
+    # For audio/docs: Pyrogram only when >50 MB
+    use_pyro  = (pyro_client is not None) and (is_video or file_size > LARGE_FILE_THRESHOLD)
 
     logger.info("Uploading %s (%.1f MB) via %s",
                 filename, size_mb, "Pyrogram MTProto" if use_pyro else "Bot API")
@@ -870,7 +876,12 @@ async def send_file(
             raise RuntimeError(
                 "File is {:.0f} MB but TG_API_ID / TG_API_HASH are not set.\n\n"
                 "Get them from https://my.telegram.org/apps and add them as "
-                "environment variables.".format(size_mb)
+                "environment variables.\n\n"
+                "📝 *Steps:*\n"
+                "1. Go to https://my.telegram.org/apps\n"
+                "2. Create an app → copy API ID and API Hash\n"
+                "3. Add `TG_API_ID` and `TG_API_HASH` as environment variables\n"
+                "4. Redeploy the bot".format(size_mb)
             )
 
         # ── Pyrogram upload with live progress ────────────────────────────

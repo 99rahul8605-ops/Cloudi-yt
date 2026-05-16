@@ -663,6 +663,52 @@ async def handle_youtube_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url
 #  DOWNLOAD CALLBACKS
 # ═════════════════════════════════════════════════════════════════════════════
 
+# ── New helper to fetch full heights using web client ────────────────────────
+async def get_full_heights(url: str) -> list[int]:
+    """Extract all video heights using the web client (which returns all formats)."""
+    opts = ydl_opts_base(use_cookies=True)
+    # Override client chain to only web for format discovery
+    opts["extractor_args"] = {
+        "youtube": {
+            "player_client": ["web"],
+            "player_skip":   ["webpage", "configs"],
+        }
+    }
+    opts["extract_flat"] = True
+    try:
+        info = await extract_info(url, extra_opts=opts)
+        heights = set()
+        for f in info.get("formats", []):
+            h = f.get("height")
+            if not h and f.get("resolution"):
+                res = f.get("resolution")
+                if "x" in res:
+                    h = int(res.split("x")[1])
+            if h and isinstance(h, int) and h > 0:
+                heights.add(h)
+        return sorted(heights)
+    except Exception as e:
+        logger.warning("Failed to fetch full heights: %s", e)
+        return [360, 480, 720, 1080]   # fallback
+
+
+# ── Thumbnail helper ──────────────────────────────────────────────────────────
+def get_thumbnail_path(video_id: str, info: dict, out_dir: Path) -> str:
+    """Download best available thumbnail and return local path."""
+    # Prefer maxresdefault, fallback to hqdefault, then standard
+    thumb_url = info.get("thumbnail")
+    if not thumb_url:
+        thumb_url = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+    out_path = out_dir / f"{video_id}_thumb.jpg"
+    try:
+        urllib.request.urlretrieve(thumb_url, out_path)
+    except Exception:
+        # Try lower quality thumbnail
+        thumb_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+        urllib.request.urlretrieve(thumb_url, out_path)
+    return str(out_path)
+
+
 async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; uid = q.from_user.id; await q.answer()
     parts = q.data.split(":")
@@ -703,20 +749,17 @@ async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_quality_menu(q, ctx):
-    info    = ctx.user_data.get("info", {})
-    formats = info.get("formats", [])
-
-    # Guard: height must be a real positive int; filter out None / 0 / "none"
+    url = ctx.user_data.get("url")
+    info = ctx.user_data.get("info", {})
+    # Try to get heights from current info (which may be limited due to client chain)
     heights = sorted(set(
-        int(f["height"]) for f in formats
-        if f.get("height")
-        and isinstance(f["height"], (int, float))
-        and int(f["height"]) > 0
-        and f.get("vcodec") not in (None, "none")
+        int(f["height"]) for f in info.get("formats", [])
+        if f.get("height") and isinstance(f["height"], (int, float)) and int(f["height"]) > 0
     ))
-
-    # Common standard heights to offer even if yt-dlp returned none
-    # (happens when using tv_embedded / android_music clients)
+    # If only 360p or empty, fetch full heights using web client
+    if len(heights) <= 1 or (len(heights) == 1 and heights[0] == 360):
+        heights = await get_full_heights(url)
+    # Ensure at least common heights if still empty
     if not heights:
         heights = [360, 480, 720, 1080]
 
@@ -733,7 +776,7 @@ async def show_quality_menu(q, ctx):
         parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
 
 
-# ─── Video ────────────────────────────────────────────────────────────────────
+# ─── Video (send_video + thumbnail) ───────────────────────────────────────────
 async def do_video(q, ctx, uid: int, quality: str):
     url = ctx.user_data.get("url")
     if not url:
@@ -776,7 +819,7 @@ async def do_video(q, ctx, uid: int, quality: str):
     except Exception as e:
         await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
 
-    # Find the downloaded file — look for mp4 first, then any extension
+    # Find the downloaded file
     vid_id = info.get("id", "")
     files  = (
         list(DOWNLOAD_DIR.glob(f"{vid_id}.mp4"))
@@ -787,20 +830,42 @@ async def do_video(q, ctx, uid: int, quality: str):
     if not files:
         await status.edit_text("❌ File not found after download."); return
 
-    filepath = str(files[0])
-    ext      = Path(filepath).suffix.lstrip(".")
-    await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
+    video_path = str(files[0])
+    ext = Path(video_path).suffix.lstrip(".")
+
+    # Download thumbnail
+    thumb_path = get_thumbnail_path(vid_id, info, DOWNLOAD_DIR)
+
+    await status.edit_text("📤 *Uploading video…*", parse_mode=ParseMode.MARKDOWN)
     try:
-        with open(filepath, "rb") as f:
-            await ctx.bot.send_document(
-                chat_id=q.message.chat_id, document=f,
-                filename=f"{info.get('title', vid_id)}.{ext}",
-                caption=f"🎬 {info.get('title', '')} [{quality}]",
+        with open(video_path, "rb") as vf, open(thumb_path, "rb") as tf:
+            await ctx.bot.send_video(
+                chat_id=q.message.chat_id,
+                video=vf,
+                thumbnail=tf,
+                caption=f"🎬 {info.get('title', '')}\n[{quality}]",
+                supports_streaming=True,
             )
         await status.delete()
     except Exception as e:
-        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-    register_for_cleanup(filepath, get_settings(uid)["cleanup_minutes"])
+        # Fallback to send_document if send_video fails
+        logger.warning("send_video failed, falling back to document: %s", e)
+        await status.edit_text(
+            f"⚠️ *Video upload failed, sending as file:*\n`{e}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        with open(video_path, "rb") as f:
+            await ctx.bot.send_document(
+                chat_id=q.message.chat_id,
+                document=f,
+                filename=f"{info.get('title', vid_id)}.{ext}",
+                caption=f"🎬 {info.get('title', '')}\n[{quality}]",
+            )
+        await status.delete()
+    finally:
+        # Schedule cleanup
+        register_for_cleanup(video_path, get_settings(uid)["cleanup_minutes"])
+        register_for_cleanup(thumb_path, get_settings(uid)["cleanup_minutes"])
 
 
 # ─── Audio ────────────────────────────────────────────────────────────────────

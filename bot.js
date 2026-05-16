@@ -16,7 +16,7 @@ const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 const COOKIE_PATH = '/app/cookies.txt';
 fs.ensureDirSync(DOWNLOAD_DIR);
 
-const YTDLP_TIMEOUT = 60000;
+const YTDLP_TIMEOUT = 120000; // 2 minutes for large videos
 
 // User settings
 const userSettings = new Map();
@@ -26,7 +26,7 @@ const BOT_START_TIME = Date.now();
 
 // ---------- Pending downloads (with TTL) ----------
 const pendingDownloads = new Map();
-const PENDING_TTL = 10 * 60 * 1000;
+const PENDING_TTL = 10 * 60 * 1000; // 10 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [chatId, entries] of pendingDownloads.entries()) {
@@ -90,7 +90,7 @@ async function runYtdlp(args, timeout = YTDLP_TIMEOUT) {
     return stdout;
   } catch (err) {
     if (err.killed && err.signal === 'SIGTERM') {
-      throw new Error('yt-dlp timed out after 60 seconds');
+      throw new Error('yt-dlp timed out after 2 minutes');
     }
     throw err;
   }
@@ -103,7 +103,6 @@ async function getAvailableQualities(url) {
     const data = JSON.parse(stdout);
     const heights = new Set();
     for (const f of data.formats || []) {
-      // Include any format that has video (vcodec not 'none')
       if (f.height && f.vcodec !== 'none') heights.add(f.height);
     }
     const sorted = Array.from(heights).sort((a, b) => a - b);
@@ -114,7 +113,6 @@ async function getAvailableQualities(url) {
   }
 }
 
-// CRITICAL FIX: Use bestvideo+bestaudio and let yt-dlp merge them
 async function downloadVideo(url, quality) {
   const infoJson = await runYtdlp(`-J "${url}"`);
   const info = JSON.parse(infoJson);
@@ -126,7 +124,6 @@ async function downloadVideo(url, quality) {
   if (quality !== 'best') {
     const target = parseInt(quality);
     if (!isNaN(target)) {
-      // Request video up to target height + best audio, then merge to mp4
       formatSpec = `-f "bestvideo[height<=${target}]+bestaudio/best[height<=${target}]"`;
     }
   } else {
@@ -304,13 +301,14 @@ bot.onText(/\/settings/, async (msg) => {
   });
 });
 
-// ---------- Callback queries (fixed pending entry handling) ----------
+// ---------- Callback queries (fixed: answer immediately, then work) ----------
 bot.on('callback_query', async (callbackQuery) => {
   const chatId = callbackQuery.message.chat.id;
   const messageId = callbackQuery.message.message_id;
   const userId = callbackQuery.from.id;
   const data = callbackQuery.data;
 
+  // Always answer the callback query first to avoid "query is too old" error
   await bot.answerCallbackQuery(callbackQuery.id);
 
   function removePendingEntry() {
@@ -321,21 +319,29 @@ bot.on('callback_query', async (callbackQuery) => {
     }
   }
 
-  // ---------- Settings callbacks (unchanged) ----------
+  // Helper to edit messages safely (catch errors)
+  async function safeEdit(text, replyMarkup = null) {
+    try {
+      const options = { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' };
+      if (replyMarkup) options.reply_markup = replyMarkup;
+      await bot.editMessageText(text, options);
+    } catch (err) {
+      // If the message no longer exists, just log it
+      console.log(`Edit error: ${err.message}`);
+    }
+  }
+
+  // ---------- Settings callbacks ----------
   if (data === 'close_settings') {
-    await bot.deleteMessage(chatId, messageId);
+    await safeEdit('Settings closed.');
+    await bot.deleteMessage(chatId, messageId).catch(() => {});
     return;
   }
   if (data === 'set_quality') {
     const qualities = ['360p', '480p', '720p', '1080p', '1440p', '2160p', 'best'];
     const buttons = qualities.map(q => [{ text: q, callback_data: `set_quality_${q}` }]);
     buttons.push([{ text: '⬅️ Back', callback_data: 'back_settings' }]);
-    await bot.editMessageText('🎬 *Select default quality:*', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: buttons },
-    });
+    await safeEdit('🎬 *Select default quality:*', { inline_keyboard: buttons });
     return;
   }
   if (data.startsWith('set_quality_')) {
@@ -343,18 +349,9 @@ bot.on('callback_query', async (callbackQuery) => {
     const s = getSettings(userId);
     s.quality = quality;
     userSettings.set(userId, s);
-    await bot.editMessageText(`✅ Default quality set to ${quality}.`, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-    });
+    await safeEdit(`✅ Default quality set to ${quality}.`);
     setTimeout(async () => {
-      await bot.editMessageText('⚙️ *Your Settings*', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: settingsKeyboard(userId),
-      });
+      await safeEdit('⚙️ *Your Settings*', settingsKeyboard(userId));
     }, 1000);
     return;
   }
@@ -364,30 +361,16 @@ bot.on('callback_query', async (callbackQuery) => {
       [{ text: 'Manual 🎛', callback_data: 'set_mode_manual' }],
       [{ text: '⬅️ Back', callback_data: 'back_settings' }],
     ];
-    await bot.editMessageText('🔁 *Download Mode:*', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: buttons },
-    });
+    await safeEdit('🔁 *Download Mode:*', { inline_keyboard: buttons });
     return;
   }
   if (data === 'set_mode_fixed') {
     const s = getSettings(userId);
     s.mode = 'fixed';
     userSettings.set(userId, s);
-    await bot.editMessageText('✅ Mode set to fixed.', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-    });
+    await safeEdit('✅ Mode set to fixed.');
     setTimeout(async () => {
-      await bot.editMessageText('⚙️ *Your Settings*', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: settingsKeyboard(userId),
-      });
+      await safeEdit('⚙️ *Your Settings*', settingsKeyboard(userId));
     }, 1000);
     return;
   }
@@ -395,18 +378,9 @@ bot.on('callback_query', async (callbackQuery) => {
     const s = getSettings(userId);
     s.mode = 'manual';
     userSettings.set(userId, s);
-    await bot.editMessageText('✅ Mode set to manual.', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-    });
+    await safeEdit('✅ Mode set to manual.');
     setTimeout(async () => {
-      await bot.editMessageText('⚙️ *Your Settings*', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: settingsKeyboard(userId),
-      });
+      await safeEdit('⚙️ *Your Settings*', settingsKeyboard(userId));
     }, 1000);
     return;
   }
@@ -417,12 +391,7 @@ bot.on('callback_query', async (callbackQuery) => {
       [{ text: '♾ Never', callback_data: 'set_cleanup_0' }],
       [{ text: '⬅️ Back', callback_data: 'back_settings' }],
     ];
-    await bot.editMessageText('🧹 *Auto-Cleanup Timer:*', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: buttons },
-    });
+    await safeEdit('🧹 *Auto-Cleanup Timer:*', { inline_keyboard: buttons });
     return;
   }
   if (data.startsWith('set_cleanup_')) {
@@ -430,28 +399,14 @@ bot.on('callback_query', async (callbackQuery) => {
     const s = getSettings(userId);
     s.cleanupMinutes = minutes;
     userSettings.set(userId, s);
-    await bot.editMessageText(`✅ Cleanup set to ${minutes === 0 ? 'Never' : minutes + ' min'}.`, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-    });
+    await safeEdit(`✅ Cleanup set to ${minutes === 0 ? 'Never' : minutes + ' min'}.`);
     setTimeout(async () => {
-      await bot.editMessageText('⚙️ *Your Settings*', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: settingsKeyboard(userId),
-      });
+      await safeEdit('⚙️ *Your Settings*', settingsKeyboard(userId));
     }, 1000);
     return;
   }
   if (data === 'back_settings') {
-    await bot.editMessageText('⚙️ *Your Settings*', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: settingsKeyboard(userId),
-    });
+    await safeEdit('⚙️ *Your Settings*', settingsKeyboard(userId));
     return;
   }
 
@@ -468,13 +423,9 @@ bot.on('callback_query', async (callbackQuery) => {
       const statusMsg = await bot.sendMessage(chatId, `⬇️ *Downloading (${s.quality})…*`, { parse_mode: 'Markdown' });
       await startVideoDownload(chatId, userId, url, s.quality, statusMsg.message_id);
     } else {
+      // Manual mode – show quality menu (keep pending entry)
       const heights = await getAvailableQualities(url);
-      await bot.editMessageText('🎬 *Select video quality:*', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: qualityKeyboard(heights),
-      });
+      await safeEdit('🎬 *Select video quality:*', qualityKeyboard(heights));
     }
     return;
   }
@@ -502,7 +453,7 @@ bot.on('callback_query', async (callbackQuery) => {
   }
   if (data === 'cancel_download') {
     removePendingEntry();
-    await bot.deleteMessage(chatId, messageId);
+    await bot.deleteMessage(chatId, messageId).catch(() => {});
     return;
   }
   if (data.startsWith('quality_')) {
@@ -515,7 +466,7 @@ bot.on('callback_query', async (callbackQuery) => {
     removePendingEntry();
     const statusMsg = await bot.sendMessage(chatId, `⬇️ *Downloading (${quality})…*`, { parse_mode: 'Markdown' });
     await startVideoDownload(chatId, userId, url, quality, statusMsg.message_id);
-    await bot.deleteMessage(chatId, messageId);
+    await bot.deleteMessage(chatId, messageId).catch(() => {});
     return;
   }
 });
@@ -529,12 +480,12 @@ async function startVideoDownload(chatId, userId, url, quality, statusMsgId) {
       chat_id: chatId,
       message_id: statusMsgId,
       parse_mode: 'Markdown',
-    });
+    }).catch(() => {});
     const videoStream = createReadStream(outputPath);
     const options = { caption: `🎬 ${title}\n[${quality}]`, supports_streaming: true };
     if (thumb) options.thumbnail = thumb;
     await bot.sendVideo(chatId, videoStream, options);
-    await bot.deleteMessage(chatId, statusMsgId);
+    await bot.deleteMessage(chatId, statusMsgId).catch(() => {});
     const minutes = getSettings(userId).cleanupMinutes;
     scheduleCleanup(outputPath, minutes);
     if (thumb) scheduleCleanup(thumb, minutes);
@@ -543,7 +494,7 @@ async function startVideoDownload(chatId, userId, url, quality, statusMsgId) {
       chat_id: chatId,
       message_id: statusMsgId,
       parse_mode: 'Markdown',
-    });
+    }).catch(() => {});
   }
 }
 
@@ -554,20 +505,20 @@ async function startAudioDownload(chatId, userId, url, statusMsgId) {
       chat_id: chatId,
       message_id: statusMsgId,
       parse_mode: 'Markdown',
-    });
+    }).catch(() => {});
     const audioStream = createReadStream(mp3Path);
     await bot.sendDocument(chatId, audioStream, {
       caption: `🎵 ${title}`,
       filename: `${title}.mp3`,
     });
-    await bot.deleteMessage(chatId, statusMsgId);
+    await bot.deleteMessage(chatId, statusMsgId).catch(() => {});
     scheduleCleanup(mp3Path, getSettings(userId).cleanupMinutes);
   } catch (err) {
     await bot.editMessageText(`❌ Audio failed: \`${err.message}\``, {
       chat_id: chatId,
       message_id: statusMsgId,
       parse_mode: 'Markdown',
-    });
+    }).catch(() => {});
   }
 }
 
@@ -579,14 +530,14 @@ async function startThumbnailDownload(chatId, userId, url, statusMsgId) {
     if (!thumb) throw new Error('No thumbnail');
     const thumbStream = createReadStream(thumb);
     await bot.sendPhoto(chatId, thumbStream, { caption: `🖼 ${info.title}` });
-    await bot.deleteMessage(chatId, statusMsgId);
+    await bot.deleteMessage(chatId, statusMsgId).catch(() => {});
     scheduleCleanup(thumb, getSettings(userId).cleanupMinutes);
   } catch (err) {
     await bot.editMessageText(`❌ Thumbnail failed: \`${err.message}\``, {
       chat_id: chatId,
       message_id: statusMsgId,
       parse_mode: 'Markdown',
-    });
+    }).catch(() => {});
   }
 }
 
@@ -614,16 +565,16 @@ bot.on('message', async (msg) => {
     );
     if (!pendingDownloads.has(chatId)) pendingDownloads.set(chatId, {});
     pendingDownloads.get(chatId)[sent.message_id] = { url, timestamp: Date.now() };
-    await bot.deleteMessage(chatId, processingMsg.message_id);
+    await bot.deleteMessage(chatId, processingMsg.message_id).catch(() => {});
   } catch (err) {
     await bot.editMessageText(`❌ Failed to fetch video info: \`${err.message}\``, {
       chat_id: chatId,
       message_id: processingMsg.message_id,
       parse_mode: 'Markdown',
-    });
+    }).catch(() => {});
   }
 });
 
 // ---------- Start cleanup worker and bot ----------
 cleanupWorker();
-console.log('✅ Bot started with fixed format selection (bestvideo+bestaudio)');
+console.log('✅ Bot started with fixed callback handling and format selection');

@@ -39,12 +39,17 @@ async function getCookieArg() {
   return '';
 }
 
-// ---------- yt-dlp wrappers ----------
+// ---------- yt-dlp wrapper with EJS fix ----------
 async function runYtdlp(args) {
   const cookieArg = await getCookieArg();
-  const cmd = `yt-dlp ${cookieArg} ${args}`;
+  // Add remote components to fetch EJS challenge solver scripts from npm
+  const remoteArg = '--remote-components ejs:npm';
+  const cmd = `yt-dlp ${cookieArg} ${remoteArg} ${args}`;
+  console.log(`Running: ${cmd}`);
   const { stdout, stderr } = await execPromise(cmd);
-  if (stderr && !stderr.includes('WARNING')) throw new Error(stderr);
+  if (stderr && !stderr.includes('WARNING') && !stderr.includes('[youtube]')) {
+    throw new Error(stderr);
+  }
   return stdout;
 }
 
@@ -183,7 +188,7 @@ function qualityKeyboard(qualities) {
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   bot.sendMessage(chatId,
-    `👋 *Welcome to YT Downloader Bot (Node.js + yt-dlp + cookies)!*\n\n` +
+    `👋 *Welcome to YT Downloader Bot (Node.js + yt-dlp + EJS fix)!*\n\n` +
     `Send me a YouTube URL.\n` +
     `⚙️ /settings – Preferences`,
     { parse_mode: 'Markdown' }
@@ -197,7 +202,6 @@ bot.onText(/\/settings/, async (msg) => {
     parse_mode: 'Markdown',
     reply_markup: settingsKeyboard(userId),
   });
-  // store messageId if needed for editing later (optional)
 });
 
 // ---------- Callback queries ----------
@@ -478,7 +482,7 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
   if (!text) return;
-  if (text.startsWith('/')) return; // skip commands
+  if (text.startsWith('/')) return;
 
   const urlMatch = text.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)/);
   if (!urlMatch) {
@@ -507,4 +511,4 @@ bot.on('message', async (msg) => {
 
 // ---------- Start cleanup worker ----------
 cleanupWorker();
-console.log('Bot started (Node.js + yt-dlp + cookies)');
+console.log('Bot started (Node.js + yt-dlp + EJS fix applied)');

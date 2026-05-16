@@ -1,13 +1,20 @@
-FROM python:3.11-slim
+FROM python:3.13
 
-# FFmpeg required for audio extraction and video merging
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg \
-        curl \
-    && rm -rf /var/lib/apt/lists/*
-
+# Set working directory
 WORKDIR /app
 
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    ffmpeg \
+    git \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install deno (JS runtime for yt-dlp EJS challenge solver)
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+
+# Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -15,14 +22,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 # YouTube extractor patches ship WEEKLY — stale yt-dlp = bot detection fails.
 RUN pip install --no-cache-dir --upgrade yt-dlp
 
-COPY bot.py .
+# Copy application code
+COPY . .
 
-# cookies.txt — replace placeholder with your real exported cookies.
-# If the file is missing the COPY will fail, so we always keep the placeholder.
-COPY cookies.txt .
-
+# Ensure downloads directory exists
 RUN mkdir -p /app/downloads
 
+# Expose port (Health server runs on port 8080)
 EXPOSE 8080
 
-CMD ["python", "bot.py"]
+# Environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+
+# Default command
+CMD ["python3", "bot.py"]

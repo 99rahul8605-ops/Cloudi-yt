@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  # Local Telegram Bot API server (uses your api_id/api_hash)
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    restart: always
+    environment:
+      - TELEGRAM_API_ID=${API_ID}      # from .env file
+      - TELEGRAM_API_HASH=${API_HASH}  # from .env file
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+    ports:
+      - "8081:8081"
+    networks:
+      - bot-net
+
+  # Your YouTube downloader bot
+  youtube-bot:
+    build: .
+    container_name: youtube-bot
+    restart: always
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - LOCAL_BOT_API_URL=http://telegram-bot-api:8081
+      # Other env vars (optional)
+      - PORT=8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - telegram-bot-api
+    networks:
+      - bot-net
+    volumes:
+      - ./downloads:/app/downloads   # persist downloads if needed
+
+volumes:
+  telegram-bot-api-data:
+
+networks:
+  bot-net:
+    driver: bridge

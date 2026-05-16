@@ -16,28 +16,23 @@ const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 const COOKIE_PATH = '/app/cookies.txt';
 fs.ensureDirSync(DOWNLOAD_DIR);
 
-// Timeout for yt-dlp commands (30 seconds)
-const YTDLP_TIMEOUT = 30000;
+// Extended timeout for large videos (60 seconds)
+const YTDLP_TIMEOUT = 60000;
 
-// User settings (in-memory)
+// User settings
 const userSettings = new Map();
 const defaultSettings = { quality: '720p', mode: 'manual', cleanupMinutes: 10 };
 const cleanupRegistry = new Map();
-
-// Bot start time
 const BOT_START_TIME = Date.now();
 
 // ---------- Pending downloads cleanup ----------
-const pendingDownloads = new Map(); // chatId -> { messageId: { url, timestamp } }
+const pendingDownloads = new Map();
 const PENDING_TTL = 10 * 60 * 1000; // 10 minutes
-
 setInterval(() => {
   const now = Date.now();
   for (const [chatId, entries] of pendingDownloads.entries()) {
     for (const [msgId, data] of Object.entries(entries)) {
-      if (now - data.timestamp > PENDING_TTL) {
-        delete entries[msgId];
-      }
+      if (now - data.timestamp > PENDING_TTL) delete entries[msgId];
     }
     if (Object.keys(entries).length === 0) pendingDownloads.delete(chatId);
   }
@@ -77,12 +72,18 @@ async function getCookieArg() {
   return (await cookieExists()) ? `--cookies "${COOKIE_PATH}"` : '';
 }
 
-// ---------- yt-dlp wrapper with timeout ----------
+// ---------- yt-dlp wrapper with all optimizations ----------
 async function runYtdlp(args, timeout = YTDLP_TIMEOUT) {
   const cookieArg = await getCookieArg();
-  const remoteArg = '--remote-components ejs:npm';
-  const fullArgs = `${cookieArg} ${remoteArg} ${args}`;
-  console.log(`[yt-dlp] Running: ${fullArgs.substring(0, 150)}...`);
+  // Required optimizations
+  const opts = [
+    '--concurrent-fragments 50',   // parallel fragment downloads
+    '--geo-bypass',                // bypass geo restrictions
+    '--js-runtimes deno',          // use Deno for JS challenges (already installed)
+    '--remote-components ejs:github', // fetch EJS scripts from GitHub (faster)
+  ].join(' ');
+  const fullArgs = `${cookieArg} ${opts} ${args}`;
+  console.log(`[yt-dlp] Running with optimizations: ${fullArgs.substring(0, 150)}...`);
   try {
     const { stdout, stderr } = await execPromise(`yt-dlp ${fullArgs}`, { timeout });
     if (stderr && !stderr.includes('WARNING') && !stderr.includes('[youtube]')) {
@@ -91,12 +92,13 @@ async function runYtdlp(args, timeout = YTDLP_TIMEOUT) {
     return stdout;
   } catch (err) {
     if (err.killed && err.signal === 'SIGTERM') {
-      throw new Error('yt-dlp timed out after 30 seconds');
+      throw new Error('yt-dlp timed out after 60 seconds');
     }
     throw err;
   }
 }
 
+// ---------- Core functions (unchanged, but use runYtdlp) ----------
 async function getAvailableQualities(url) {
   try {
     const stdout = await runYtdlp(`-J --flat-playlist "${url}"`);
@@ -216,7 +218,7 @@ function formatUptime(ms) {
 // ---------- Telegram bot ----------
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Inline keyboards
+// Inline keyboards (simplified but functional)
 function settingsKeyboard(userId) {
   const s = getSettings(userId);
   return {
@@ -248,7 +250,7 @@ function qualityKeyboard(qualities) {
 // ---------- Command handlers ----------
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id,
-    `👋 *Welcome to YT Downloader Bot (Node.js + yt-dlp)!*\n\n` +
+    `👋 *Welcome to YT Downloader Bot (Optimized)*\n\n` +
     `Send me a YouTube URL.\n` +
     `⚙️ /settings – Preferences\n` +
     `📊 /stats – Bot statistics`,
@@ -274,7 +276,7 @@ bot.onText(/\/stats/, async (msg) => {
       `📊 *Bot Statistics*\n\n` +
       `🔧 *yt-dlp version*: \`${ytVersion}\`\n` +
       `🍪 *Cookies*: ${cookiePresent ? '✅ Present' : '❌ Missing'}\n` +
-      `🧩 *EJS*: Enabled (--remote-components ejs:npm)\n` +
+      `🚀 *Optimizations*: concurrent fragments=50, geo-bypass, deno runtime\n` +
       `⏱ *Uptime*: ${uptime}\n` +
       `👥 *Active users*: ${activeUsers}\n` +
       `💻 *Node.js*: ${nodeVersion}\n` +
@@ -303,7 +305,6 @@ bot.on('callback_query', async (callbackQuery) => {
 
   await bot.answerCallbackQuery(callbackQuery.id);
 
-  // Helper to remove pending entry
   function removePendingEntry() {
     const chatPending = pendingDownloads.get(chatId);
     if (chatPending && chatPending[messageId]) {
@@ -312,19 +313,14 @@ bot.on('callback_query', async (callbackQuery) => {
     }
   }
 
-  // ---- Settings callbacks ----
-  if (data === 'close_settings') {
-    await bot.deleteMessage(chatId, messageId);
-    return;
-  }
+  // Settings callbacks (same as before – omitted for brevity, but fully functional)
+  // We'll keep the essential ones to save space; full version can be provided.
+  if (data === 'close_settings') return bot.deleteMessage(chatId, messageId);
   if (data === 'set_quality') {
-    const qualities = ['360p', '480p', '720p', '1080p', '1440p', '2160p', 'best'];
+    const qualities = ['360p','480p','720p','1080p','1440p','2160p','best'];
     const buttons = qualities.map(q => [{ text: q, callback_data: `set_quality_${q}` }]);
     buttons.push([{ text: '⬅️ Back', callback_data: 'back_settings' }]);
-    await bot.editMessageText('🎬 *Select default quality:*', {
-      chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: buttons },
-    });
+    await bot.editMessageText('🎬 *Select default quality:*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
     return;
   }
   if (data.startsWith('set_quality_')) {
@@ -333,9 +329,7 @@ bot.on('callback_query', async (callbackQuery) => {
     s.quality = quality;
     userSettings.set(userId, s);
     await bot.editMessageText(`✅ Default quality set to ${quality}.`, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
-    setTimeout(async () => {
-      await bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) });
-    }, 1000);
+    setTimeout(() => bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) }), 1000);
     return;
   }
   if (data === 'set_mode') {
@@ -352,9 +346,7 @@ bot.on('callback_query', async (callbackQuery) => {
     s.mode = 'fixed';
     userSettings.set(userId, s);
     await bot.editMessageText('✅ Mode set to fixed.', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
-    setTimeout(async () => {
-      await bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) });
-    }, 1000);
+    setTimeout(() => bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) }), 1000);
     return;
   }
   if (data === 'set_mode_manual') {
@@ -362,9 +354,7 @@ bot.on('callback_query', async (callbackQuery) => {
     s.mode = 'manual';
     userSettings.set(userId, s);
     await bot.editMessageText('✅ Mode set to manual.', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
-    setTimeout(async () => {
-      await bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) });
-    }, 1000);
+    setTimeout(() => bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) }), 1000);
     return;
   }
   if (data === 'set_cleanup') {
@@ -383,9 +373,7 @@ bot.on('callback_query', async (callbackQuery) => {
     s.cleanupMinutes = minutes;
     userSettings.set(userId, s);
     await bot.editMessageText(`✅ Cleanup set to ${minutes === 0 ? 'Never' : minutes + ' min'}.`, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
-    setTimeout(async () => {
-      await bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) });
-    }, 1000);
+    setTimeout(() => bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) }), 1000);
     return;
   }
   if (data === 'back_settings') {
@@ -393,10 +381,10 @@ bot.on('callback_query', async (callbackQuery) => {
     return;
   }
 
-  // ---- Download callbacks ----
+  // Download callbacks
   if (data === 'dl_video') {
     const url = pendingDownloads.get(chatId)?.[messageId]?.url;
-    if (!url) { await bot.sendMessage(chatId, 'No URL found. Please send again.'); return; }
+    if (!url) return bot.sendMessage(chatId, 'No URL found. Please send again.');
     removePendingEntry();
     const s = getSettings(userId);
     if (s.mode === 'fixed') {
@@ -410,7 +398,7 @@ bot.on('callback_query', async (callbackQuery) => {
   }
   if (data === 'dl_audio') {
     const url = pendingDownloads.get(chatId)?.[messageId]?.url;
-    if (!url) { await bot.sendMessage(chatId, 'No URL found.'); return; }
+    if (!url) return bot.sendMessage(chatId, 'No URL found.');
     removePendingEntry();
     const statusMsg = await bot.sendMessage(chatId, '⬇️ *Extracting audio…*', { parse_mode: 'Markdown' });
     await startAudioDownload(chatId, userId, url, statusMsg.message_id);
@@ -418,7 +406,7 @@ bot.on('callback_query', async (callbackQuery) => {
   }
   if (data === 'dl_thumb') {
     const url = pendingDownloads.get(chatId)?.[messageId]?.url;
-    if (!url) { await bot.sendMessage(chatId, 'No URL found.'); return; }
+    if (!url) return bot.sendMessage(chatId, 'No URL found.');
     removePendingEntry();
     const statusMsg = await bot.sendMessage(chatId, '🖼 *Downloading thumbnail…*', { parse_mode: 'Markdown' });
     await startThumbnailDownload(chatId, userId, url, statusMsg.message_id);
@@ -432,7 +420,7 @@ bot.on('callback_query', async (callbackQuery) => {
   if (data.startsWith('quality_')) {
     const quality = data.replace('quality_', '');
     const url = pendingDownloads.get(chatId)?.[messageId]?.url;
-    if (!url) { await bot.sendMessage(chatId, 'Session expired. Please send URL again.'); return; }
+    if (!url) return bot.sendMessage(chatId, 'Session expired. Please send URL again.');
     removePendingEntry();
     const statusMsg = await bot.sendMessage(chatId, `⬇️ *Downloading (${quality})…*`, { parse_mode: 'Markdown' });
     await startVideoDownload(chatId, userId, url, quality, statusMsg.message_id);
@@ -441,7 +429,7 @@ bot.on('callback_query', async (callbackQuery) => {
   }
 });
 
-// ---------- Download implementations (streaming, non‑blocking) ----------
+// ---------- Download implementations ----------
 async function startVideoDownload(chatId, userId, url, quality, statusMsgId) {
   try {
     const { outputPath, title, videoId } = await downloadVideo(url, quality);
@@ -488,7 +476,7 @@ async function startThumbnailDownload(chatId, userId, url, statusMsgId) {
   }
 }
 
-// ---------- Message handler (immediate response) ----------
+// ---------- Message handler ----------
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
@@ -500,8 +488,6 @@ bot.on('message', async (msg) => {
     return;
   }
   const url = urlMatch[0];
-
-  // Send immediate "processing" message
   const processingMsg = await bot.sendMessage(chatId, '⏳ *Fetching video info...*', { parse_mode: 'Markdown' });
 
   try {
@@ -512,10 +498,8 @@ bot.on('message', async (msg) => {
       `📹 *${info.title}*\n⏱ \`${dur}\`\n\nWhat would you like?`,
       { parse_mode: 'Markdown', reply_markup: downloadTypeKeyboard() }
     );
-    // Store the URL for this message
     if (!pendingDownloads.has(chatId)) pendingDownloads.set(chatId, {});
     pendingDownloads.get(chatId)[sent.message_id] = { url, timestamp: Date.now() };
-    // Delete the "processing" message
     await bot.deleteMessage(chatId, processingMsg.message_id);
   } catch (err) {
     await bot.editMessageText(`❌ Failed to fetch video info: \`${err.message}\``, { chat_id: chatId, message_id: processingMsg.message_id, parse_mode: 'Markdown' });
@@ -524,4 +508,4 @@ bot.on('message', async (msg) => {
 
 // ---------- Start ----------
 cleanupWorker();
-console.log('✅ Bot started (fast, responsive, memory-optimized)');
+console.log('✅ Bot started with yt-dlp optimizations (concurrent fragments, geo-bypass, deno runtime)');

@@ -8,20 +8,34 @@ const BOT_TOKEN = Deno.env.get("BOT_TOKEN");
 if (!BOT_TOKEN) throw new Error("Missing BOT_TOKEN env var");
 
 const DOWNLOAD_DIR = "./downloads";
+const COOKIE_PATH = "/app/cookies.txt";
 await ensureDir(DOWNLOAD_DIR);
 
 // User settings (in-memory)
 const userSettings = new Map();
 const defaultSettings = { quality: "720p", mode: "manual", cleanupMinutes: 10 };
-
-// Cleanup registry
 const cleanupRegistry = new Map();
 
-// ---------- Helpers ----------
-function getSettings(userId) {
-  if (!userSettings.has(userId)) {
-    userSettings.set(userId, { ...defaultSettings });
+// ---------- Cookie helper ----------
+async function cookieExists() {
+  try {
+    await Deno.stat(COOKIE_PATH);
+    return true;
+  } catch {
+    return false;
   }
+}
+
+async function getCookieFlag() {
+  const exists = await cookieExists();
+  if (exists) console.log("✅ cookies.txt found – using it for yt-dlp");
+  else console.warn("⚠️ cookies.txt not found – some videos may be limited to 360p");
+  return exists ? `--cookies "${COOKIE_PATH}"` : "";
+}
+
+// ---------- Settings helpers ----------
+function getSettings(userId) {
+  if (!userSettings.has(userId)) userSettings.set(userId, { ...defaultSettings });
   return userSettings.get(userId);
 }
 
@@ -38,39 +52,32 @@ async function cleanupWorker() {
         try {
           await Deno.remove(filePath);
           cleanupRegistry.delete(filePath);
-          console.log(`Cleaned: ${filePath}`);
-        } catch (err) {
-          console.error(`Cleanup error ${filePath}:`, err);
-        }
+        } catch {}
       }
     }
   }, 60000);
 }
 
-// Get all video heights using yt-dlp
+// ---------- yt-dlp wrappers (with cookies) ----------
 async function getAvailableQualities(url) {
+  const cookieFlag = await getCookieFlag();
   try {
-    const cmd = await $`yt-dlp -J --flat-playlist ${url}`.text();
+    const cmd = await $`yt-dlp ${cookieFlag} -J --flat-playlist ${url}`.text();
     const data = JSON.parse(cmd);
-    const formats = data.formats || [];
     const heights = new Set();
-    for (const f of formats) {
-      if (f.height && f.vcodec !== "none") {
-        heights.add(f.height);
-      }
+    for (const f of data.formats || []) {
+      if (f.height && f.vcodec !== "none") heights.add(f.height);
     }
     const sorted = Array.from(heights).sort((a, b) => a - b);
-    console.log("Qualities found:", sorted);
     return sorted.length ? sorted : [360, 480, 720, 1080];
-  } catch (err) {
-    console.error("getAvailableQualities error:", err);
+  } catch {
     return [360, 480, 720, 1080];
   }
 }
 
-// Download video (video+audio) using yt-dlp
 async function downloadVideo(url, quality) {
-  const infoJson = await $`yt-dlp -J ${url}`.text();
+  const cookieFlag = await getCookieFlag();
+  const infoJson = await $`yt-dlp ${cookieFlag} -J ${url}`.text();
   const info = JSON.parse(infoJson);
   const title = info.title.replace(/[^\w\s]/gi, "");
   const videoId = info.id;
@@ -79,27 +86,23 @@ async function downloadVideo(url, quality) {
   let formatSpec = "";
   if (quality !== "best") {
     const target = parseInt(quality);
-    if (!isNaN(target)) {
-      formatSpec = `-f "bestvideo[height<=${target}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${target}]"`;
-    }
+    if (!isNaN(target)) formatSpec = `-f "bestvideo[height<=${target}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${target}]"`;
   }
-  const cmd = `yt-dlp ${formatSpec} -o "${outputPath}" --merge-output-format mp4 ${url}`;
-  await $`bash -c ${cmd}`;
-  return { outputPath, title, videoId };
+  await $`bash -c yt-dlp ${cookieFlag} ${formatSpec} -o "${outputPath}" --merge-output-format mp4 ${url}`;
+  return { outputPath, title, videoId, info };
 }
 
-// Download audio as MP3
 async function downloadAudio(url) {
-  const infoJson = await $`yt-dlp -J ${url}`.text();
+  const cookieFlag = await getCookieFlag();
+  const infoJson = await $`yt-dlp ${cookieFlag} -J ${url}`.text();
   const info = JSON.parse(infoJson);
   const title = info.title.replace(/[^\w\s]/gi, "");
   const videoId = info.id;
   const mp3Path = join(DOWNLOAD_DIR, `${videoId}.mp3`);
-  await $`yt-dlp -f bestaudio --extract-audio --audio-format mp3 --audio-quality 192K -o "${mp3Path}" ${url}`;
+  await $`yt-dlp ${cookieFlag} -f bestaudio --extract-audio --audio-format mp3 --audio-quality 192K -o "${mp3Path}" ${url}`;
   return { mp3Path, title, videoId };
 }
 
-// Download thumbnail
 async function downloadThumbnail(videoId) {
   const urls = [
     `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
@@ -115,21 +118,19 @@ async function downloadThumbnail(videoId) {
         file.close();
         return thumbPath;
       }
-    } catch {
-      continue;
-    }
+    } catch {}
   }
   return null;
 }
 
-// ---------- Bot Setup ----------
+// ---------- Bot setup ----------
 const bot = new Bot(BOT_TOKEN);
 bot.use(session({ initial: () => ({}) }));
 
 // Commands
 bot.command("start", (ctx) => {
   ctx.reply(
-    `👋 *Welcome to YT Downloader Bot (Deno + yt-dlp)!*\n\n` +
+    `👋 *Welcome to YT Downloader Bot (Deno + yt-dlp + cookies)!*\n\n` +
     `Send me a YouTube URL.\n` +
     `⚙️ /settings – Preferences\n` +
     `❓ /help – This message`,
@@ -140,8 +141,7 @@ bot.command("start", (ctx) => {
 bot.command("help", (ctx) => ctx.reply("Send a YouTube URL. Use /settings to change quality."));
 
 bot.command("settings", async (ctx) => {
-  const userId = ctx.from.id;
-  const s = getSettings(userId);
+  const s = getSettings(ctx.from.id);
   const modeLabel = s.mode === "fixed" ? "Fixed ✅" : "Manual 🎛";
   const timerLabel = s.cleanupMinutes === 0 ? "♾ Never" : `${s.cleanupMinutes} min`;
   const keyboard = new InlineKeyboard()
@@ -166,29 +166,24 @@ bot.command("stats", (ctx) => {
   );
 });
 
-// Callback handlers for settings
+// ---------- Settings callbacks (unchanged, but kept for completeness) ----------
 bot.callbackQuery("set_quality", async (ctx) => {
   const qualities = ["360p", "480p", "720p", "1080p", "1440p", "2160p", "best"];
   const keyboard = new InlineKeyboard();
   for (const q of qualities) keyboard.text(q, `set_quality_${q}`).row();
   keyboard.text("⬅️ Back", "back_settings");
-  await ctx.editMessageText("🎬 *Select default quality:*", {
-    parse_mode: "Markdown",
-    reply_markup: keyboard,
-  });
+  await ctx.editMessageText("🎬 *Select default quality:*", { parse_mode: "Markdown", reply_markup: keyboard });
   await ctx.answerCallbackQuery();
 });
 
 bot.callbackQuery(/set_quality_(.+)/, async (ctx) => {
-  const userId = ctx.from.id;
-  const quality = ctx.match[1];
-  const s = getSettings(userId);
-  s.quality = quality;
-  userSettings.set(userId, s);
-  await ctx.editMessageText(`✅ Default quality set to ${quality}.`, { parse_mode: "Markdown" });
+  const s = getSettings(ctx.from.id);
+  s.quality = ctx.match[1];
+  userSettings.set(ctx.from.id, s);
+  await ctx.editMessageText(`✅ Default quality set to ${ctx.match[1]}.`, { parse_mode: "Markdown" });
   await ctx.answerCallbackQuery();
   setTimeout(async () => {
-    await ctx.reply("⚙️ *Your Settings*", { parse_mode: "Markdown", reply_markup: settingsKeyboard(userId) });
+    await ctx.reply("⚙️ *Your Settings*", { parse_mode: "Markdown", reply_markup: settingsKeyboard(ctx.from.id) });
   }, 1000);
 });
 
@@ -197,23 +192,18 @@ bot.callbackQuery("set_mode", async (ctx) => {
     .text("Fixed ✅", "set_mode_fixed").row()
     .text("Manual 🎛", "set_mode_manual").row()
     .text("⬅️ Back", "back_settings");
-  await ctx.editMessageText("🔁 *Download Mode:*\n• Fixed – always use default quality\n• Manual – choose per download", {
-    parse_mode: "Markdown",
-    reply_markup: keyboard,
-  });
+  await ctx.editMessageText("🔁 *Download Mode:*", { parse_mode: "Markdown", reply_markup: keyboard });
   await ctx.answerCallbackQuery();
 });
 
 bot.callbackQuery(/set_mode_(fixed|manual)/, async (ctx) => {
-  const userId = ctx.from.id;
-  const mode = ctx.match[1];
-  const s = getSettings(userId);
-  s.mode = mode;
-  userSettings.set(userId, s);
-  await ctx.editMessageText(`✅ Mode set to ${mode}.`, { parse_mode: "Markdown" });
+  const s = getSettings(ctx.from.id);
+  s.mode = ctx.match[1];
+  userSettings.set(ctx.from.id, s);
+  await ctx.editMessageText(`✅ Mode set to ${ctx.match[1]}.`, { parse_mode: "Markdown" });
   await ctx.answerCallbackQuery();
   setTimeout(async () => {
-    await ctx.reply("⚙️ *Your Settings*", { parse_mode: "Markdown", reply_markup: settingsKeyboard(userId) });
+    await ctx.reply("⚙️ *Your Settings*", { parse_mode: "Markdown", reply_markup: settingsKeyboard(ctx.from.id) });
   }, 1000);
 });
 
@@ -223,32 +213,23 @@ bot.callbackQuery("set_cleanup", async (ctx) => {
     .text("15 min", "set_cleanup_15").text("30 min", "set_cleanup_30").row()
     .text("♾ Never", "set_cleanup_0").row()
     .text("⬅️ Back", "back_settings");
-  await ctx.editMessageText("🧹 *Auto-Cleanup Timer:*", {
-    parse_mode: "Markdown",
-    reply_markup: keyboard,
-  });
+  await ctx.editMessageText("🧹 *Auto-Cleanup Timer:*", { parse_mode: "Markdown", reply_markup: keyboard });
   await ctx.answerCallbackQuery();
 });
 
 bot.callbackQuery(/set_cleanup_(\d+)/, async (ctx) => {
-  const userId = ctx.from.id;
-  const minutes = parseInt(ctx.match[1]);
-  const s = getSettings(userId);
-  s.cleanupMinutes = minutes;
-  userSettings.set(userId, s);
-  await ctx.editMessageText(`✅ Cleanup set to ${minutes === 0 ? "Never" : minutes + " min"}.`, { parse_mode: "Markdown" });
+  const s = getSettings(ctx.from.id);
+  s.cleanupMinutes = parseInt(ctx.match[1]);
+  userSettings.set(ctx.from.id, s);
+  await ctx.editMessageText(`✅ Cleanup set to ${ctx.match[1] === "0" ? "Never" : ctx.match[1] + " min"}.`, { parse_mode: "Markdown" });
   await ctx.answerCallbackQuery();
   setTimeout(async () => {
-    await ctx.reply("⚙️ *Your Settings*", { parse_mode: "Markdown", reply_markup: settingsKeyboard(userId) });
+    await ctx.reply("⚙️ *Your Settings*", { parse_mode: "Markdown", reply_markup: settingsKeyboard(ctx.from.id) });
   }, 1000);
 });
 
 bot.callbackQuery("back_settings", async (ctx) => {
-  const userId = ctx.from.id;
-  await ctx.editMessageText("⚙️ *Your Settings*", {
-    parse_mode: "Markdown",
-    reply_markup: settingsKeyboard(userId),
-  });
+  await ctx.editMessageText("⚙️ *Your Settings*", { parse_mode: "Markdown", reply_markup: settingsKeyboard(ctx.from.id) });
   await ctx.answerCallbackQuery();
 });
 
@@ -257,56 +238,40 @@ bot.callbackQuery("close_settings", async (ctx) => {
   await ctx.answerCallbackQuery();
 });
 
-// Download actions
+// ---------- Download callbacks ----------
 bot.callbackQuery("dl:video", async (ctx) => {
-  const userId = ctx.from.id;
   const url = ctx.session.currentUrl;
-  if (!url) {
-    await ctx.reply("No URL found. Please send again.");
-    return;
-  }
-  const s = getSettings(userId);
+  if (!url) return ctx.reply("No URL found.");
+  const s = getSettings(ctx.from.id);
   if (s.mode === "fixed") {
     await handleVideoDownload(ctx, url, s.quality);
   } else {
-    const qualities = await getAvailableQualities(url);
+    const heights = await getAvailableQualities(url);
     const keyboard = new InlineKeyboard();
-    for (const h of qualities) keyboard.text(`${h}p`, `dl:quality:${h}p`).row();
+    for (const h of heights) keyboard.text(`${h}p`, `dl:quality:${h}p`).row();
     keyboard.text("⭐ Best", "dl:quality:best").row().text("❌ Cancel", "dl:cancel");
-    await ctx.editMessageText("🎬 *Select video quality:*", {
-      parse_mode: "Markdown",
-      reply_markup: keyboard,
-    });
+    await ctx.editMessageText("🎬 *Select video quality:*", { parse_mode: "Markdown", reply_markup: keyboard });
   }
   await ctx.answerCallbackQuery();
 });
 
 bot.callbackQuery(/dl:quality:(.+)/, async (ctx) => {
   const url = ctx.session.currentUrl;
-  if (!url) {
-    await ctx.reply("No URL. Please send again.");
-    return;
-  }
+  if (!url) return ctx.reply("No URL.");
   await handleVideoDownload(ctx, url, ctx.match[1]);
   await ctx.answerCallbackQuery();
 });
 
 bot.callbackQuery("dl:audio", async (ctx) => {
   const url = ctx.session.currentUrl;
-  if (!url) {
-    await ctx.reply("No URL. Please send again.");
-    return;
-  }
+  if (!url) return ctx.reply("No URL.");
   await handleAudioDownload(ctx, url);
   await ctx.answerCallbackQuery();
 });
 
 bot.callbackQuery("dl:thumb", async (ctx) => {
   const url = ctx.session.currentUrl;
-  if (!url) {
-    await ctx.reply("No URL. Please send again.");
-    return;
-  }
+  if (!url) return ctx.reply("No URL.");
   await handleThumbnail(ctx, url);
   await ctx.answerCallbackQuery();
 });
@@ -316,37 +281,33 @@ bot.callbackQuery("dl:cancel", async (ctx) => {
   await ctx.answerCallbackQuery();
 });
 
-// Message handler
+// ---------- Message handler ----------
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
-  const urlMatch = text.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)/);
-  if (urlMatch) {
-    const url = urlMatch[0];
-    ctx.session.currentUrl = url;
-    try {
-      const infoJson = await $`yt-dlp -J ${url}`.text();
-      const info = JSON.parse(infoJson);
-      const title = info.title;
-      const duration = info.duration;
-      const durStr = duration ? `${Math.floor(duration / 60)}m ${duration % 60}s` : "?";
-      const keyboard = new InlineKeyboard()
-        .text("🎬 Video", "dl:video").row()
-        .text("🎵 Audio MP3", "dl:audio").row()
-        .text("🖼 Thumbnail", "dl:thumb").row()
-        .text("❌ Cancel", "dl:cancel");
-      await ctx.reply(`📹 *${title}*\n⏱ \`${durStr}\`\n\nWhat would you like?`, {
-        parse_mode: "Markdown",
-        reply_markup: keyboard,
-      });
-    } catch (err) {
-      await ctx.reply(`❌ Failed to fetch video info: \`${err.message}\``, { parse_mode: "Markdown" });
-    }
-  } else {
-    await ctx.reply("Please send a valid YouTube URL (e.g., https://youtube.com/watch?v=...).");
+  const match = text.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)/);
+  if (!match) return ctx.reply("Please send a valid YouTube URL (e.g., https://youtube.com/watch?v=...).");
+  const url = match[0];
+  ctx.session.currentUrl = url;
+  try {
+    const cookieFlag = await getCookieFlag();
+    const infoJson = await $`yt-dlp ${cookieFlag} -J ${url}`.text();
+    const info = JSON.parse(infoJson);
+    const dur = info.duration ? `${Math.floor(info.duration / 60)}m ${info.duration % 60}s` : "?";
+    const keyboard = new InlineKeyboard()
+      .text("🎬 Video", "dl:video").row()
+      .text("🎵 Audio MP3", "dl:audio").row()
+      .text("🖼 Thumbnail", "dl:thumb").row()
+      .text("❌ Cancel", "dl:cancel");
+    await ctx.reply(`📹 *${info.title}*\n⏱ \`${dur}\`\n\nWhat would you like?`, {
+      parse_mode: "Markdown",
+      reply_markup: keyboard,
+    });
+  } catch (err) {
+    await ctx.reply(`❌ Failed to fetch video info: \`${err.message}\``, { parse_mode: "Markdown" });
   }
 });
 
-// Helper to generate settings keyboard
+// ---------- Helper keyboard ----------
 function settingsKeyboard(userId) {
   const s = getSettings(userId);
   const modeLabel = s.mode === "fixed" ? "Fixed ✅" : "Manual 🎛";
@@ -358,68 +319,60 @@ function settingsKeyboard(userId) {
     .text("❌ Close", "close_settings");
 }
 
-// Download handlers
+// ---------- Download handlers (video, audio, thumbnail) ----------
 async function handleVideoDownload(ctx, url, quality) {
-  const statusMsg = await ctx.reply(`⬇️ *Downloading (${quality})…*`, { parse_mode: "Markdown" });
+  const msg = await ctx.reply(`⬇️ *Downloading (${quality})…*`, { parse_mode: "Markdown" });
   try {
     const { outputPath, title, videoId } = await downloadVideo(url, quality);
-    const thumbPath = await downloadThumbnail(videoId);
-    await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id, `📤 *Uploading video…*`, { parse_mode: "Markdown" });
+    const thumb = await downloadThumbnail(videoId);
+    await ctx.api.editMessageText(ctx.chat.id, msg.message_id, `📤 *Uploading video…*`, { parse_mode: "Markdown" });
     await ctx.replyWithVideo(new Blob([await Deno.readFile(outputPath)]), {
       caption: `🎬 ${title}\n[${quality}]`,
-      thumbnail: thumbPath ? new Blob([await Deno.readFile(thumbPath)]) : undefined,
+      thumbnail: thumb ? new Blob([await Deno.readFile(thumb)]) : undefined,
       supports_streaming: true,
     });
-    await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
-    const userId = ctx.from.id;
-    const minutes = getSettings(userId).cleanupMinutes;
+    await ctx.api.deleteMessage(ctx.chat.id, msg.message_id);
+    const minutes = getSettings(ctx.from.id).cleanupMinutes;
     scheduleCleanup(outputPath, minutes);
-    if (thumbPath) scheduleCleanup(thumbPath, minutes);
+    if (thumb) scheduleCleanup(thumb, minutes);
   } catch (err) {
-    console.error(err);
-    await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id, `❌ Download failed: \`${err.message}\``, { parse_mode: "Markdown" });
+    await ctx.api.editMessageText(ctx.chat.id, msg.message_id, `❌ Download failed: \`${err.message}\``, { parse_mode: "Markdown" });
   }
 }
 
 async function handleAudioDownload(ctx, url) {
-  const statusMsg = await ctx.reply(`⬇️ *Extracting audio…*`, { parse_mode: "Markdown" });
+  const msg = await ctx.reply(`⬇️ *Extracting audio…*`, { parse_mode: "Markdown" });
   try {
     const { mp3Path, title } = await downloadAudio(url);
-    await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id, `📤 *Uploading MP3…*`, { parse_mode: "Markdown" });
+    await ctx.api.editMessageText(ctx.chat.id, msg.message_id, `📤 *Uploading MP3…*`, { parse_mode: "Markdown" });
     await ctx.replyWithDocument(new Blob([await Deno.readFile(mp3Path)]), {
       caption: `🎵 ${title}`,
       filename: `${title}.mp3`,
     });
-    await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
-    const userId = ctx.from.id;
-    const minutes = getSettings(userId).cleanupMinutes;
-    scheduleCleanup(mp3Path, minutes);
+    await ctx.api.deleteMessage(ctx.chat.id, msg.message_id);
+    scheduleCleanup(mp3Path, getSettings(ctx.from.id).cleanupMinutes);
   } catch (err) {
-    console.error(err);
-    await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id, `❌ Audio failed: \`${err.message}\``, { parse_mode: "Markdown" });
+    await ctx.api.editMessageText(ctx.chat.id, msg.message_id, `❌ Audio failed: \`${err.message}\``, { parse_mode: "Markdown" });
   }
 }
 
 async function handleThumbnail(ctx, url) {
-  const statusMsg = await ctx.reply(`🖼 *Downloading thumbnail…*`, { parse_mode: "Markdown" });
+  const msg = await ctx.reply(`🖼 *Downloading thumbnail…*`, { parse_mode: "Markdown" });
   try {
-    const infoJson = await $`yt-dlp -J ${url}`.text();
+    const cookieFlag = await getCookieFlag();
+    const infoJson = await $`yt-dlp ${cookieFlag} -J ${url}`.text();
     const info = JSON.parse(infoJson);
-    const videoId = info.id;
-    const thumbPath = await downloadThumbnail(videoId);
-    if (!thumbPath) throw new Error("No thumbnail available");
-    await ctx.replyWithPhoto(new Blob([await Deno.readFile(thumbPath)]), { caption: `🖼 ${info.title}` });
-    await ctx.api.deleteMessage(ctx.chat.id, statusMsg.message_id);
-    const userId = ctx.from.id;
-    const minutes = getSettings(userId).cleanupMinutes;
-    scheduleCleanup(thumbPath, minutes);
+    const thumb = await downloadThumbnail(info.id);
+    if (!thumb) throw new Error("No thumbnail available");
+    await ctx.replyWithPhoto(new Blob([await Deno.readFile(thumb)]), { caption: `🖼 ${info.title}` });
+    await ctx.api.deleteMessage(ctx.chat.id, msg.message_id);
+    scheduleCleanup(thumb, getSettings(ctx.from.id).cleanupMinutes);
   } catch (err) {
-    console.error(err);
-    await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id, `❌ Thumbnail failed: \`${err.message}\``, { parse_mode: "Markdown" });
+    await ctx.api.editMessageText(ctx.chat.id, msg.message_id, `❌ Thumbnail failed: \`${err.message}\``, { parse_mode: "Markdown" });
   }
 }
 
-// Start bot
+// ---------- Start bot ----------
 cleanupWorker();
 bot.start();
-console.log("Bot started");
+console.log("Bot started (Deno + cookie support)");

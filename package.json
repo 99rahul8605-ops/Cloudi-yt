@@ -1,13 +1,16 @@
 {
   "name": "yt-telegram-bot",
   "version": "1.0.0",
-  "description": "Telegram YouTube Downloader Bot",
+  "description": "Telegram YouTube Downloader Bot - Node.js",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
-    "grammy": "^1.27.0"
+    "@distube/ytdl-core": "^4.13.5",
+    "axios": "^1.6.2",
+    "fs-extra": "^11.2.0",
+    "telegraf": "^4.15.3"
   },
   "engines": {
     "node": ">=18"

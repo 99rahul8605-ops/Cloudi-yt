@@ -16,7 +16,7 @@ const userSettings = new Map();
 const defaultSettings = { quality: "720p", mode: "manual", cleanupMinutes: 10 };
 const cleanupRegistry = new Map();
 
-// ---------- Cookie helper ----------
+// ---------- Cookie helper (no quotes) ----------
 async function cookieExists() {
   try {
     await Deno.stat(COOKIE_PATH);
@@ -26,11 +26,24 @@ async function cookieExists() {
   }
 }
 
-async function getCookieFlag() {
+async function getCookieArgs() {
   const exists = await cookieExists();
-  if (exists) console.log("✅ cookies.txt found – using it for yt-dlp");
-  else console.warn("⚠️ cookies.txt not found – some videos may be limited to 360p");
-  return exists ? `--cookies "${COOKIE_PATH}"` : "";
+  if (exists) {
+    console.log("✅ cookies.txt found – using it for yt-dlp");
+    return ["--cookies", COOKIE_PATH];
+  }
+  console.warn("⚠️ cookies.txt not found – some videos may be limited to 360p");
+  return [];
+}
+
+// ---------- yt-dlp version check ----------
+async function logYtdlpVersion() {
+  try {
+    const { stdout } = await $`yt-dlp --version`;
+    console.log(`yt-dlp version: ${stdout.trim()}`);
+  } catch (err) {
+    console.error("Failed to get yt-dlp version:", err.message);
+  }
 }
 
 // ---------- Settings helpers ----------
@@ -58,12 +71,12 @@ async function cleanupWorker() {
   }, 60000);
 }
 
-// ---------- yt-dlp wrappers (with cookies) ----------
+// ---------- yt-dlp wrappers (with proper argument splitting) ----------
 async function getAvailableQualities(url) {
-  const cookieFlag = await getCookieFlag();
+  const cookieArgs = await getCookieArgs();
   try {
-    const cmd = await $`yt-dlp ${cookieFlag} -J --flat-playlist ${url}`.text();
-    const data = JSON.parse(cmd);
+    const { stdout } = await $`yt-dlp ${cookieArgs} -J --flat-playlist ${url}`;
+    const data = JSON.parse(stdout);
     const heights = new Set();
     for (const f of data.formats || []) {
       if (f.height && f.vcodec !== "none") heights.add(f.height);
@@ -76,30 +89,33 @@ async function getAvailableQualities(url) {
 }
 
 async function downloadVideo(url, quality) {
-  const cookieFlag = await getCookieFlag();
-  const infoJson = await $`yt-dlp ${cookieFlag} -J ${url}`.text();
-  const info = JSON.parse(infoJson);
+  const cookieArgs = await getCookieArgs();
+  const { stdout: infoStdout } = await $`yt-dlp ${cookieArgs} -J ${url}`;
+  const info = JSON.parse(infoStdout);
   const title = info.title.replace(/[^\w\s]/gi, "");
   const videoId = info.id;
   const outputPath = join(DOWNLOAD_DIR, `${videoId}.mp4`);
 
-  let formatSpec = "";
+  let formatArgs = [];
   if (quality !== "best") {
     const target = parseInt(quality);
-    if (!isNaN(target)) formatSpec = `-f "bestvideo[height<=${target}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${target}]"`;
+    if (!isNaN(target)) {
+      const formatSpec = `bestvideo[height<=${target}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${target}]`;
+      formatArgs = ["-f", formatSpec];
+    }
   }
-  await $`bash -c yt-dlp ${cookieFlag} ${formatSpec} -o "${outputPath}" --merge-output-format mp4 ${url}`;
+  await $`yt-dlp ${cookieArgs} ${formatArgs} -o ${outputPath} --merge-output-format mp4 ${url}`;
   return { outputPath, title, videoId, info };
 }
 
 async function downloadAudio(url) {
-  const cookieFlag = await getCookieFlag();
-  const infoJson = await $`yt-dlp ${cookieFlag} -J ${url}`.text();
-  const info = JSON.parse(infoJson);
+  const cookieArgs = await getCookieArgs();
+  const { stdout: infoStdout } = await $`yt-dlp ${cookieArgs} -J ${url}`;
+  const info = JSON.parse(infoStdout);
   const title = info.title.replace(/[^\w\s]/gi, "");
   const videoId = info.id;
   const mp3Path = join(DOWNLOAD_DIR, `${videoId}.mp3`);
-  await $`yt-dlp ${cookieFlag} -f bestaudio --extract-audio --audio-format mp3 --audio-quality 192K -o "${mp3Path}" ${url}`;
+  await $`yt-dlp ${cookieArgs} -f bestaudio --extract-audio --audio-format mp3 --audio-quality 192K -o ${mp3Path} ${url}`;
   return { mp3Path, title, videoId };
 }
 
@@ -166,7 +182,7 @@ bot.command("stats", (ctx) => {
   );
 });
 
-// ---------- Settings callbacks (unchanged, but kept for completeness) ----------
+// ---------- Settings callbacks ----------
 bot.callbackQuery("set_quality", async (ctx) => {
   const qualities = ["360p", "480p", "720p", "1080p", "1440p", "2160p", "best"];
   const keyboard = new InlineKeyboard();
@@ -285,13 +301,13 @@ bot.callbackQuery("dl:cancel", async (ctx) => {
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
   const match = text.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)/);
-  if (!match) return ctx.reply("Please send a valid YouTube URL (e.g., https://youtube.com/watch?v=...).");
+  if (!match) return ctx.reply("Please send a valid YouTube URL.");
   const url = match[0];
   ctx.session.currentUrl = url;
   try {
-    const cookieFlag = await getCookieFlag();
-    const infoJson = await $`yt-dlp ${cookieFlag} -J ${url}`.text();
-    const info = JSON.parse(infoJson);
+    const cookieArgs = await getCookieArgs();
+    const { stdout } = await $`yt-dlp ${cookieArgs} -J ${url}`;
+    const info = JSON.parse(stdout);
     const dur = info.duration ? `${Math.floor(info.duration / 60)}m ${info.duration % 60}s` : "?";
     const keyboard = new InlineKeyboard()
       .text("🎬 Video", "dl:video").row()
@@ -319,7 +335,7 @@ function settingsKeyboard(userId) {
     .text("❌ Close", "close_settings");
 }
 
-// ---------- Download handlers (video, audio, thumbnail) ----------
+// ---------- Download handlers ----------
 async function handleVideoDownload(ctx, url, quality) {
   const msg = await ctx.reply(`⬇️ *Downloading (${quality})…*`, { parse_mode: "Markdown" });
   try {
@@ -359,9 +375,9 @@ async function handleAudioDownload(ctx, url) {
 async function handleThumbnail(ctx, url) {
   const msg = await ctx.reply(`🖼 *Downloading thumbnail…*`, { parse_mode: "Markdown" });
   try {
-    const cookieFlag = await getCookieFlag();
-    const infoJson = await $`yt-dlp ${cookieFlag} -J ${url}`.text();
-    const info = JSON.parse(infoJson);
+    const cookieArgs = await getCookieArgs();
+    const { stdout } = await $`yt-dlp ${cookieArgs} -J ${url}`;
+    const info = JSON.parse(stdout);
     const thumb = await downloadThumbnail(info.id);
     if (!thumb) throw new Error("No thumbnail available");
     await ctx.replyWithPhoto(new Blob([await Deno.readFile(thumb)]), { caption: `🖼 ${info.title}` });
@@ -373,6 +389,7 @@ async function handleThumbnail(ctx, url) {
 }
 
 // ---------- Start bot ----------
+await logYtdlpVersion();
 cleanupWorker();
 bot.start();
-console.log("Bot started (Deno + cookie support)");
+console.log("Bot started (Deno + fixed cookie support)");

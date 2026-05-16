@@ -12,7 +12,7 @@ YouTube bypass strategy (ordered by reliability):
   7. compat_opts workarounds
 """
 
-import os, asyncio, time, logging, re, threading, random, urllib.request
+import os, asyncio, time, logging, re, threading, random, urllib.request, sys, platform, subprocess
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -24,6 +24,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, ExtractorError
+import yt_dlp as _yt_dlp_module
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -37,6 +38,7 @@ BOT_TOKEN    = os.environ["BOT_TOKEN"]
 DOWNLOAD_DIR = Path("downloads")
 COOKIES_FILE = "cookies.txt"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+BOT_START_TIME = time.time()
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -184,14 +186,57 @@ def get_settings(uid: int) -> dict:
 
 
 def quality_to_format(q: str) -> str:
-    m = {
-        "360p":  "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]",
-        "480p":  "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]",
-        "720p":  "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "1080p": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "best":  "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-    }
-    return m.get(q, m["720p"])
+    """
+    Build a yt-dlp format selector with an exhaustive fallback chain.
+
+    Why so many fallbacks?
+      - YouTube serves different containers per region/account/client:
+          mp4+m4a  (most common desktop)
+          webm+webm (common on android_music / tv_embedded clients)
+          mp4 with muxed audio (older / low-res videos)
+      - If the first selector fails yt-dlp raises "Requested format is not
+        available" instead of trying the next one — we must list ALL options.
+
+    Chain order for each quality:
+      1. mp4 video  + m4a audio  (best quality, needs ffmpeg merge)
+      2. webm video + webm audio (common on non-web clients)
+      3. mp4 video  + any audio  (any audio codec)
+      4. any video  + any audio  at the target height (widest net)
+      5. single-file best at that height (pre-muxed, no merge needed)
+      6. absolute fallback: best single-file available
+    """
+    h = {
+        "360p":  360,
+        "480p":  480,
+        "720p":  720,
+        "1080p": 1080,
+    }.get(q)
+
+    if h is None:
+        # "best" — no height constraint, just grab the highest quality
+        return (
+            "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[ext=webm]+bestaudio[ext=webm]"
+            "/bestvideo+bestaudio"
+            "/best"
+        )
+
+    return (
+        # 1. mp4 + m4a at or below target height
+        f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]"
+        # 2. webm + webm at or below target height
+        f"/bestvideo[height<={h}][ext=webm]+bestaudio[ext=webm]"
+        # 3. mp4 + any audio at or below target height
+        f"/bestvideo[height<={h}][ext=mp4]+bestaudio"
+        # 4. any video + any audio at or below target height
+        f"/bestvideo[height<={h}]+bestaudio"
+        # 5. pre-muxed (single file) at or below target height
+        f"/best[height<={h}]"
+        # 6. absolute fallback — ignore height, grab best available
+        "/bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo+bestaudio"
+        "/best"
+    )
 
 
 def register_for_cleanup(path: str, minutes: int):
@@ -228,7 +273,9 @@ def friendly_error(e: Exception) -> str:
         return "⚙️ *FFmpeg error.* Try a lower quality."
     if "fragment" in msg:
         return "🌐 *Network error* downloading fragments. Please retry."
-    if "no video formats" in msg or "requested format" in msg:
+    if "requested format" in msg or "not available" in msg:
+        return "❌ *Requested format not available.* Retrying with best available…"
+    if "no video formats" in msg:
         return "❌ *No downloadable formats found* for this video."
     return f"❌ Download failed:\n`{str(e)[:400]}`"
 
@@ -367,6 +414,90 @@ async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "If downloads still fail, cookies may have *expired*.\n"
                 "Re-export from a fresh YouTube session and redeploy."
             )
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+# ─── Stats ────────────────────────────────────────────────────────────────────
+def _get_ffmpeg_version() -> str:
+    """Return the FFmpeg version string, or a short error message."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        first_line = (result.stdout or result.stderr).splitlines()[0]
+        # e.g. "ffmpeg version 6.1.1-static https://..."
+        match = re.search(r"ffmpeg version\s+(\S+)", first_line, re.IGNORECASE)
+        return match.group(1) if match else first_line[:60]
+    except FileNotFoundError:
+        return "❌ Not found in PATH"
+    except Exception as exc:
+        return f"❌ {exc}"
+
+
+def _format_uptime(seconds: float) -> str:
+    seconds = int(seconds)
+    days,  seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    mins,  seconds = divmod(seconds, 60)
+    parts = []
+    if days:  parts.append(f"{days}d")
+    if hours: parts.append(f"{hours}h")
+    if mins:  parts.append(f"{mins}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def _download_dir_info() -> tuple[int, int]:
+    """Return (file_count, total_bytes) for DOWNLOAD_DIR."""
+    files = list(DOWNLOAD_DIR.iterdir()) if DOWNLOAD_DIR.exists() else []
+    total = sum(f.stat().st_size for f in files if f.is_file())
+    return len(files), total
+
+
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show bot + dependency statistics."""
+    # yt-dlp version
+    try:
+        ytdlp_ver = _yt_dlp_module.version.__version__
+    except Exception:
+        ytdlp_ver = "unknown"
+
+    ffmpeg_ver   = _get_ffmpeg_version()
+    python_ver   = sys.version.split()[0]
+    os_info      = f"{platform.system()} {platform.release()}"
+    uptime_str   = _format_uptime(time.time() - BOT_START_TIME)
+    file_count, dir_bytes = _download_dir_info()
+    dir_mb       = dir_bytes / (1024 * 1024)
+    active_users = len(user_settings)
+    queued_files = len(cleanup_registry)
+    cs           = cookie_status()
+    cookie_icon  = "✅" if cs["ok"] else "❌"
+    cookie_label = (
+        f"{cs.get('yt_lines', 0)} YT cookies, SAPISID={'✅' if cs.get('has_sapisid') else '⚠️'}"
+        if cs["ok"] else cs["reason"]
+    )
+
+    msg = (
+        "📊 *Bot Statistics*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🔧 *Dependencies*\n"
+        f"  • yt-dlp:  `{ytdlp_ver}`\n"
+        f"  • FFmpeg:  `{ffmpeg_ver}`\n"
+        f"  • Python:  `{python_ver}`\n"
+        f"  • OS:      `{os_info}`\n\n"
+        "⏱ *Runtime*\n"
+        f"  • Uptime:  `{uptime_str}`\n\n"
+        "👥 *Usage*\n"
+        f"  • Active user profiles:  `{active_users}`\n"
+        f"  • Files pending cleanup: `{queued_files}`\n\n"
+        "💾 *Download Folder*\n"
+        f"  • Files: `{file_count}`\n"
+        f"  • Size:  `{dir_mb:.2f} MB`\n\n"
+        "🍪 *Cookies*\n"
+        f"  • Status: {cookie_icon} `{cookie_label}`\n"
+    )
 
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -534,18 +665,28 @@ async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def show_quality_menu(q, ctx):
     info    = ctx.user_data.get("info", {})
     formats = info.get("formats", [])
+
+    # Guard: height must be a real positive int; filter out None / 0 / "none"
     heights = sorted(set(
-        f["height"] for f in formats
-        if f.get("height") and f.get("vcodec") not in (None, "none")
+        int(f["height"]) for f in formats
+        if f.get("height")
+        and isinstance(f["height"], (int, float))
+        and int(f["height"]) > 0
+        and f.get("vcodec") not in (None, "none")
     ))
+
+    # Common standard heights to offer even if yt-dlp returned none
+    # (happens when using tv_embedded / android_music clients)
     if not heights:
-        await do_video(q, ctx, q.from_user.id, "best"); return
+        heights = [360, 480, 720, 1080]
+
     rows, row = [], []
     for h in heights:
         row.append(InlineKeyboardButton(f"{h}p", callback_data=f"dl:quality:{h}p"))
         if len(row) == 3:
             rows.append(row); row = []
-    if row: rows.append(row)
+    if row:
+        rows.append(row)
     rows.append([InlineKeyboardButton("⭐ Best Available", callback_data="dl:quality:best")])
     rows.append([InlineKeyboardButton("❌ Cancel",         callback_data="dl:cancel")])
     await q.message.edit_text("🎬 *Select video quality:*",
@@ -562,26 +703,59 @@ async def do_video(q, ctx, uid: int, quality: str):
         parse_mode=ParseMode.MARKDOWN)
     loop = asyncio.get_event_loop()
     hook = build_progress_hook(loop, status, q.message.chat_id, ctx.bot)
+
     try:
         info = await do_download(url, {
-            "format":              quality_to_format(quality),
+            "format": quality_to_format(quality),
+            # mp4 is preferred output; yt-dlp will re-mux webm→mp4 via ffmpeg
+            # if both streams are webm this produces a valid mp4 container
             "merge_output_format": "mp4",
+            # If ffmpeg is unavailable and streams can't be merged, fall back
+            # to whatever single-file format exists rather than erroring out
+            "prefer_free_formats": False,
         }, hook)
     except (DownloadError, ExtractorError) as e:
-        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
+        err_str = str(e)
+        # "Requested format not available" → retry with absolute fallback
+        if "requested format" in err_str.lower() or "not available" in err_str.lower():
+            await status.edit_text(
+                f"⚠️ *{quality} not available for this video.*\n"
+                "⬇️ Retrying with best available quality…",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            try:
+                info = await do_download(url, {
+                    "format":              "bestvideo+bestaudio/best",
+                    "merge_output_format": "mp4",
+                }, hook)
+            except Exception as e2:
+                await status.edit_text(friendly_error(e2), parse_mode=ParseMode.MARKDOWN)
+                return
+        else:
+            await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+            return
     except Exception as e:
         await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
 
-    files = list(DOWNLOAD_DIR.glob(f"{info.get('id', '')}.*"))
+    # Find the downloaded file — look for mp4 first, then any extension
+    vid_id = info.get("id", "")
+    files  = (
+        list(DOWNLOAD_DIR.glob(f"{vid_id}.mp4"))
+        or list(DOWNLOAD_DIR.glob(f"{vid_id}.mkv"))
+        or list(DOWNLOAD_DIR.glob(f"{vid_id}.webm"))
+        or list(DOWNLOAD_DIR.glob(f"{vid_id}.*"))
+    )
     if not files:
         await status.edit_text("❌ File not found after download."); return
+
     filepath = str(files[0])
+    ext      = Path(filepath).suffix.lstrip(".")
     await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
     try:
         with open(filepath, "rb") as f:
             await ctx.bot.send_document(
                 chat_id=q.message.chat_id, document=f,
-                filename=Path(filepath).name,
+                filename=f"{info.get('title', vid_id)}.{ext}",
                 caption=f"🎬 {info.get('title', '')} [{quality}]",
             )
         await status.delete()
@@ -709,6 +883,7 @@ def main():
     app.add_handler(CommandHandler("help",        cmd_help))
     app.add_handler(CommandHandler("settings",    cmd_settings))
     app.add_handler(CommandHandler("cookiecheck", cmd_cookiecheck))
+    app.add_handler(CommandHandler("stats",       cmd_stats))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^s:"))
     app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -720,6 +895,7 @@ def main():
             BotCommand("help",        "Help & usage"),
             BotCommand("settings",    "Manage preferences"),
             BotCommand("cookiecheck", "Diagnose cookie issues"),
+            BotCommand("stats",       "Bot & dependency info"),
         ])
         asyncio.create_task(cleanup_worker())
 

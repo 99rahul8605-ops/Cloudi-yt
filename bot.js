@@ -5,6 +5,7 @@ const axios = require('axios');
 const { exec } = require('child_process');
 const util = require('util');
 const http = require('http');
+const { createReadStream } = require('fs');
 const execPromise = util.promisify(exec);
 
 // ---------- Config ----------
@@ -15,6 +16,9 @@ const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 const COOKIE_PATH = '/app/cookies.txt';
 fs.ensureDirSync(DOWNLOAD_DIR);
 
+// Timeout for yt-dlp commands (30 seconds)
+const YTDLP_TIMEOUT = 30000;
+
 // User settings (in-memory)
 const userSettings = new Map();
 const defaultSettings = { quality: '720p', mode: 'manual', cleanupMinutes: 10 };
@@ -23,26 +27,39 @@ const cleanupRegistry = new Map();
 // Bot start time
 const BOT_START_TIME = Date.now();
 
+// ---------- Pending downloads cleanup ----------
+const pendingDownloads = new Map(); // chatId -> { messageId: { url, timestamp } }
+const PENDING_TTL = 10 * 60 * 1000; // 10 minutes
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [chatId, entries] of pendingDownloads.entries()) {
+    for (const [msgId, data] of Object.entries(entries)) {
+      if (now - data.timestamp > PENDING_TTL) {
+        delete entries[msgId];
+      }
+    }
+    if (Object.keys(entries).length === 0) pendingDownloads.delete(chatId);
+  }
+}, 60000);
+
 // ---------- Health server ----------
 const PORT = process.env.PORT || 8080;
 const healthServer = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('OK');
 });
-healthServer.listen(PORT, () => {
-  console.log(`✅ Health server listening on port ${PORT}`);
-});
+healthServer.listen(PORT, () => console.log(`✅ Health server on port ${PORT}`));
 
 // ---------- yt-dlp version cache ----------
 let ytdlpVersion = null;
-
 async function getYtdlpVersion() {
   if (ytdlpVersion) return ytdlpVersion;
   try {
-    const { stdout } = await execPromise('yt-dlp --version');
+    const { stdout } = await execPromise('yt-dlp --version', { timeout: 5000 });
     ytdlpVersion = stdout.trim();
     return ytdlpVersion;
-  } catch (err) {
+  } catch {
     return 'unknown';
   }
 }
@@ -56,28 +73,28 @@ async function cookieExists() {
     return false;
   }
 }
-
 async function getCookieArg() {
-  const exists = await cookieExists();
-  if (exists) {
-    console.log('✅ cookies.txt found – using it for yt-dlp');
-    return `--cookies "${COOKIE_PATH}"`;
-  }
-  console.warn('⚠️ cookies.txt not found – some videos may be limited to 360p');
-  return '';
+  return (await cookieExists()) ? `--cookies "${COOKIE_PATH}"` : '';
 }
 
-// ---------- yt-dlp wrapper with EJS fix ----------
-async function runYtdlp(args) {
+// ---------- yt-dlp wrapper with timeout ----------
+async function runYtdlp(args, timeout = YTDLP_TIMEOUT) {
   const cookieArg = await getCookieArg();
   const remoteArg = '--remote-components ejs:npm';
-  const cmd = `yt-dlp ${cookieArg} ${remoteArg} ${args}`;
-  console.log(`Running: ${cmd}`);
-  const { stdout, stderr } = await execPromise(cmd);
-  if (stderr && !stderr.includes('WARNING') && !stderr.includes('[youtube]')) {
-    throw new Error(stderr);
+  const fullArgs = `${cookieArg} ${remoteArg} ${args}`;
+  console.log(`[yt-dlp] Running: ${fullArgs.substring(0, 150)}...`);
+  try {
+    const { stdout, stderr } = await execPromise(`yt-dlp ${fullArgs}`, { timeout });
+    if (stderr && !stderr.includes('WARNING') && !stderr.includes('[youtube]')) {
+      throw new Error(stderr);
+    }
+    return stdout;
+  } catch (err) {
+    if (err.killed && err.signal === 'SIGTERM') {
+      throw new Error('yt-dlp timed out after 30 seconds');
+    }
+    throw err;
   }
-  return stdout;
 }
 
 async function getAvailableQualities(url) {
@@ -91,7 +108,7 @@ async function getAvailableQualities(url) {
     const sorted = Array.from(heights).sort((a,b) => a-b);
     return sorted.length ? sorted : [360, 480, 720, 1080];
   } catch (err) {
-    console.error(err);
+    console.error('getAvailableQualities error:', err.message);
     return [360, 480, 720, 1080];
   }
 }
@@ -147,17 +164,13 @@ async function downloadThumbnail(videoId) {
 
 // ---------- Settings helpers ----------
 function getSettings(userId) {
-  if (!userSettings.has(userId)) {
-    userSettings.set(userId, { ...defaultSettings });
-  }
+  if (!userSettings.has(userId)) userSettings.set(userId, { ...defaultSettings });
   return userSettings.get(userId);
 }
-
 function scheduleCleanup(filePath, minutes) {
   const expire = minutes === 0 ? 0 : Date.now() + minutes * 60 * 1000;
   cleanupRegistry.set(filePath, expire);
 }
-
 async function cleanupWorker() {
   setInterval(async () => {
     const now = Date.now();
@@ -166,14 +179,13 @@ async function cleanupWorker() {
         try {
           await fs.remove(filePath);
           cleanupRegistry.delete(filePath);
-          console.log(`Cleaned: ${filePath}`);
         } catch {}
       }
     }
   }, 60000);
 }
 
-// ---------- Stats helper ----------
+// ---------- Stats helpers ----------
 async function getDownloadDirStats() {
   try {
     const files = await fs.readdir(DOWNLOAD_DIR);
@@ -187,7 +199,6 @@ async function getDownloadDirStats() {
     return { count: 0, sizeMB: '0.00' };
   }
 }
-
 function formatUptime(ms) {
   const seconds = Math.floor(ms / 1000);
   const days = Math.floor(seconds / 86400);
@@ -205,24 +216,18 @@ function formatUptime(ms) {
 // ---------- Telegram bot ----------
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Store pending downloads (chatId -> { messageId: url })
-const pendingDownloads = new Map();
-
-// Helper to create inline keyboards
+// Inline keyboards
 function settingsKeyboard(userId) {
   const s = getSettings(userId);
-  const modeLabel = s.mode === 'fixed' ? 'Fixed ✅' : 'Manual 🎛';
-  const timerLabel = s.cleanupMinutes === 0 ? '♾ Never' : `${s.cleanupMinutes} min`;
   return {
     inline_keyboard: [
       [{ text: `🎬 Quality: ${s.quality.toUpperCase()}`, callback_data: 'set_quality' }],
-      [{ text: `🔁 Mode: ${modeLabel}`, callback_data: 'set_mode' }],
-      [{ text: `🧹 Cleanup: ${timerLabel}`, callback_data: 'set_cleanup' }],
+      [{ text: `🔁 Mode: ${s.mode === 'fixed' ? 'Fixed ✅' : 'Manual 🎛'}`, callback_data: 'set_mode' }],
+      [{ text: `🧹 Cleanup: ${s.cleanupMinutes === 0 ? '♾ Never' : `${s.cleanupMinutes} min`}`, callback_data: 'set_cleanup' }],
       [{ text: '❌ Close', callback_data: 'close_settings' }],
     ],
   };
 }
-
 function downloadTypeKeyboard() {
   return {
     inline_keyboard: [
@@ -233,7 +238,6 @@ function downloadTypeKeyboard() {
     ],
   };
 }
-
 function qualityKeyboard(qualities) {
   const buttons = qualities.map(h => [{ text: `${h}p`, callback_data: `quality_${h}p` }]);
   buttons.push([{ text: '⭐ Best', callback_data: 'quality_best' }]);
@@ -243,9 +247,8 @@ function qualityKeyboard(qualities) {
 
 // ---------- Command handlers ----------
 bot.onText(/\/start/, (msg) => {
-  const chatId = msg.chat.id;
-  bot.sendMessage(chatId,
-    `👋 *Welcome to YT Downloader Bot (Node.js + yt-dlp + EJS fix)!*\n\n` +
+  bot.sendMessage(msg.chat.id,
+    `👋 *Welcome to YT Downloader Bot (Node.js + yt-dlp)!*\n\n` +
     `Send me a YouTube URL.\n` +
     `⚙️ /settings – Preferences\n` +
     `📊 /stats – Bot statistics`,
@@ -255,45 +258,43 @@ bot.onText(/\/start/, (msg) => {
 
 bot.onText(/\/stats/, async (msg) => {
   const chatId = msg.chat.id;
+  const userId = msg.from.id;
   try {
-    const ytVersion = await getYtdlpVersion();
-    const cookiePresent = await cookieExists();
-    const cookieStatus = cookiePresent ? '✅ Present' : '❌ Missing (some videos may be limited)';
-    const ejsStatus = '✅ Enabled (--remote-components ejs:npm)';
-    const uptime = formatUptime(Date.now() - BOT_START_TIME);
-    const activeUsers = userSettings.size;
-    const nodeVersion = process.version;
-    const { count: fileCount, sizeMB: dirSizeMB } = await getDownloadDirStats();
-    const pendingCleanup = cleanupRegistry.size;
-
+    const [ytVersion, cookiePresent, dirStats, uptime, activeUsers, nodeVersion, pendingCleanup, userSettingsObj] = await Promise.all([
+      getYtdlpVersion(),
+      cookieExists(),
+      getDownloadDirStats(),
+      formatUptime(Date.now() - BOT_START_TIME),
+      userSettings.size,
+      process.version,
+      cleanupRegistry.size,
+      getSettings(userId)
+    ]);
     const statsText = 
       `📊 *Bot Statistics*\n\n` +
       `🔧 *yt-dlp version*: \`${ytVersion}\`\n` +
-      `🍪 *Cookies*: ${cookieStatus}\n` +
-      `🧩 *EJS remote components*: ${ejsStatus}\n` +
+      `🍪 *Cookies*: ${cookiePresent ? '✅ Present' : '❌ Missing'}\n` +
+      `🧩 *EJS*: Enabled (--remote-components ejs:npm)\n` +
       `⏱ *Uptime*: ${uptime}\n` +
       `👥 *Active users*: ${activeUsers}\n` +
       `💻 *Node.js*: ${nodeVersion}\n` +
-      `💾 *Download folder*: ${fileCount} files, ${dirSizeMB} MB\n` +
+      `💾 *Download folder*: ${dirStats.count} files, ${dirStats.sizeMB} MB\n` +
       `🧹 *Pending cleanup*: ${pendingCleanup} files\n` +
-      `⚙️ *Settings*: Default quality = ${getSettings(msg.from.id).quality}, Mode = ${getSettings(msg.from.id).mode}, Cleanup = ${getSettings(msg.from.id).cleanupMinutes === 0 ? 'Never' : getSettings(msg.from.id).cleanupMinutes + ' min'}`;
-
+      `⚙️ *Your settings*: Quality = ${userSettingsObj.quality}, Mode = ${userSettingsObj.mode}, Cleanup = ${userSettingsObj.cleanupMinutes === 0 ? 'Never' : userSettingsObj.cleanupMinutes + ' min'}`;
     await bot.sendMessage(chatId, statsText, { parse_mode: 'Markdown' });
   } catch (err) {
-    await bot.sendMessage(chatId, `❌ Failed to get stats: \`${err.message}\``, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `❌ Stats error: \`${err.message}\``, { parse_mode: 'Markdown' });
   }
 });
 
 bot.onText(/\/settings/, async (msg) => {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  await bot.sendMessage(chatId, '⚙️ *Your Settings*', {
+  await bot.sendMessage(msg.chat.id, '⚙️ *Your Settings*', {
     parse_mode: 'Markdown',
-    reply_markup: settingsKeyboard(userId),
+    reply_markup: settingsKeyboard(msg.from.id),
   });
 });
 
-// ---------- Callback queries (same as before, but keep all) ----------
+// ---------- Callback queries ----------
 bot.on('callback_query', async (callbackQuery) => {
   const chatId = callbackQuery.message.chat.id;
   const messageId = callbackQuery.message.message_id;
@@ -302,7 +303,16 @@ bot.on('callback_query', async (callbackQuery) => {
 
   await bot.answerCallbackQuery(callbackQuery.id);
 
-  // Settings callbacks
+  // Helper to remove pending entry
+  function removePendingEntry() {
+    const chatPending = pendingDownloads.get(chatId);
+    if (chatPending && chatPending[messageId]) {
+      delete chatPending[messageId];
+      if (Object.keys(chatPending).length === 0) pendingDownloads.delete(chatId);
+    }
+  }
+
+  // ---- Settings callbacks ----
   if (data === 'close_settings') {
     await bot.deleteMessage(chatId, messageId);
     return;
@@ -312,9 +322,7 @@ bot.on('callback_query', async (callbackQuery) => {
     const buttons = qualities.map(q => [{ text: q, callback_data: `set_quality_${q}` }]);
     buttons.push([{ text: '⬅️ Back', callback_data: 'back_settings' }]);
     await bot.editMessageText('🎬 *Select default quality:*', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
+      chat_id: chatId, message_id: messageId, parse_mode: 'Markdown',
       reply_markup: { inline_keyboard: buttons },
     });
     return;
@@ -324,18 +332,9 @@ bot.on('callback_query', async (callbackQuery) => {
     const s = getSettings(userId);
     s.quality = quality;
     userSettings.set(userId, s);
-    await bot.editMessageText(`✅ Default quality set to ${quality}.`, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-    });
+    await bot.editMessageText(`✅ Default quality set to ${quality}.`, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
     setTimeout(async () => {
-      await bot.editMessageText('⚙️ *Your Settings*', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: settingsKeyboard(userId),
-      });
+      await bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) });
     }, 1000);
     return;
   }
@@ -345,30 +344,16 @@ bot.on('callback_query', async (callbackQuery) => {
       [{ text: 'Manual 🎛', callback_data: 'set_mode_manual' }],
       [{ text: '⬅️ Back', callback_data: 'back_settings' }],
     ];
-    await bot.editMessageText('🔁 *Download Mode:*', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: buttons },
-    });
+    await bot.editMessageText('🔁 *Download Mode:*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
     return;
   }
   if (data === 'set_mode_fixed') {
     const s = getSettings(userId);
     s.mode = 'fixed';
     userSettings.set(userId, s);
-    await bot.editMessageText('✅ Mode set to fixed.', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-    });
+    await bot.editMessageText('✅ Mode set to fixed.', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
     setTimeout(async () => {
-      await bot.editMessageText('⚙️ *Your Settings*', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: settingsKeyboard(userId),
-      });
+      await bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) });
     }, 1000);
     return;
   }
@@ -376,18 +361,9 @@ bot.on('callback_query', async (callbackQuery) => {
     const s = getSettings(userId);
     s.mode = 'manual';
     userSettings.set(userId, s);
-    await bot.editMessageText('✅ Mode set to manual.', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-    });
+    await bot.editMessageText('✅ Mode set to manual.', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
     setTimeout(async () => {
-      await bot.editMessageText('⚙️ *Your Settings*', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: settingsKeyboard(userId),
-      });
+      await bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) });
     }, 1000);
     return;
   }
@@ -398,12 +374,7 @@ bot.on('callback_query', async (callbackQuery) => {
       [{ text: '♾ Never', callback_data: 'set_cleanup_0' }],
       [{ text: '⬅️ Back', callback_data: 'back_settings' }],
     ];
-    await bot.editMessageText('🧹 *Auto-Cleanup Timer:*', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: buttons },
-    });
+    await bot.editMessageText('🧹 *Auto-Cleanup Timer:*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: { inline_keyboard: buttons } });
     return;
   }
   if (data.startsWith('set_cleanup_')) {
@@ -411,85 +382,58 @@ bot.on('callback_query', async (callbackQuery) => {
     const s = getSettings(userId);
     s.cleanupMinutes = minutes;
     userSettings.set(userId, s);
-    await bot.editMessageText(`✅ Cleanup set to ${minutes === 0 ? 'Never' : minutes + ' min'}.`, {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-    });
+    await bot.editMessageText(`✅ Cleanup set to ${minutes === 0 ? 'Never' : minutes + ' min'}.`, { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown' });
     setTimeout(async () => {
-      await bot.editMessageText('⚙️ *Your Settings*', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: settingsKeyboard(userId),
-      });
+      await bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) });
     }, 1000);
     return;
   }
   if (data === 'back_settings') {
-    await bot.editMessageText('⚙️ *Your Settings*', {
-      chat_id: chatId,
-      message_id: messageId,
-      parse_mode: 'Markdown',
-      reply_markup: settingsKeyboard(userId),
-    });
+    await bot.editMessageText('⚙️ *Your Settings*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: settingsKeyboard(userId) });
     return;
   }
 
-  // Download callbacks
+  // ---- Download callbacks ----
   if (data === 'dl_video') {
-    const url = pendingDownloads.get(chatId)?.[messageId];
-    if (!url) {
-      await bot.sendMessage(chatId, 'No URL found. Please send again.');
-      return;
-    }
+    const url = pendingDownloads.get(chatId)?.[messageId]?.url;
+    if (!url) { await bot.sendMessage(chatId, 'No URL found. Please send again.'); return; }
+    removePendingEntry();
     const s = getSettings(userId);
     if (s.mode === 'fixed') {
       const statusMsg = await bot.sendMessage(chatId, `⬇️ *Downloading (${s.quality})…*`, { parse_mode: 'Markdown' });
       await startVideoDownload(chatId, userId, url, s.quality, statusMsg.message_id);
     } else {
       const heights = await getAvailableQualities(url);
-      const keyboard = qualityKeyboard(heights);
-      await bot.editMessageText('🎬 *Select video quality:*', {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: 'Markdown',
-        reply_markup: keyboard,
-      });
+      await bot.editMessageText('🎬 *Select video quality:*', { chat_id: chatId, message_id: messageId, parse_mode: 'Markdown', reply_markup: qualityKeyboard(heights) });
     }
     return;
   }
   if (data === 'dl_audio') {
-    const url = pendingDownloads.get(chatId)?.[messageId];
-    if (!url) {
-      await bot.sendMessage(chatId, 'No URL found. Please send again.');
-      return;
-    }
+    const url = pendingDownloads.get(chatId)?.[messageId]?.url;
+    if (!url) { await bot.sendMessage(chatId, 'No URL found.'); return; }
+    removePendingEntry();
     const statusMsg = await bot.sendMessage(chatId, '⬇️ *Extracting audio…*', { parse_mode: 'Markdown' });
     await startAudioDownload(chatId, userId, url, statusMsg.message_id);
     return;
   }
   if (data === 'dl_thumb') {
-    const url = pendingDownloads.get(chatId)?.[messageId];
-    if (!url) {
-      await bot.sendMessage(chatId, 'No URL found. Please send again.');
-      return;
-    }
+    const url = pendingDownloads.get(chatId)?.[messageId]?.url;
+    if (!url) { await bot.sendMessage(chatId, 'No URL found.'); return; }
+    removePendingEntry();
     const statusMsg = await bot.sendMessage(chatId, '🖼 *Downloading thumbnail…*', { parse_mode: 'Markdown' });
     await startThumbnailDownload(chatId, userId, url, statusMsg.message_id);
     return;
   }
   if (data === 'cancel_download') {
+    removePendingEntry();
     await bot.deleteMessage(chatId, messageId);
     return;
   }
   if (data.startsWith('quality_')) {
     const quality = data.replace('quality_', '');
-    const url = pendingDownloads.get(chatId)?.[messageId];
-    if (!url) {
-      await bot.sendMessage(chatId, 'Session expired. Please send URL again.');
-      return;
-    }
+    const url = pendingDownloads.get(chatId)?.[messageId]?.url;
+    if (!url) { await bot.sendMessage(chatId, 'Session expired. Please send URL again.'); return; }
+    removePendingEntry();
     const statusMsg = await bot.sendMessage(chatId, `⬇️ *Downloading (${quality})…*`, { parse_mode: 'Markdown' });
     await startVideoDownload(chatId, userId, url, quality, statusMsg.message_id);
     await bot.deleteMessage(chatId, messageId);
@@ -497,54 +441,35 @@ bot.on('callback_query', async (callbackQuery) => {
   }
 });
 
-// ---------- Download implementations (unchanged) ----------
+// ---------- Download implementations (streaming, non‑blocking) ----------
 async function startVideoDownload(chatId, userId, url, quality, statusMsgId) {
   try {
     const { outputPath, title, videoId } = await downloadVideo(url, quality);
     const thumb = await downloadThumbnail(videoId);
-    await bot.editMessageText('📤 *Uploading video…*', {
-      chat_id: chatId,
-      message_id: statusMsgId,
-      parse_mode: 'Markdown',
-    });
-    await bot.sendVideo(chatId, outputPath, {
-      caption: `🎬 ${title}\n[${quality}]`,
-      thumbnail: thumb,
-      supports_streaming: true,
-    });
+    await bot.editMessageText('📤 *Uploading video…*', { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' });
+    const videoStream = createReadStream(outputPath);
+    const options = { caption: `🎬 ${title}\n[${quality}]`, supports_streaming: true };
+    if (thumb) options.thumbnail = thumb;
+    await bot.sendVideo(chatId, videoStream, options);
     await bot.deleteMessage(chatId, statusMsgId);
     const minutes = getSettings(userId).cleanupMinutes;
     scheduleCleanup(outputPath, minutes);
     if (thumb) scheduleCleanup(thumb, minutes);
   } catch (err) {
-    await bot.editMessageText(`❌ Download failed: \`${err.message}\``, {
-      chat_id: chatId,
-      message_id: statusMsgId,
-      parse_mode: 'Markdown',
-    });
+    await bot.editMessageText(`❌ Download failed: \`${err.message}\``, { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' });
   }
 }
 
 async function startAudioDownload(chatId, userId, url, statusMsgId) {
   try {
     const { mp3Path, title } = await downloadAudio(url);
-    await bot.editMessageText('📤 *Uploading MP3…*', {
-      chat_id: chatId,
-      message_id: statusMsgId,
-      parse_mode: 'Markdown',
-    });
-    await bot.sendDocument(chatId, mp3Path, {
-      caption: `🎵 ${title}`,
-      filename: `${title}.mp3`,
-    });
+    await bot.editMessageText('📤 *Uploading MP3…*', { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' });
+    const audioStream = createReadStream(mp3Path);
+    await bot.sendDocument(chatId, audioStream, { caption: `🎵 ${title}`, filename: `${title}.mp3` });
     await bot.deleteMessage(chatId, statusMsgId);
     scheduleCleanup(mp3Path, getSettings(userId).cleanupMinutes);
   } catch (err) {
-    await bot.editMessageText(`❌ Audio failed: \`${err.message}\``, {
-      chat_id: chatId,
-      message_id: statusMsgId,
-      parse_mode: 'Markdown',
-    });
+    await bot.editMessageText(`❌ Audio failed: \`${err.message}\``, { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' });
   }
 }
 
@@ -554,24 +479,20 @@ async function startThumbnailDownload(chatId, userId, url, statusMsgId) {
     const info = JSON.parse(infoJson);
     const thumb = await downloadThumbnail(info.id);
     if (!thumb) throw new Error('No thumbnail');
-    await bot.sendPhoto(chatId, thumb, { caption: `🖼 ${info.title}` });
+    const thumbStream = createReadStream(thumb);
+    await bot.sendPhoto(chatId, thumbStream, { caption: `🖼 ${info.title}` });
     await bot.deleteMessage(chatId, statusMsgId);
     scheduleCleanup(thumb, getSettings(userId).cleanupMinutes);
   } catch (err) {
-    await bot.editMessageText(`❌ Thumbnail failed: \`${err.message}\``, {
-      chat_id: chatId,
-      message_id: statusMsgId,
-      parse_mode: 'Markdown',
-    });
+    await bot.editMessageText(`❌ Thumbnail failed: \`${err.message}\``, { chat_id: chatId, message_id: statusMsgId, parse_mode: 'Markdown' });
   }
 }
 
-// ---------- Message handler for URLs ----------
+// ---------- Message handler (immediate response) ----------
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
-  if (!text) return;
-  if (text.startsWith('/')) return;
+  if (!text || text.startsWith('/')) return;
 
   const urlMatch = text.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/)([\w-]+)/);
   if (!urlMatch) {
@@ -579,24 +500,28 @@ bot.on('message', async (msg) => {
     return;
   }
   const url = urlMatch[0];
+
+  // Send immediate "processing" message
+  const processingMsg = await bot.sendMessage(chatId, '⏳ *Fetching video info...*', { parse_mode: 'Markdown' });
+
   try {
     const infoJson = await runYtdlp(`-J "${url}"`);
     const info = JSON.parse(infoJson);
     const dur = info.duration ? `${Math.floor(info.duration/60)}m ${info.duration%60}s` : '?';
     const sent = await bot.sendMessage(chatId,
       `📹 *${info.title}*\n⏱ \`${dur}\`\n\nWhat would you like?`,
-      {
-        parse_mode: 'Markdown',
-        reply_markup: downloadTypeKeyboard(),
-      }
+      { parse_mode: 'Markdown', reply_markup: downloadTypeKeyboard() }
     );
+    // Store the URL for this message
     if (!pendingDownloads.has(chatId)) pendingDownloads.set(chatId, {});
-    pendingDownloads.get(chatId)[sent.message_id] = url;
+    pendingDownloads.get(chatId)[sent.message_id] = { url, timestamp: Date.now() };
+    // Delete the "processing" message
+    await bot.deleteMessage(chatId, processingMsg.message_id);
   } catch (err) {
-    await bot.sendMessage(chatId, `❌ Failed to fetch video info: \`${err.message}\``, { parse_mode: 'Markdown' });
+    await bot.editMessageText(`❌ Failed to fetch video info: \`${err.message}\``, { chat_id: chatId, message_id: processingMsg.message_id, parse_mode: 'Markdown' });
   }
 });
 
-// ---------- Start cleanup worker ----------
+// ---------- Start ----------
 cleanupWorker();
-console.log('✅ Bot started (Node.js + yt-dlp + EJS fix + health server + stats command)');
+console.log('✅ Bot started (fast, responsive, memory-optimized)');

@@ -2,17 +2,10 @@
  * Telegram YouTube Downloader Bot — Node.js
  * Grammy + yt-dlp + FFmpeg
  *
- * No-cookie bypass strategy (layered):
- *   1. android_vr  — no sign-in wall, full format list, works without cookies
- *   2. ios         — full resolution, low bot-detection
- *   3. web         — standard web client
- *   4. mweb        — mobile web fallback
- *   5. tv_embedded — age-gate bypass, 360p max (last resort)
- *
- *   skip=webpage   — skips JS player challenge page entirely
- *   --no-check-certificate — avoids SSL issues in Docker containers
- *
- * If cookies.txt IS present and valid, it is used on top for best reliability.
+ * Cookie bypass strategy:
+ *   - cookies.txt auto-detected at startup (absolute path, next to bot.js)
+ *   - With cookies    → web, android, ios clients (full resolution)
+ *   - Without cookies → android_vr, ios, web, mweb, tv_embedded (no sign-in wall)
  */
 
 "use strict";
@@ -31,23 +24,14 @@ const execFileAsync = promisify(execFile);
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const DOWNLOAD_DIR = path.resolve("downloads");
+// FIX: absolute path so cookies.txt is always found next to bot.js,
+// regardless of what directory the process is launched from (Render, Railway, etc.)
 const COOKIES_FILE = path.resolve(__dirname, "cookies.txt");
 const PORT         = parseInt(process.env.PORT || "8080", 10);
 
 if (!BOT_TOKEN) {
   console.error("FATAL: BOT_TOKEN environment variable is not set.");
   process.exit(1);
-}
-
-// ── Startup cookie diagnostic ─────────────────────────────────────────────────
-{
-  const cs = cookieStatus();
-  if (cs.ok) {
-    console.log(`[startup] cookies.txt ✅  path=${COOKIES_FILE}  size=${cs.size}B  ytLines=${cs.ytLines}  SAPISID=${cs.hasSAPISID}  SID=${cs.hasSID}`);
-  } else {
-    console.warn(`[startup] cookies.txt ❌  reason="${cs.reason}"  path=${COOKIES_FILE}`);
-    console.warn("[startup] Bot will use android_vr bypass — some videos may still be blocked.");
-  }
 }
 
 fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
@@ -65,21 +49,26 @@ function getSettings(uid) {
 // ── Cookie helpers ────────────────────────────────────────────────────────────
 function cookieStatus() {
   if (!fs.existsSync(COOKIES_FILE))
-    return { ok: false, reason: `File not found at ${COOKIES_FILE}` };
+    return { ok: false, reason: `File not found at: ${COOKIES_FILE}` };
+
   const stat = fs.statSync(COOKIES_FILE);
   if (stat.size < 100)
-    return { ok: false, reason: `File too small (${stat.size} bytes) — export again` };
+    return { ok: false, reason: `File too small (${stat.size} bytes) — re-export it` };
+
   let text;
   try { text = fs.readFileSync(COOKIES_FILE, "utf8"); }
-  catch (e) { return { ok: false, reason: `Cannot read: ${e.message}` }; }
+  catch (e) { return { ok: false, reason: `Cannot read file: ${e.message}` }; }
 
-  // Normalize line endings (Windows CRLF -> LF)
+  // Normalize Windows line endings
   const lines = text.replace(/\r\n/g, "\n").split("\n");
 
   // Must be Netscape cookie format
   const hasHeader = lines.some(l => l.includes("Netscape HTTP Cookie File"));
   if (!hasHeader)
-    return { ok: false, reason: "Not a valid Netscape cookie file (missing header). Re-export using 'Get cookies.txt LOCALLY' extension." };
+    return {
+      ok: false,
+      reason: "Not a valid Netscape cookie file — re-export using the 'Get cookies.txt LOCALLY' Chrome/Firefox extension",
+    };
 
   const real = lines.filter(l => l.trim() && !l.startsWith("#"));
   const yt   = real.filter(l =>
@@ -87,22 +76,37 @@ function cookieStatus() {
     l.includes("google.com")  || l.includes(".google.com")
   );
 
-  if (!real.length) return { ok: false, reason: "No cookie data found (file contains only comments)" };
-  if (!yt.length)   return { ok: false, reason: "No youtube.com/google.com cookies — export from youtube.com while logged in" };
-
-  const hasSAPISID   = yt.some(l => l.includes("SAPISID"));
-  const hasSID       = yt.some(l => l.includes("\tSID\t") || l.includes("\t__Secure-1PSID\t") || l.includes("__Secure-3PSID"));
+  if (!real.length) return { ok: false, reason: "No cookie data (only comments/blank lines)" };
+  if (!yt.length)   return { ok: false, reason: "No youtube.com/google.com cookies found — export while logged into youtube.com" };
 
   return {
-    ok: true, size: stat.size,
-    total: real.length, ytLines: yt.length,
-    hasSAPISID, hasSID,
+    ok: true,
+    size: stat.size,
+    total: real.length,
+    ytLines: yt.length,
+    hasSAPISID: yt.some(l => l.includes("SAPISID")),
+    hasSID: yt.some(l =>
+      l.includes("\tSID\t") ||
+      l.includes("\t__Secure-1PSID\t") ||
+      l.includes("__Secure-3PSID")
+    ),
     sample: yt[0]?.slice(0, 120) || "",
   };
 }
 
-// ── yt-dlp helpers ────────────────────────────────────────────────────────────
+// ── Startup cookie diagnostic ─────────────────────────────────────────────────
+{
+  const cs = cookieStatus();
+  if (cs.ok) {
+    console.log(`[startup] cookies.txt ✅  path=${COOKIES_FILE}  size=${cs.size}B  ytLines=${cs.ytLines}  SAPISID=${cs.hasSAPISID}  SID=${cs.hasSID}`);
+  } else {
+    console.warn(`[startup] cookies.txt ❌  reason="${cs.reason}"`);
+    console.warn(`[startup] Expected path: ${COOKIES_FILE}`);
+    console.warn("[startup] Bot will use android_vr bypass — some videos may still be blocked.");
+  }
+}
 
+// ── yt-dlp helpers ────────────────────────────────────────────────────────────
 function baseArgs() {
   const cs = cookieStatus();
   const args = [
@@ -122,19 +126,17 @@ function baseArgs() {
     "--add-header", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "--add-header", "DNT:1",
     "--add-header", "Sec-Fetch-Mode:navigate",
-    // Use cookies if valid; with cookies prefer web client (better quality & access)
-    // Without cookies use android_vr (no sign-in wall) + ios fallbacks
   ];
 
   if (cs.ok) {
     args.push("--cookies", COOKIES_FILE);
-    // With valid cookies, web client gives best results
+    // With valid cookies, web client gives best quality and access
     args.push("--extractor-args", "youtube:player_client=web,android,ios,tv_embedded;skip=webpage");
-    console.log(`[yt-dlp] cookies.txt OK — ${cs.ytLines} YT lines, SAPISID=${cs.hasSAPISID}, SID=${cs.hasSID} | path: ${COOKIES_FILE}`);
+    console.log(`[yt-dlp] cookies.txt OK — ${cs.ytLines} YT lines | SAPISID=${cs.hasSAPISID} | SID=${cs.hasSID}`);
   } else {
-    // No cookies: android_vr bypasses sign-in walls without authentication
+    // No cookies: android_vr bypasses sign-in wall without authentication
     args.push("--extractor-args", "youtube:player_client=android_vr,ios,web,mweb,tv_embedded;skip=webpage");
-    console.log(`[yt-dlp] No valid cookies (${cs.reason}) — android_vr bypass active`);
+    console.log(`[yt-dlp] No cookies (${cs.reason}) — android_vr bypass active`);
   }
 
   return args;
@@ -242,13 +244,13 @@ function friendlyError(err) {
       msg.includes("confirm your age") || msg.includes("this video is unavailable")) {
     const cs = cookieStatus();
     const hint = cs.ok
-      ? "🍪 Cookies loaded but YouTube still blocked — they may be expired. Re-export and redeploy."
-      : `🍪 No valid cookies found (${cs.reason}). Run /cookiecheck for details.`;
-    return `🔒 *YouTube blocked this video.*\n${hint}`;
+      ? "Cookies are loaded but may be *expired* — re-export from a fresh YouTube session and redeploy."
+      : `Cookie problem: _${cs.reason}_\nRun /cookiecheck for details.`;
+    return `🔒 *YouTube blocked this video.*\n\n🍪 ${hint}`;
   }
   if (msg.includes("private"))     return "🔒 This video is *private*.";
   if (msg.includes("unavailable")) return "❌ Video *unavailable* — region-blocked or removed.";
-  if (msg.includes("age"))         return "🔞 *Age-restricted.* Add cookies from a verified account and redeploy.";
+  if (msg.includes("age"))         return "🔞 *Age-restricted.* Add cookies from a verified account.";
   if (msg.includes("copyright") || msg.includes("blocked"))
                                    return "⛔ Blocked due to *copyright restrictions*.";
   if (msg.includes("ffmpeg"))      return "⚙️ *FFmpeg error.* Try a lower quality.";
@@ -310,9 +312,9 @@ bot.command("cookiecheck", async (ctx) => {
   if (!cs.ok) {
     msg =
       "🍪 *Cookie Check — ❌ PROBLEM*\n\n" +
-      `❗ Issue: \`${cs.reason}\`\n` +
-      `📁 Expected path: \`${COOKIES_FILE}\`\n\n` +
-      "*How to fix:*\n1\\. Log into YouTube in Chrome/Firefox\n" +
+      `📁 Path: \`${COOKIES_FILE}\`\n` +
+      `❗ Issue: \`${cs.reason}\`\n\n` +
+      "*How to fix:*\n1\\. Log into YouTube in Chrome/Firefox \\(not incognito\\)\n" +
       "2\\. Install *'Get cookies\\.txt LOCALLY'* extension\n" +
       "3\\. Export `cookies.txt` from youtube\\.com\n" +
       "4\\. Place it next to `bot\\.js` and redeploy\n\n" +
@@ -326,7 +328,7 @@ bot.command("cookiecheck", async (ctx) => {
       `🔑 SAPISID: ${cs.hasSAPISID ? "✅" : "⚠️ Missing"}\n` +
       `🔑 SID: ${cs.hasSID ? "✅" : "⚠️ Missing"}\n\n` +
       ((!cs.hasSAPISID || !cs.hasSID)
-        ? "_⚠️ Some auth cookies are missing\\. Re\\-export while logged into YouTube for best results\\._"
+        ? "_⚠️ Some auth cookies missing — re\\-export while fully logged into YouTube\\._"
         : "_✅ All key auth cookies present\\._");
   }
   await ctx.reply(msg, { parse_mode: "MarkdownV2" });

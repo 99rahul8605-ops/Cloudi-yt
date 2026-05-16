@@ -12,10 +12,6 @@ const execPromise = util.promisify(exec);
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN env var');
 
-// Custom Bot API server (set to your local server URL, e.g., http://localhost:8081)
-// If not set, falls back to public API (50MB limit)
-const LOCAL_BOT_API_URL = process.env.LOCAL_BOT_API_URL || 'https://api.telegram.org';
-
 const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
 const COOKIE_PATH = '/app/cookies.txt';
 fs.ensureDirSync(DOWNLOAD_DIR);
@@ -75,8 +71,8 @@ async function getCookieArg() {
   return (await cookieExists()) ? `--cookies "${COOKIE_PATH}"` : '';
 }
 
-// ---------- yt-dlp wrapper with optimizations and verbose logging ----------
-async function runYtdlp(args, timeout = YTDLP_TIMEOUT, verbose = false) {
+// ---------- yt-dlp wrapper with all optimizations ----------
+async function runYtdlp(args, timeout = YTDLP_TIMEOUT) {
   const cookieArg = await getCookieArg();
   const opts = [
     '--concurrent-fragments 50',
@@ -84,13 +80,11 @@ async function runYtdlp(args, timeout = YTDLP_TIMEOUT, verbose = false) {
     '--js-runtimes deno',
     '--remote-components ejs:github',
   ].join(' ');
-  const verboseFlag = verbose ? '--verbose' : '';
-  const fullArgs = `${cookieArg} ${opts} ${verboseFlag} ${args}`;
-  console.log(`[yt-dlp] Running: yt-dlp ${fullArgs}`);
+  // Ensure the format selector is passed as a single argument
+  const fullArgs = `${cookieArg} ${opts} ${args}`;
+  console.log(`[yt-dlp] Running: ${fullArgs.substring(0, 200)}...`);
   try {
     const { stdout, stderr } = await execPromise(`yt-dlp ${fullArgs}`, { timeout });
-    // Log stderr for debugging (especially format selection messages)
-    if (stderr) console.log(`[yt-dlp stderr]\n${stderr}`);
     if (stderr && !stderr.includes('WARNING') && !stderr.includes('[youtube]')) {
       throw new Error(stderr);
     }
@@ -106,10 +100,12 @@ async function runYtdlp(args, timeout = YTDLP_TIMEOUT, verbose = false) {
 // ---------- Get all available video heights (including video-only) ----------
 async function getAvailableQualities(url) {
   try {
-    const stdout = await runYtdlp(`-J "${url}"`, YTDLP_TIMEOUT, false);
+    // Use full info (not --flat-playlist) to get video-only formats
+    const stdout = await runYtdlp(`-J "${url}"`);
     const data = JSON.parse(stdout);
     const heights = new Set();
     for (const f of data.formats || []) {
+      // Include any format that has video (vcodec not 'none')
       if (f.height && f.vcodec && f.vcodec !== 'none') {
         heights.add(f.height);
       }
@@ -123,9 +119,9 @@ async function getAvailableQualities(url) {
   }
 }
 
-// ---------- Download video (separate video+audio, merge with ffmpeg) ----------
+// ---------- Download video (separate video+audio, then merge) ----------
 async function downloadVideo(url, quality) {
-  const infoJson = await runYtdlp(`-J "${url}"`, YTDLP_TIMEOUT, false);
+  const infoJson = await runYtdlp(`-J "${url}"`);
   const info = JSON.parse(infoJson);
   const title = info.title.replace(/[^\w\s]/gi, '');
   const videoId = info.id;
@@ -135,34 +131,26 @@ async function downloadVideo(url, quality) {
   if (quality !== 'best') {
     const target = parseInt(quality);
     if (!isNaN(target)) {
-      // Force separate video and audio streams, then merge with ffmpeg
-      formatArg = `-f "bestvideo[height<=${target}]+bestaudio/best[height<=${target}]"`;
+      // Use single quotes around the format selector to prevent shell splitting
+      formatArg = `-f 'bestvideo[height<=${target}]+bestaudio/best[height<=${target}]'`;
     }
   } else {
-    formatArg = `-f "bestvideo+bestaudio/best"`;
+    formatArg = `-f 'bestvideo+bestaudio/best'`;
   }
-  // Use --merge-output-format mp4 to ensure ffmpeg merges
+  // Add --verbose to see selected formats in logs
   const cmd = `${formatArg} -o "${outputPath}" --merge-output-format mp4 --verbose "${url}"`;
-  console.log(`[yt-dlp] Download command: yt-dlp ${cmd}`);
-  
-  // Run with verbose=true to see format selection details
-  await runYtdlp(cmd, YTDLP_TIMEOUT, true);
-  
-  // Verify that the file exists and is not empty
-  const stats = await fs.stat(outputPath);
-  if (stats.size === 0) throw new Error('Downloaded file is empty');
-  console.log(`Downloaded ${outputPath} (${stats.size} bytes)`);
-  
+  console.log(`Download command: yt-dlp ${cmd}`);
+  await runYtdlp(cmd);
   return { outputPath, title, videoId, info };
 }
 
 async function downloadAudio(url) {
-  const infoJson = await runYtdlp(`-J "${url}"`, YTDLP_TIMEOUT, false);
+  const infoJson = await runYtdlp(`-J "${url}"`);
   const info = JSON.parse(infoJson);
   const title = info.title.replace(/[^\w\s]/gi, '');
   const videoId = info.id;
   const mp3Path = path.join(DOWNLOAD_DIR, `${videoId}.mp3`);
-  await runYtdlp(`-f bestaudio --extract-audio --audio-format mp3 --audio-quality 192K -o "${mp3Path}" "${url}"`, YTDLP_TIMEOUT, true);
+  await runYtdlp(`-f bestaudio --extract-audio --audio-format mp3 --audio-quality 192K -o "${mp3Path}" "${url}"`);
   return { mp3Path, title, videoId };
 }
 
@@ -241,12 +229,8 @@ function formatUptime(ms) {
   return parts.join(' ');
 }
 
-// ---------- Telegram bot with custom API server ----------
-const bot = new TelegramBot(BOT_TOKEN, {
-  polling: true,
-  apiRoot: LOCAL_BOT_API_URL
-});
-console.log(`Bot using API root: ${LOCAL_BOT_API_URL}`);
+// ---------- Telegram bot ----------
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 // ---------- Inline keyboards ----------
 function settingsKeyboard(userId) {
@@ -282,7 +266,7 @@ function qualityKeyboard(qualities) {
 // ---------- Command handlers ----------
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id,
-    `👋 *Welcome to YT Downloader Bot (2GB Upload + FFmpeg Merge)*\n\n` +
+    `👋 *Welcome to YT Downloader Bot (Optimized)*\n\n` +
     `Send me a YouTube URL.\n` +
     `⚙️ /settings – Preferences\n` +
     `📊 /stats – Bot statistics\n` +
@@ -291,12 +275,13 @@ bot.onText(/\/start/, (msg) => {
   );
 });
 
+// Debug command to list all available formats
 bot.onText(/\/formats (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const url = match[1];
   const processing = await bot.sendMessage(chatId, '🔍 Fetching formats...');
   try {
-    const stdout = await runYtdlp(`-J "${url}"`, YTDLP_TIMEOUT, false);
+    const stdout = await runYtdlp(`-J "${url}"`);
     const data = JSON.parse(stdout);
     const formats = data.formats || [];
     const lines = [];
@@ -335,8 +320,6 @@ bot.onText(/\/stats/, async (msg) => {
       `🔧 *yt-dlp version*: \`${ytVersion}\`\n` +
       `🍪 *Cookies*: ${cookiePresent ? '✅ Present' : '❌ Missing'}\n` +
       `🚀 *Optimizations*: concurrent fragments=50, geo-bypass, deno runtime\n` +
-      `📤 *Upload limit*: ${LOCAL_BOT_API_URL !== 'https://api.telegram.org' ? '2GB (custom API server)' : '50MB (public API)'}\n` +
-      `🎞️ *FFmpeg merge*: Enabled (separate video+audio streams)\n` +
       `⏱ *Uptime*: ${uptime}\n` +
       `👥 *Active users*: ${activeUsers}\n` +
       `💻 *Node.js*: ${nodeVersion}\n` +
@@ -363,6 +346,7 @@ bot.on('callback_query', async (callbackQuery) => {
   const userId = callbackQuery.from.id;
   const data = callbackQuery.data;
 
+  // Always answer first
   await bot.answerCallbackQuery(callbackQuery.id);
 
   function removePendingEntry() {
@@ -541,7 +525,6 @@ async function startVideoDownload(chatId, userId, url, quality, statusMsgId) {
     scheduleCleanup(outputPath, minutes);
     if (thumb) scheduleCleanup(thumb, minutes);
   } catch (err) {
-    console.error(`Download error: ${err.message}`);
     await bot.editMessageText(`❌ Download failed: \`${err.message}\``, {
       chat_id: chatId,
       message_id: statusMsgId,
@@ -576,7 +559,7 @@ async function startAudioDownload(chatId, userId, url, statusMsgId) {
 
 async function startThumbnailDownload(chatId, userId, url, statusMsgId) {
   try {
-    const infoJson = await runYtdlp(`-J "${url}"`, YTDLP_TIMEOUT, false);
+    const infoJson = await runYtdlp(`-J "${url}"`);
     const info = JSON.parse(infoJson);
     const thumb = await downloadThumbnail(info.id);
     if (!thumb) throw new Error('No thumbnail');
@@ -608,7 +591,7 @@ bot.on('message', async (msg) => {
   const processingMsg = await bot.sendMessage(chatId, '⏳ *Fetching video info...*', { parse_mode: 'Markdown' });
 
   try {
-    const infoJson = await runYtdlp(`-J "${url}"`, YTDLP_TIMEOUT, false);
+    const infoJson = await runYtdlp(`-J "${url}"`);
     const info = JSON.parse(infoJson);
     const dur = info.duration ? `${Math.floor(info.duration / 60)}m ${info.duration % 60}s` : '?';
     const sent = await bot.sendMessage(chatId,
@@ -629,4 +612,4 @@ bot.on('message', async (msg) => {
 
 // ---------- Start cleanup worker and bot ----------
 cleanupWorker();
-console.log('✅ Bot started with FFmpeg merge, 2GB upload support, and verbose logging');
+console.log('✅ Bot started with fixed format selection and /formats debug command');

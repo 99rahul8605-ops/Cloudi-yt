@@ -26,6 +26,7 @@ COPY bot.js .
 
 # Optional: copy cookies.txt if you have one
 # COPY cookies.txt /app/cookies.txt
+COPY cookies.txt /app/cookies.txt
 
 RUN mkdir -p downloads
 

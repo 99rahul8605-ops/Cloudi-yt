@@ -1,15 +1,26 @@
 """
 Advanced Telegram YouTube Downloader Bot
-python-telegram-bot v21 | yt-dlp | FFmpeg | Render
+python-telegram-bot v21 (handlers) + Pyrogram (MTProto upload) | yt-dlp | FFmpeg
+
+Architecture:
+  • python-telegram-bot  → all commands, callbacks, inline keyboards, polling
+  • Pyrogram (MTProto)   → video/audio/file uploads (no 50 MB Bot API cap,
+                           direct DC streaming, real upload progress)
+  • yt-dlp              → download to disk, then stream-upload via Pyrogram
 
 YouTube bypass strategy (ordered by reliability):
   1. cookies.txt auto-detected + validated on startup
   2. /cookiecheck command – shows cookie status + first valid line
-  3. tv_embedded + mweb + android_music + ios client chain
+  3. ios + web + mweb + tv_embedded + android_music client chain
   4. age_gate bypass via embed extraction
   5. Rotating User-Agents
   6. Extractor / fragment retries + pacing
   7. compat_opts workarounds
+
+Required env vars:
+  BOT_TOKEN   – Telegram Bot token (from @BotFather)
+  API_ID      – Telegram API id   (from https://my.telegram.org)
+  API_HASH    – Telegram API hash (from https://my.telegram.org)
 """
 
 import os, asyncio, time, logging, re, threading, random, urllib.request, sys, platform, subprocess
@@ -22,6 +33,9 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters,
 )
 from telegram.constants import ParseMode
+
+from pyrogram import Client as PyroClient
+
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, ExtractorError
 import yt_dlp as _yt_dlp_module
@@ -31,10 +45,13 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.environ["BOT_TOKEN"]
+API_ID       = int(os.environ["API_ID"])
+API_HASH     = os.environ["API_HASH"]
 DOWNLOAD_DIR = Path("downloads")
 COOKIES_FILE = "cookies.txt"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
@@ -56,15 +73,22 @@ DEFAULT_SETTINGS = {"quality": "720p", "mode": "manual", "cleanup_minutes": 10}
 user_settings:    dict[int, dict]  = {}
 cleanup_registry: dict[str, float] = {}
 
+# ── Pyrogram MTProto client (bot mode) ───────────────────────────────────────
+# Uses bot token — no user session file needed. in_memory=True = no disk session.
+pyro: PyroClient = PyroClient(
+    name="ytdl_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    in_memory=True,
+)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  COOKIE HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
 
 def cookie_status() -> dict:
-    """
-    Returns detailed status of cookies.txt so we can surface problems to admin.
-    """
     path = Path(COOKIES_FILE)
     if not path.exists():
         return {"ok": False, "reason": "File not found", "path": str(path.resolve())}
@@ -89,67 +113,42 @@ def cookie_status() -> dict:
                           "make sure you export while on youtube.com",
                 "path": str(path.resolve()), "total_lines": len(real_lines)}
 
-    # Check for critical cookies
     has_sapisid = any("SAPISID" in l for l in yt_lines)
     has_sid     = any("\tSID\t" in l or "\t__Secure-1PSID\t" in l for l in yt_lines)
     sample      = yt_lines[0][:120] if yt_lines else ""
 
     return {
-        "ok":         True,
-        "path":       str(path.resolve()),
-        "size":       size,
-        "total":      len(real_lines),
-        "yt_lines":   len(yt_lines),
-        "has_sapisid": has_sapisid,
-        "has_sid":     has_sid,
-        "sample":     sample,
+        "ok": True, "path": str(path.resolve()), "size": size,
+        "total": len(real_lines), "yt_lines": len(yt_lines),
+        "has_sapisid": has_sapisid, "has_sid": has_sid, "sample": sample,
     }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  YT-DLP OPTIONS – FULL BYPASS STACK
+#  YT-DLP OPTIONS
 # ═════════════════════════════════════════════════════════════════════════════
 
 def ydl_opts_base(use_cookies: bool = True) -> dict:
     """
-    Layered bypass:
-      • cookies.txt  (when valid)
-      • tv_embedded  → bypasses age-gate & most sign-in checks
-      • mweb         → mobile web, lighter bot-detection
-      • android_music → no sign-in enforcement
-      • ios          → tertiary
-      • web          → standard web (last resort)
-
-    format_sort ensures yt-dlp prefers mp4/m4a so the format selectors
-    in quality_to_format() actually match what gets served.
+    Used for metadata/info extraction.
+    tv_embedded first — best at bypassing restrictions when reading info.
+    player_skip NOT set so the full format list is returned.
     """
     opts: dict = {
         "quiet":       True,
         "no_warnings": True,
         "noplaylist":  True,
         "outtmpl":     str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
-
-        # Always merge to mp4 so the output is universally playable
         "merge_output_format": "mp4",
-
-        # Prefer mp4/m4a containers and h264/aac codecs so format selectors match.
-        # Without this yt-dlp picks formats arbitrarily across clients, causing
-        # "Requested format not available" even when the video is accessible.
         "format_sort": ["res", "ext:mp4:m4a", "codec:h264:aac", "size"],
-
-        # Retries
         "retries":             10,
         "fragment_retries":    10,
         "extractor_retries":   5,
         "file_access_retries": 5,
         "socket_timeout":      30,
-
-        # Human-like pacing
         "sleep_interval_requests": 1,
         "sleep_interval":          2,
         "max_sleep_interval":      5,
-
-        # Browser impersonation
         "http_headers": {
             "User-Agent":      random.choice(USER_AGENTS),
             "Accept-Language": "en-US,en;q=0.9",
@@ -157,28 +156,13 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
             "DNT":             "1",
             "Sec-Fetch-Mode":  "navigate",
         },
-
-        # ── Client fallback chain ─────────────────────────────────────────
-        # tv_embedded  → YouTube TV embed, bypasses sign-in/age-gate entirely
-        # mweb         → YouTube mobile web (lighter detection)
-        # android_music → YouTube Music Android app (no sign-in wall)
-        # ios          → YouTube iOS app
-        # web          → standard web (last resort)
-        #
-        # NOTE: player_skip is intentionally NOT set here so that extract_info
-        # (metadata / format-list fetch) gets the full format list. The skip is
-        # only applied during actual downloads via ydl_opts_download().
         "extractor_args": {
             "youtube": {
                 "player_client": ["tv_embedded", "mweb", "android_music", "ios", "web"],
             }
         },
-
-        # Compatibility workarounds for age-gated / restricted content
         "compat_opts": {"no-youtube-unavailable-videos"},
     }
-
-    # ── Cookies ───────────────────────────────────────────────────────────
     if use_cookies:
         cs = cookie_status()
         if cs["ok"]:
@@ -186,7 +170,24 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
             logger.info("cookies.txt loaded (%d YT lines)", cs.get("yt_lines", 0))
         else:
             logger.warning("cookies.txt problem: %s", cs["reason"])
+    return opts
 
+
+def ydl_opts_download() -> dict:
+    """
+    Used for actual file downloads.
+    ios/web first — they serve full resolution (720p/1080p).
+    tv_embedded pushed to end — it caps at 360p.
+    No player_skip — skipping configs strips the format list and causes 360p fallback.
+    """
+    opts = ydl_opts_base()
+    opts["extractor_args"]["youtube"]["player_client"] = [
+        "ios",           # Full resolution, minimal bot-detection
+        "web",           # Standard web — all resolutions
+        "mweb",          # Mobile web fallback
+        "tv_embedded",   # Age-gate bypass only (360p max)
+        "android_music", # Final fallback
+    ]
     return opts
 
 
@@ -201,102 +202,34 @@ def get_settings(uid: int) -> dict:
 
 
 def quality_to_format(q: str) -> str:
-    """
-    Build a yt-dlp format selector with an exhaustive fallback chain.
-
-    Why so many fallbacks?
-      - YouTube serves different containers per region/account/client:
-          mp4+m4a      (most common desktop/web)
-          webm+webm    (common on android_music / tv_embedded clients)
-          mp4+webm     (mixed — mp4 video, opus/webm audio)
-          mp4 pre-muxed (older / low-res videos, no separate audio track)
-      - If a selector fails, yt-dlp raises "Requested format is not available"
-        instead of trying the next one; ALL options must be listed explicitly.
-      - format_sort in ydl_opts_base already prefers mp4/m4a, so the first
-        arms of each chain will usually win; the later arms catch edge cases.
-
-    Chain order for each quality tier:
-      1.  mp4 video + m4a audio            (preferred: h264+aac, ffmpeg merges)
-      2.  mp4 video + webm/opus audio      (mp4 video, opus audio — also fine)
-      3.  webm video + webm/opus audio     (tv_embedded / android clients)
-      4.  any video + any audio at height  (widest net, any codec)
-      5.  pre-muxed single file at height  (no separate audio stream)
-      6.  height+1 tier up (graceful upscale when exact height absent)
-      7.  absolute fallback: best split then best single file
-    """
-    h = {
-        "360p":  360,
-        "480p":  480,
-        "720p":  720,
-        "1080p": 1080,
-    }.get(q)
-
+    h = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080}.get(q)
     if h is None:
-        # "best" — no height constraint, grab highest quality available
         return (
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
             "/bestvideo[ext=mp4]+bestaudio[ext=webm]"
             "/bestvideo[ext=webm]+bestaudio[ext=webm]"
             "/bestvideo[ext=webm]+bestaudio[ext=m4a]"
-            "/bestvideo+bestaudio"
-            "/best"
+            "/bestvideo+bestaudio/best"
         )
-
-    # Allow up to one step above the target so a 720p request doesn't fail
-    # just because the video only has a 1080p stream (yt-dlp won't downscale
-    # unless we list a higher ceiling explicitly).
-    h_up = h + 360  # e.g. 720p → also try ≤1080p if exact tier missing
-
+    h_up = h + 360
     return (
-        # ── Exact height, split streams ───────────────────────────────────
-        # 1. mp4 + m4a  (best: h264+aac)
         f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]"
-        # 2. mp4 video + opus/webm audio
         f"/bestvideo[height<={h}][ext=mp4]+bestaudio[ext=webm]"
-        # 3. webm video + webm/opus audio  (tv_embedded / android_music)
         f"/bestvideo[height<={h}][ext=webm]+bestaudio[ext=webm]"
-        # 4. webm video + m4a audio  (uncommon but possible)
         f"/bestvideo[height<={h}][ext=webm]+bestaudio[ext=m4a]"
-        # 5. any video + any audio at target height  (codec-agnostic)
         f"/bestvideo[height<={h}]+bestaudio"
-        # ── Pre-muxed single file at exact height ─────────────────────────
-        # 6. pre-muxed mp4 at or below target height
         f"/best[height<={h}][ext=mp4]"
-        # 7. any pre-muxed at or below target height
         f"/best[height<={h}]"
-        # ── Graceful upscale: one tier above (e.g. 720→≤1080) ────────────
         f"/bestvideo[height<={h_up}][ext=mp4]+bestaudio[ext=m4a]"
         f"/bestvideo[height<={h_up}][ext=mp4]+bestaudio[ext=webm]"
         f"/bestvideo[height<={h_up}][ext=webm]+bestaudio[ext=webm]"
         f"/bestvideo[height<={h_up}]+bestaudio"
         f"/best[height<={h_up}]"
-        # ── Absolute fallback: ignore height entirely ─────────────────────
         "/bestvideo[ext=mp4]+bestaudio[ext=m4a]"
         "/bestvideo[ext=mp4]+bestaudio[ext=webm]"
         "/bestvideo[ext=webm]+bestaudio[ext=webm]"
-        "/bestvideo+bestaudio"
-        "/best"
+        "/bestvideo+bestaudio/best"
     )
-
-
-def ydl_opts_download() -> dict:
-    """
-    Like ydl_opts_base() but reorders player_client so high-resolution clients
-    come first during actual downloads.
-
-    tv_embedded is great for bypassing age-gates but only serves up to 360p.
-    For downloads we want ios / web first (full resolution), with tv_embedded
-    and android_music as fallbacks for restricted content.
-    """
-    opts = ydl_opts_base()
-    opts["extractor_args"]["youtube"]["player_client"] = [
-        "ios",           # Full resolution, minimal bot-detection
-        "web",           # Standard web — all resolutions available
-        "mweb",          # Mobile web fallback
-        "tv_embedded",   # Bypass age-gate / sign-in (360p max)
-        "android_music", # Last resort
-    ]
-    return opts
 
 
 def register_for_cleanup(path: str, minutes: int):
@@ -311,14 +244,14 @@ def friendly_error(e: Exception) -> str:
     msg = str(e).lower()
     if "sign in" in msg or "not a bot" in msg or "confirm" in msg or "cookie" in msg:
         return (
-            "🔒 *YouTube is still blocking this video.*\n\n"
-            "Your cookies.txt may be expired or missing key cookies.\n\n"
-            "📋 *Run /cookiecheck to see what's wrong.*\n\n"
+            "🔒 *YouTube is blocking this video.*\n\n"
+            "Your cookies.txt may be expired or missing.\n\n"
+            "📋 *Run /cookiecheck to diagnose.*\n\n"
             "*Common fixes:*\n"
-            "• Re-export cookies while actively logged into YouTube\n"
-            "• Make sure you export from `youtube.com` (not google.com)\n"
-            "• Use the *'Get cookies.txt LOCALLY'* extension (not other tools)\n"
-            "• Disable incognito mode — cookies won't exist there\n"
+            "• Re-export cookies while logged into YouTube\n"
+            "• Export from `youtube.com` (not google.com)\n"
+            "• Use *'Get cookies.txt LOCALLY'* extension\n"
+            "• Disable incognito mode\n"
             "• Try a different Google account"
         )
     if "private" in msg:
@@ -326,21 +259,34 @@ def friendly_error(e: Exception) -> str:
     if "unavailable" in msg or "not available" in msg:
         return "❌ Video *unavailable* — may be region-blocked or removed."
     if "age" in msg:
-        return "🔞 *Age-restricted.* Provide cookies from a verified/aged account."
+        return "🔞 *Age-restricted.* Provide cookies from a verified account."
     if "copyright" in msg or "blocked" in msg:
         return "⛔ Blocked due to *copyright restrictions*."
     if "ffmpeg" in msg:
         return "⚙️ *FFmpeg error.* Try a lower quality."
     if "fragment" in msg:
         return "🌐 *Network error* downloading fragments. Please retry."
-    if "requested format" in msg or "not available" in msg:
+    if "requested format" in msg:
         return "❌ *Requested format not available.* Retrying with best available…"
     if "no video formats" in msg:
         return "❌ *No downloadable formats found* for this video."
     return f"❌ Download failed:\n`{str(e)[:400]}`"
 
 
-# ── Core async wrappers ───────────────────────────────────────────────────────
+def fetch_thumb(url: str | None) -> bytes | None:
+    """Download thumbnail bytes, or return None on failure."""
+    if not url:
+        return None
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return r.read()
+    except Exception:
+        return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CORE ASYNC WRAPPERS (yt-dlp)
+# ═════════════════════════════════════════════════════════════════════════════
 
 async def extract_info(url: str, download: bool = False,
                        extra_opts: dict | None = None) -> dict:
@@ -365,12 +311,15 @@ async def do_download(url: str, extra_opts: dict, progress_cb) -> dict:
     return await loop.run_in_executor(None, _run)
 
 
-def build_progress_hook(loop, status_msg, _cid, _bot):
+def build_dl_progress_hook(loop, status_msg):
+    """yt-dlp download progress → edit status message (throttled to 3 s)."""
     last = [0.0]
     def hook(d):
-        if d["status"] != "downloading": return
+        if d["status"] != "downloading":
+            return
         now = time.time()
-        if now - last[0] < 3: return
+        if now - last[0] < 3:
+            return
         last[0] = now
         pct   = d.get("_percent_str",  "?%").strip()
         speed = d.get("_speed_str",    "?").strip()
@@ -383,7 +332,112 @@ def build_progress_hook(loop, status_msg, _cid, _bot):
     return hook
 
 
-# ── Background cleanup ────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+#  PYROGRAM MTProto UPLOAD HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def make_upload_progress_cb(loop, status_msg, label: str):
+    """
+    Pyrogram upload progress callback: (current_bytes, total_bytes).
+    Throttled to one edit per 4 s to avoid flood-wait errors.
+    """
+    last      = [0.0]
+    last_curr = [0]
+    start     = [time.time()]
+
+    def _cb(current: int, total: int):
+        now = time.time()
+        if now - last[0] < 4:
+            return
+        elapsed = now - start[0] + 0.001
+        speed   = (current - last_curr[0]) / (now - last[0] + 0.001)
+        last[0]      = now
+        last_curr[0] = current
+
+        pct     = f"{current / total * 100:.1f}%" if total else "?"
+        spd_str = (
+            f"{speed / (1024*1024):.1f} MB/s" if speed > 1024*1024
+            else f"{speed / 1024:.1f} KB/s"
+        )
+        asyncio.run_coroutine_threadsafe(
+            status_msg.edit_text(
+                f"{label}\n`{pct}` | 🚀 `{spd_str}`",
+                parse_mode=ParseMode.MARKDOWN,
+            ), loop)
+
+    return _cb
+
+
+async def pyro_send_video(chat_id: int, filepath: str, caption: str,
+                          info: dict, status_msg, loop) -> None:
+    """
+    Stream-upload a video via Pyrogram MTProto.
+    • No 50 MB Bot API size cap
+    • Real upload progress displayed in status message
+    • YouTube thumbnail attached as cover art
+    """
+    # Save thumbnail to a temp file (Pyrogram needs a path, not bytes)
+    thumb_data = fetch_thumb(info.get("thumbnail"))
+    thumb_path = None
+    if thumb_data:
+        thumb_path = str(DOWNLOAD_DIR / f"_thumb_{info.get('id', 'x')}.jpg")
+        Path(thumb_path).write_bytes(thumb_data)
+
+    progress_cb = make_upload_progress_cb(loop, status_msg, "📤 *Uploading video…*")
+
+    try:
+        await pyro.send_video(
+            chat_id=chat_id,
+            video=filepath,
+            caption=caption,
+            duration=info.get("duration") or 0,
+            width=info.get("width") or 0,
+            height=info.get("height") or 0,
+            thumb=thumb_path,
+            supports_streaming=True,
+            progress=progress_cb,
+        )
+    finally:
+        if thumb_path:
+            Path(thumb_path).unlink(missing_ok=True)
+
+
+async def pyro_send_audio(chat_id: int, filepath: str, caption: str,
+                          info: dict, status_msg, loop) -> None:
+    """Stream-upload an MP3 via Pyrogram MTProto with thumbnail."""
+    thumb_data = fetch_thumb(info.get("thumbnail"))
+    thumb_path = None
+    if thumb_data:
+        thumb_path = str(DOWNLOAD_DIR / f"_thumb_{info.get('id', 'x')}.jpg")
+        Path(thumb_path).write_bytes(thumb_data)
+
+    progress_cb = make_upload_progress_cb(loop, status_msg, "📤 *Uploading audio…*")
+
+    try:
+        await pyro.send_audio(
+            chat_id=chat_id,
+            audio=filepath,
+            caption=caption,
+            duration=info.get("duration") or 0,
+            performer=info.get("uploader") or "",
+            title=info.get("title") or "",
+            thumb=thumb_path,
+            progress=progress_cb,
+        )
+    finally:
+        if thumb_path:
+            Path(thumb_path).unlink(missing_ok=True)
+
+
+async def pyro_send_photo(chat_id: int, filepath: str, caption: str) -> None:
+    """Upload a photo via Pyrogram MTProto."""
+    await pyro.send_photo(chat_id=chat_id, photo=filepath, caption=caption)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  BACKGROUND CLEANUP
+# ═════════════════════════════════════════════════════════════════════════════
+
 async def cleanup_worker():
     while True:
         await asyncio.sleep(60)
@@ -399,7 +453,7 @@ async def cleanup_worker():
                     logger.warning("Cleanup error %s: %s", path, exc)
 
 
-# ── Health server ──────────────────────────────────────────────────────────────
+# ── Health server ─────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers(); self.wfile.write(b"OK")
@@ -432,9 +486,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Diagnose the cookies.txt file and show actionable status."""
     cs = cookie_status()
-
     if not cs["ok"]:
         msg = (
             "🍪 *Cookie Check — ❌ PROBLEM FOUND*\n\n"
@@ -444,13 +496,13 @@ async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "1. Open Chrome/Firefox and go to `youtube.com`\n"
             "2. Make sure you're *logged in* to Google\n"
             "3. Install: *'Get cookies.txt LOCALLY'* extension\n"
-            "4. Click extension → click *Export as* → save `cookies.txt`\n"
+            "4. Click extension → *Export as* → save `cookies.txt`\n"
             "5. Replace your `cookies.txt` file and redeploy\n\n"
             "⚠️ *Do NOT export in incognito mode*\n"
             "⚠️ *Export from youtube.com, not google.com*"
         )
     else:
-        sapisid_status = "✅" if cs.get("has_sapisid") else "⚠️ Missing (may cause issues)"
+        sapisid_status = "✅" if cs.get("has_sapisid") else "⚠️ Missing"
         sid_status     = "✅" if cs.get("has_sid")     else "⚠️ Missing"
         msg = (
             "🍪 *Cookie Check — ✅ File looks valid*\n\n"
@@ -463,38 +515,20 @@ async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📄 Sample line:\n`{cs.get('sample', 'N/A')[:100]}`\n\n"
         )
         if not cs.get("has_sapisid") or not cs.get("has_sid"):
-            msg += (
-                "⚠️ *Missing critical auth cookies.*\n"
-                "Re-export while fully logged into YouTube.\n"
-                "Make sure you're not in incognito mode."
-            )
+            msg += "⚠️ *Missing critical auth cookies.* Re-export while fully logged into YouTube."
         else:
-            msg += (
-                "✅ Cookies look complete.\n\n"
-                "If downloads still fail, cookies may have *expired*.\n"
-                "Re-export from a fresh YouTube session and redeploy."
-            )
-
+            msg += "✅ Cookies look complete. If downloads still fail, re-export from a fresh session."
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
-# ─── Stats ────────────────────────────────────────────────────────────────────
 def _get_ffmpeg_version() -> str:
-    """Return the FFmpeg version string, or a short error message."""
     try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True, text=True, timeout=5,
-        )
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
         first_line = (result.stdout or result.stderr).splitlines()[0]
-        # e.g. "ffmpeg version 6.1.1-static https://..."
         match = re.search(r"ffmpeg version\s+(\S+)", first_line, re.IGNORECASE)
         return match.group(1) if match else first_line[:60]
-    except FileNotFoundError:
-        return "❌ Not found in PATH"
-    except Exception as exc:
-        return f"❌ {exc}"
-
+    except FileNotFoundError: return "❌ Not found in PATH"
+    except Exception as exc:  return f"❌ {exc}"
 
 def _format_uptime(seconds: float) -> str:
     seconds = int(seconds)
@@ -508,33 +542,29 @@ def _format_uptime(seconds: float) -> str:
     parts.append(f"{seconds}s")
     return " ".join(parts)
 
-
 def _download_dir_info() -> tuple[int, int]:
-    """Return (file_count, total_bytes) for DOWNLOAD_DIR."""
     files = list(DOWNLOAD_DIR.iterdir()) if DOWNLOAD_DIR.exists() else []
     total = sum(f.stat().st_size for f in files if f.is_file())
     return len(files), total
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show bot + dependency statistics."""
-    # yt-dlp version
-    try:
-        ytdlp_ver = _yt_dlp_module.version.__version__
-    except Exception:
-        ytdlp_ver = "unknown"
+    try:    ytdlp_ver = _yt_dlp_module.version.__version__
+    except: ytdlp_ver = "unknown"
+    try:    import pyrogram; pyro_ver = pyrogram.__version__
+    except: pyro_ver = "unknown"
 
-    ffmpeg_ver   = _get_ffmpeg_version()
-    python_ver   = sys.version.split()[0]
-    os_info      = f"{platform.system()} {platform.release()}"
-    uptime_str   = _format_uptime(time.time() - BOT_START_TIME)
+    ffmpeg_ver            = _get_ffmpeg_version()
+    python_ver            = sys.version.split()[0]
+    os_info               = f"{platform.system()} {platform.release()}"
+    uptime_str            = _format_uptime(time.time() - BOT_START_TIME)
     file_count, dir_bytes = _download_dir_info()
-    dir_mb       = dir_bytes / (1024 * 1024)
-    active_users = len(user_settings)
-    queued_files = len(cleanup_registry)
-    cs           = cookie_status()
-    cookie_icon  = "✅" if cs["ok"] else "❌"
-    cookie_label = (
+    dir_mb                = dir_bytes / (1024 * 1024)
+    active_users          = len(user_settings)
+    queued_files          = len(cleanup_registry)
+    cs                    = cookie_status()
+    cookie_icon           = "✅" if cs["ok"] else "❌"
+    cookie_label          = (
         f"{cs.get('yt_lines', 0)} YT cookies, SAPISID={'✅' if cs.get('has_sapisid') else '⚠️'}"
         if cs["ok"] else cs["reason"]
     )
@@ -543,12 +573,13 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📊 *Bot Statistics*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "🔧 *Dependencies*\n"
-        f"  • yt-dlp:  `{ytdlp_ver}`\n"
-        f"  • FFmpeg:  `{ffmpeg_ver}`\n"
-        f"  • Python:  `{python_ver}`\n"
-        f"  • OS:      `{os_info}`\n\n"
+        f"  • yt-dlp:   `{ytdlp_ver}`\n"
+        f"  • FFmpeg:   `{ffmpeg_ver}`\n"
+        f"  • Python:   `{python_ver}`\n"
+        f"  • Pyrogram: `{pyro_ver}`\n"
+        f"  • OS:       `{os_info}`\n\n"
         "⏱ *Runtime*\n"
-        f"  • Uptime:  `{uptime_str}`\n\n"
+        f"  • Uptime: `{uptime_str}`\n\n"
         "👥 *Usage*\n"
         f"  • Active user profiles:  `{active_users}`\n"
         f"  • Files pending cleanup: `{queued_files}`\n\n"
@@ -558,7 +589,6 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🍪 *Cookies*\n"
         f"  • Status: {cookie_icon} `{cookie_label}`\n"
     )
-
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -588,7 +618,6 @@ async def settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if parts[1] == "close":
         await q.message.delete(); return
-
     if parts[1] == "back":
         await q.message.edit_text("⚙️ *Your Settings*", parse_mode=ParseMode.MARKDOWN,
             reply_markup=settings_keyboard(uid)); return
@@ -653,7 +682,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_youtube_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
-    msg = await update.message.reply_text("🔍 Fetching video info…")
+    msg = await update.message.reply_text("🔍 *Fetching video info…*", parse_mode=ParseMode.MARKDOWN)
     try:
         info = await extract_info(url)
     except (DownloadError, ExtractorError) as e:
@@ -726,10 +755,6 @@ async def show_quality_menu(q, ctx):
     info    = ctx.user_data.get("info", {})
     formats = info.get("formats", [])
 
-    # Detect which standard heights are actually confirmed available in metadata.
-    # tv_embedded / android_music clients often omit format lists entirely, so
-    # we always show ALL standard tiers — quality_to_format() has an exhaustive
-    # fallback chain that gracefully retries with best if a tier is unavailable.
     detected = set(
         int(f["height"]) for f in formats
         if f.get("height")
@@ -738,23 +763,19 @@ async def show_quality_menu(q, ctx):
         and f.get("vcodec") not in (None, "none")
     )
 
-    # Always offer all standard tiers. Mark confirmed-available ones with ✅.
-    # If detected is empty (common with bypass clients), show all without marks.
     standard = [360, 480, 720, 1080]
     rows, row = [], []
     for h in standard:
         label = f"✅ {h}p" if (detected and h in detected) else f"{h}p"
         row.append(InlineKeyboardButton(label, callback_data=f"dl:quality:{h}p"))
-        if len(row) == 2:          # 2 per row keeps buttons readable
+        if len(row) == 2:
             rows.append(row); row = []
     if row:
         rows.append(row)
     rows.append([InlineKeyboardButton("⭐ Best Available", callback_data="dl:quality:best")])
     rows.append([InlineKeyboardButton("❌ Cancel",         callback_data="dl:cancel")])
 
-    note = ""
-    if not detected:
-        note = "\n_ℹ️ Format list unavailable — all qualities will be attempted._"
+    note = "\n_ℹ️ Format list unavailable — all qualities will be attempted._" if not detected else ""
     await q.message.edit_text(
         f"🎬 *Select video quality:*{note}",
         parse_mode=ParseMode.MARKDOWN,
@@ -768,18 +789,14 @@ async def do_video(q, ctx, uid: int, quality: str):
     if not url:
         await q.message.edit_text("❌ No URL stored. Please resend the link."); return
 
-    status = await q.message.edit_text(f"⬇️ *Downloading ({quality})…*",
-        parse_mode=ParseMode.MARKDOWN)
-    loop = asyncio.get_event_loop()
-    hook = build_progress_hook(loop, status, q.message.chat_id, ctx.bot)
+    status = await q.message.edit_text(f"⬇️ *Downloading ({quality})…*", parse_mode=ParseMode.MARKDOWN)
+    loop   = asyncio.get_event_loop()
+    hook   = build_dl_progress_hook(loop, status)
 
     try:
-        info = await do_download(url, {
-            "format": quality_to_format(quality),
-        }, hook)
+        info = await do_download(url, {"format": quality_to_format(quality)}, hook)
     except (DownloadError, ExtractorError) as e:
         err_str = str(e).lower()
-        # "Requested format not available" → retry with codec-agnostic fallback
         if any(kw in err_str for kw in ("requested format", "not available", "no video formats")):
             logger.warning("Format unavailable for %s @ %s — retrying with best", url, quality)
             await status.edit_text(
@@ -792,20 +809,16 @@ async def do_video(q, ctx, uid: int, quality: str):
                         "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
                         "/bestvideo[ext=mp4]+bestaudio[ext=webm]"
                         "/bestvideo[ext=webm]+bestaudio[ext=webm]"
-                        "/bestvideo+bestaudio"
-                        "/best"
+                        "/bestvideo+bestaudio/best"
                     ),
                 }, hook)
             except Exception as e2:
-                await status.edit_text(friendly_error(e2), parse_mode=ParseMode.MARKDOWN)
-                return
+                await status.edit_text(friendly_error(e2), parse_mode=ParseMode.MARKDOWN); return
         else:
-            await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
-            return
+            await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
     except Exception as e:
         await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
 
-    # Find the downloaded file — look for mp4 first, then any extension
     vid_id = info.get("id", "")
     files  = (
         list(DOWNLOAD_DIR.glob(f"{vid_id}.mp4"))
@@ -817,37 +830,21 @@ async def do_video(q, ctx, uid: int, quality: str):
         await status.edit_text("❌ File not found after download."); return
 
     filepath = str(files[0])
-    await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
-
-    # Fetch YouTube thumbnail — must be wrapped in InputFile for PTB v21
-    from io import BytesIO
-    from telegram import InputFile
-    thumb_input = None
-    thumb_url   = info.get("thumbnail")
-    if thumb_url:
-        try:
-            import urllib.request as _ur
-            with _ur.urlopen(thumb_url, timeout=10) as resp:
-                thumb_data = resp.read()
-            thumb_input = InputFile(BytesIO(thumb_data), filename="thumb.jpg")
-        except Exception:
-            thumb_input = None  # non-fatal — upload without thumb
+    await status.edit_text("📤 *Uploading via MTProto…*", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        with open(filepath, "rb") as f:
-            await ctx.bot.send_video(
-                chat_id=q.message.chat_id,
-                video=f,
-                caption=f"🎬 {info.get('title', '')} [{quality}]",
-                thumbnail=thumb_input,
-                supports_streaming=True,
-                width=info.get("width"),
-                height=info.get("height"),
-                duration=info.get("duration"),
-            )
+        await pyro_send_video(
+            chat_id=q.message.chat_id,
+            filepath=filepath,
+            caption=f"🎬 *{info.get('title', '')}* [{quality}]",
+            info=info,
+            status_msg=status,
+            loop=loop,
+        )
         await status.delete()
     except Exception as e:
         await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
+
     register_for_cleanup(filepath, get_settings(uid)["cleanup_minutes"])
 
 
@@ -858,13 +855,11 @@ async def do_audio(q, ctx, uid: int):
         await q.message.edit_text("❌ No URL stored."); return
 
     status = await q.message.edit_text("⬇️ *Extracting audio…*", parse_mode=ParseMode.MARKDOWN)
-    loop = asyncio.get_event_loop()
-    hook = build_progress_hook(loop, status, q.message.chat_id, ctx.bot)
+    loop   = asyncio.get_event_loop()
+    hook   = build_dl_progress_hook(loop, status)
+
     try:
         info = await do_download(url, {
-            # bestaudio/best covers both split-stream and pre-muxed sources.
-            # format_sort in ydl_opts_base already prefers m4a; this handles
-            # webm/opus streams served by tv_embedded / android_music clients.
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "postprocessors": [{"key": "FFmpegExtractAudio",
                                 "preferredcodec": "mp3",
@@ -879,18 +874,23 @@ async def do_audio(q, ctx, uid: int):
     files  = list(DOWNLOAD_DIR.glob(f"{vid_id}.mp3")) or list(DOWNLOAD_DIR.glob(f"{vid_id}.*"))
     if not files:
         await status.edit_text("❌ Audio file not found."); return
+
     filepath = str(files[0])
-    await status.edit_text("📤 *Uploading MP3…*", parse_mode=ParseMode.MARKDOWN)
+    await status.edit_text("📤 *Uploading audio via MTProto…*", parse_mode=ParseMode.MARKDOWN)
+
     try:
-        with open(filepath, "rb") as f:
-            await ctx.bot.send_document(
-                chat_id=q.message.chat_id, document=f,
-                filename=f"{info.get('title', 'audio')}.mp3",
-                caption=f"🎵 {info.get('title', '')}",
-            )
+        await pyro_send_audio(
+            chat_id=q.message.chat_id,
+            filepath=filepath,
+            caption=f"🎵 *{info.get('title', '')}*",
+            info=info,
+            status_msg=status,
+            loop=loop,
+        )
         await status.delete()
     except Exception as e:
         await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
+
     register_for_cleanup(filepath, get_settings(uid)["cleanup_minutes"])
 
 
@@ -900,22 +900,25 @@ async def do_thumbnail(q, ctx, uid: int):
     thumb_url = info.get("thumbnail")
     if not thumb_url:
         await q.message.edit_text("❌ No thumbnail found."); return
+
     status  = await q.message.edit_text("🖼 *Downloading thumbnail…*", parse_mode=ParseMode.MARKDOWN)
     outpath = DOWNLOAD_DIR / f"{info.get('id', 'thumb')}_thumb.jpg"
+
+    thumb_data = fetch_thumb(thumb_url)
+    if not thumb_data:
+        await status.edit_text("❌ Thumbnail fetch failed."); return
+    outpath.write_bytes(thumb_data)
+
     try:
-        urllib.request.urlretrieve(thumb_url, outpath)
-    except Exception as e:
-        await status.edit_text(f"❌ Thumbnail fetch failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-    try:
-        with open(outpath, "rb") as f:
-            await ctx.bot.send_document(
-                chat_id=q.message.chat_id, document=f,
-                filename=f"{info.get('title', 'thumbnail')}.jpg",
-                caption=f"🖼 {info.get('title', '')}",
-            )
+        await pyro_send_photo(
+            chat_id=q.message.chat_id,
+            filepath=str(outpath),
+            caption=f"🖼 *{info.get('title', '')}*",
+        )
         await status.delete()
     except Exception as e:
         await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
+
     register_for_cleanup(str(outpath), get_settings(uid)["cleanup_minutes"])
 
 
@@ -957,14 +960,13 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def main():
-    # Log cookie status on startup so it's visible in Render logs
     cs = cookie_status()
     if cs["ok"]:
         logger.info("✅ cookies.txt OK — %d YouTube/Google lines, SAPISID=%s",
                     cs.get("yt_lines", 0), cs.get("has_sapisid", False))
     else:
         logger.warning("⚠️ cookies.txt problem: %s", cs["reason"])
-        logger.warning("   Bot will try client fallback chain (tv_embedded/android_music/ios)")
+        logger.warning("   Bot will try client fallback chain (ios/web/tv_embedded)")
 
     threading.Thread(target=start_health_server, daemon=True).start()
 
@@ -987,9 +989,18 @@ def main():
             BotCommand("cookiecheck", "Diagnose cookie issues"),
             BotCommand("stats",       "Bot & dependency info"),
         ])
+        # Start Pyrogram MTProto client alongside PTB
+        await pyro.start()
+        logger.info("✅ Pyrogram MTProto client started")
         asyncio.create_task(cleanup_worker())
 
-    app.post_init = post_init
+    async def post_shutdown(application: Application):
+        await pyro.stop()
+        logger.info("Pyrogram MTProto client stopped")
+
+    app.post_init     = post_init
+    app.post_shutdown = post_shutdown
+
     logger.info("Bot started — polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

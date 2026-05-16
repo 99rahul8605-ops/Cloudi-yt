@@ -4,6 +4,7 @@ const path = require('path');
 const axios = require('axios');
 const { exec } = require('child_process');
 const util = require('util');
+const http = require('http');
 const execPromise = util.promisify(exec);
 
 // ---------- Config ----------
@@ -18,6 +19,16 @@ fs.ensureDirSync(DOWNLOAD_DIR);
 const userSettings = new Map();
 const defaultSettings = { quality: '720p', mode: 'manual', cleanupMinutes: 10 };
 const cleanupRegistry = new Map();
+
+// ---------- Health server ----------
+const PORT = process.env.PORT || 8080;
+const healthServer = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('OK');
+});
+healthServer.listen(PORT, () => {
+  console.log(`✅ Health server listening on port ${PORT}`);
+});
 
 // ---------- Cookie helper ----------
 async function cookieExists() {
@@ -42,7 +53,6 @@ async function getCookieArg() {
 // ---------- yt-dlp wrapper with EJS fix ----------
 async function runYtdlp(args) {
   const cookieArg = await getCookieArg();
-  // Add remote components to fetch EJS challenge solver scripts from npm
   const remoteArg = '--remote-components ejs:npm';
   const cmd = `yt-dlp ${cookieArg} ${remoteArg} ${args}`;
   console.log(`Running: ${cmd}`);
@@ -403,7 +413,7 @@ bot.on('callback_query', async (callbackQuery) => {
     }
     const statusMsg = await bot.sendMessage(chatId, `⬇️ *Downloading (${quality})…*`, { parse_mode: 'Markdown' });
     await startVideoDownload(chatId, userId, url, quality, statusMsg.message_id);
-    await bot.deleteMessage(chatId, messageId); // remove quality menu
+    await bot.deleteMessage(chatId, messageId);
     return;
   }
 });
@@ -501,7 +511,6 @@ bot.on('message', async (msg) => {
         reply_markup: downloadTypeKeyboard(),
       }
     );
-    // store URL for callback
     if (!pendingDownloads.has(chatId)) pendingDownloads.set(chatId, {});
     pendingDownloads.get(chatId)[sent.message_id] = url;
   } catch (err) {
@@ -511,4 +520,4 @@ bot.on('message', async (msg) => {
 
 // ---------- Start cleanup worker ----------
 cleanupWorker();
-console.log('Bot started (Node.js + yt-dlp + EJS fix applied)');
+console.log('✅ Bot started (Node.js + yt-dlp + EJS fix + health server)');

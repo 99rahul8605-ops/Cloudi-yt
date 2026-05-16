@@ -809,14 +809,30 @@ async def do_video(q, ctx, uid: int, quality: str):
         await status.edit_text("❌ File not found after download."); return
 
     filepath = str(files[0])
-    ext      = Path(filepath).suffix.lstrip(".")
     await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
+
+    # Fetch YouTube thumbnail to use as video cover art
+    thumb_bytes = None
+    thumb_url   = info.get("thumbnail")
+    if thumb_url:
+        try:
+            import urllib.request as _ur
+            with _ur.urlopen(thumb_url, timeout=10) as resp:
+                thumb_bytes = resp.read()
+        except Exception:
+            thumb_bytes = None  # non-fatal — upload without thumb
+
     try:
         with open(filepath, "rb") as f:
-            await ctx.bot.send_document(
-                chat_id=q.message.chat_id, document=f,
-                filename=f"{info.get('title', vid_id)}.{ext}",
+            await ctx.bot.send_video(
+                chat_id=q.message.chat_id,
+                video=f,
                 caption=f"🎬 {info.get('title', '')} [{quality}]",
+                thumbnail=thumb_bytes,
+                supports_streaming=True,
+                width=info.get("width"),
+                height=info.get("height"),
+                duration=info.get("duration"),
             )
         await status.delete()
     except Exception as e:

@@ -31,12 +31,23 @@ const execFileAsync = promisify(execFile);
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const DOWNLOAD_DIR = path.resolve("downloads");
-const COOKIES_FILE = "cookies.txt";
+const COOKIES_FILE = path.resolve(__dirname, "cookies.txt");
 const PORT         = parseInt(process.env.PORT || "8080", 10);
 
 if (!BOT_TOKEN) {
   console.error("FATAL: BOT_TOKEN environment variable is not set.");
   process.exit(1);
+}
+
+// ── Startup cookie diagnostic ─────────────────────────────────────────────────
+{
+  const cs = cookieStatus();
+  if (cs.ok) {
+    console.log(`[startup] cookies.txt ✅  path=${COOKIES_FILE}  size=${cs.size}B  ytLines=${cs.ytLines}  SAPISID=${cs.hasSAPISID}  SID=${cs.hasSID}`);
+  } else {
+    console.warn(`[startup] cookies.txt ❌  reason="${cs.reason}"  path=${COOKIES_FILE}`);
+    console.warn("[startup] Bot will use android_vr bypass — some videos may still be blocked.");
+  }
 }
 
 fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
@@ -54,24 +65,39 @@ function getSettings(uid) {
 // ── Cookie helpers ────────────────────────────────────────────────────────────
 function cookieStatus() {
   if (!fs.existsSync(COOKIES_FILE))
-    return { ok: false, reason: "File not found" };
+    return { ok: false, reason: `File not found at ${COOKIES_FILE}` };
   const stat = fs.statSync(COOKIES_FILE);
   if (stat.size < 100)
-    return { ok: false, reason: `File too small (${stat.size} bytes)` };
+    return { ok: false, reason: `File too small (${stat.size} bytes) — export again` };
   let text;
   try { text = fs.readFileSync(COOKIES_FILE, "utf8"); }
   catch (e) { return { ok: false, reason: `Cannot read: ${e.message}` }; }
-  const lines = text.split("\n");
-  const real  = lines.filter(l => l.trim() && !l.startsWith("#"));
-  const yt    = real.filter(l => l.includes("youtube.com") || l.includes("google.com"));
-  if (!real.length) return { ok: false, reason: "No cookie data (only comments)" };
-  if (!yt.length)   return { ok: false, reason: "No youtube.com/google.com cookies found" };
+
+  // Normalize line endings (Windows CRLF -> LF)
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+
+  // Must be Netscape cookie format
+  const hasHeader = lines.some(l => l.includes("Netscape HTTP Cookie File"));
+  if (!hasHeader)
+    return { ok: false, reason: "Not a valid Netscape cookie file (missing header). Re-export using 'Get cookies.txt LOCALLY' extension." };
+
+  const real = lines.filter(l => l.trim() && !l.startsWith("#"));
+  const yt   = real.filter(l =>
+    l.includes("youtube.com") || l.includes(".youtube.com") ||
+    l.includes("google.com")  || l.includes(".google.com")
+  );
+
+  if (!real.length) return { ok: false, reason: "No cookie data found (file contains only comments)" };
+  if (!yt.length)   return { ok: false, reason: "No youtube.com/google.com cookies — export from youtube.com while logged in" };
+
+  const hasSAPISID   = yt.some(l => l.includes("SAPISID"));
+  const hasSID       = yt.some(l => l.includes("\tSID\t") || l.includes("\t__Secure-1PSID\t") || l.includes("__Secure-3PSID"));
+
   return {
     ok: true, size: stat.size,
     total: real.length, ytLines: yt.length,
-    hasSAPISID: yt.some(l => l.includes("SAPISID")),
-    hasSID:     yt.some(l => l.includes("\tSID\t") || l.includes("\t__Secure-1PSID\t")),
-    sample:     yt[0]?.slice(0, 120) || "",
+    hasSAPISID, hasSID,
+    sample: yt[0]?.slice(0, 120) || "",
   };
 }
 
@@ -96,18 +122,19 @@ function baseArgs() {
     "--add-header", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "--add-header", "DNT:1",
     "--add-header", "Sec-Fetch-Mode:navigate",
-    // android_vr: no sign-in wall, full format list, no JS challenge
-    // ios: full res, low detection  |  web/mweb: fallbacks
-    // tv_embedded: age-gate bypass (360p max, last resort)
-    // skip=webpage: skip JS player challenge entirely
-    "--extractor-args", "youtube:player_client=android_vr,ios,web,mweb,tv_embedded;skip=webpage",
+    // Use cookies if valid; with cookies prefer web client (better quality & access)
+    // Without cookies use android_vr (no sign-in wall) + ios fallbacks
   ];
 
   if (cs.ok) {
     args.push("--cookies", COOKIES_FILE);
-    console.log(`[yt-dlp] cookies.txt loaded (${cs.ytLines} YT lines)`);
+    // With valid cookies, web client gives best results
+    args.push("--extractor-args", "youtube:player_client=web,android,ios,tv_embedded;skip=webpage");
+    console.log(`[yt-dlp] cookies.txt OK — ${cs.ytLines} YT lines, SAPISID=${cs.hasSAPISID}, SID=${cs.hasSID} | path: ${COOKIES_FILE}`);
   } else {
-    console.log(`[yt-dlp] No cookies (${cs.reason}) — android_vr bypass active`);
+    // No cookies: android_vr bypasses sign-in walls without authentication
+    args.push("--extractor-args", "youtube:player_client=android_vr,ios,web,mweb,tv_embedded;skip=webpage");
+    console.log(`[yt-dlp] No valid cookies (${cs.reason}) — android_vr bypass active`);
   }
 
   return args;
@@ -211,11 +238,17 @@ function fetchBuffer(url) {
 
 function friendlyError(err) {
   const msg = (err?.message || String(err)).toLowerCase();
-  if (msg.includes("sign in") || msg.includes("login") || msg.includes("not a bot"))
-    return "🔒 *YouTube is blocking this video.*\nAdd a `cookies.txt` and redeploy.\nRun /cookiecheck for details.";
+  if (msg.includes("sign in") || msg.includes("login") || msg.includes("not a bot") ||
+      msg.includes("confirm your age") || msg.includes("this video is unavailable")) {
+    const cs = cookieStatus();
+    const hint = cs.ok
+      ? "🍪 Cookies loaded but YouTube still blocked — they may be expired. Re-export and redeploy."
+      : `🍪 No valid cookies found (${cs.reason}). Run /cookiecheck for details.`;
+    return `🔒 *YouTube blocked this video.*\n${hint}`;
+  }
   if (msg.includes("private"))     return "🔒 This video is *private*.";
   if (msg.includes("unavailable")) return "❌ Video *unavailable* — region-blocked or removed.";
-  if (msg.includes("age"))         return "🔞 *Age-restricted.* Add cookies from a verified account.";
+  if (msg.includes("age"))         return "🔞 *Age-restricted.* Add cookies from a verified account and redeploy.";
   if (msg.includes("copyright") || msg.includes("blocked"))
                                    return "⛔ Blocked due to *copyright restrictions*.";
   if (msg.includes("ffmpeg"))      return "⚙️ *FFmpeg error.* Try a lower quality.";
@@ -277,19 +310,24 @@ bot.command("cookiecheck", async (ctx) => {
   if (!cs.ok) {
     msg =
       "🍪 *Cookie Check — ❌ PROBLEM*\n\n" +
-      `❗ Issue: *${cs.reason}*\n\n` +
+      `❗ Issue: \`${cs.reason}\`\n` +
+      `📁 Expected path: \`${COOKIES_FILE}\`\n\n` +
       "*How to fix:*\n1\\. Log into YouTube in Chrome/Firefox\n" +
       "2\\. Install *'Get cookies\\.txt LOCALLY'* extension\n" +
       "3\\. Export `cookies.txt` from youtube\\.com\n" +
-      "4\\. Add it to your project and redeploy\n\n" +
+      "4\\. Place it next to `bot\\.js` and redeploy\n\n" +
       "_ℹ️ Bot still works without cookies via android\\_vr bypass\\._";
   } else {
     msg =
       "🍪 *Cookie Check — ✅ Valid*\n\n" +
+      `📁 Path: \`${COOKIES_FILE}\`\n` +
       `📦 Size: \`${cs.size} bytes\`\n` +
       `🎯 YouTube/Google lines: \`${cs.ytLines}\`\n` +
       `🔑 SAPISID: ${cs.hasSAPISID ? "✅" : "⚠️ Missing"}\n` +
-      `🔑 SID: ${cs.hasSID ? "✅" : "⚠️ Missing"}`;
+      `🔑 SID: ${cs.hasSID ? "✅" : "⚠️ Missing"}\n\n` +
+      ((!cs.hasSAPISID || !cs.hasSID)
+        ? "_⚠️ Some auth cookies are missing\\. Re\\-export while logged into YouTube for best results\\._"
+        : "_✅ All key auth cookies present\\._");
   }
   await ctx.reply(msg, { parse_mode: "MarkdownV2" });
 });

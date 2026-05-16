@@ -26,6 +26,13 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, ExtractorError
 import yt_dlp as _yt_dlp_module
 
+try:
+    from pyrogram import Client as PyroClient
+    from pyrogram.errors import FloodWait
+    PYROGRAM_AVAILABLE = True
+except ImportError:
+    PYROGRAM_AVAILABLE = False
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -39,6 +46,16 @@ DOWNLOAD_DIR = Path("downloads")
 COOKIES_FILE = "cookies.txt"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 BOT_START_TIME = time.time()
+
+# ── Telegram MTProto (large-file upload, up to 2 GB) ─────────────────────────
+# Set TG_API_ID and TG_API_HASH from https://my.telegram.org/apps
+# If not set the bot still works but is capped at 50 MB per file.
+TG_API_ID   = os.environ.get("TG_API_ID")
+TG_API_HASH = os.environ.get("TG_API_HASH")
+LARGE_FILE_THRESHOLD = 50 * 1024 * 1024   # 50 MB — Bot API hard limit
+
+# Initialised in main() if credentials are present
+pyro_client = None
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -121,7 +138,7 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
       • web          → standard web (last resort)
 
     format_sort ensures yt-dlp prefers mp4/m4a so the format selectors
-    in quality_to_format() actually match what gets served.
+    in quality_opts() actually match what gets served.
     """
     opts: dict = {
         "quiet":       True,
@@ -131,11 +148,6 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
 
         # Always merge to mp4 so the output is universally playable
         "merge_output_format": "mp4",
-
-        # Prefer mp4/m4a containers and h264/aac codecs so format selectors match.
-        # Without this yt-dlp picks formats arbitrarily across clients, causing
-        # "Requested format not available" even when the video is accessible.
-        "format_sort": ["res", "ext:mp4:m4a", "codec:h264:aac", "size"],
 
         # Retries
         "retries":             10,
@@ -165,9 +177,10 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
         # ios          → YouTube iOS app
         # web          → standard web (last resort)
         #
-        # NOTE: player_skip is intentionally NOT set here so that extract_info
-        # (metadata / format-list fetch) gets the full format list. The skip is
-        # only applied during actual downloads via ydl_opts_download().
+        # NOTE: Do NOT set player_skip here. Skipping "webpage" or "configs"
+        # prevents yt-dlp from fetching the initial player response that
+        # contains the format manifest — the result is an empty format list
+        # and every format selector throws "Requested format is not available".
         "extractor_args": {
             "youtube": {
                 "player_client": ["tv_embedded", "mweb", "android_music", "ios", "web"],
@@ -200,103 +213,109 @@ def get_settings(uid: int) -> dict:
     return user_settings[uid]
 
 
-def quality_to_format(q: str) -> str:
+def pick_best_formats(formats: list, quality: str) -> tuple[str, str]:
     """
-    Build a yt-dlp format selector with an exhaustive fallback chain.
+    Inspect the raw format list from extract_info and return
+    (video_format_id, audio_format_id) using actual IDs — no selector
+    strings that can misfire.
 
-    Why so many fallbacks?
-      - YouTube serves different containers per region/account/client:
-          mp4+m4a      (most common desktop/web)
-          webm+webm    (common on android_music / tv_embedded clients)
-          mp4+webm     (mixed — mp4 video, opus/webm audio)
-          mp4 pre-muxed (older / low-res videos, no separate audio track)
-      - If a selector fails, yt-dlp raises "Requested format is not available"
-        instead of trying the next one; ALL options must be listed explicitly.
-      - format_sort in ydl_opts_base already prefers mp4/m4a, so the first
-        arms of each chain will usually win; the later arms catch edge cases.
+    Logic:
+      1. Separate formats into video-only, audio-only, and muxed buckets.
+      2. For video: prefer the highest-resolution video-only stream at or
+         below the requested height; fall back to muxed if none found.
+      3. For audio: prefer m4a > webm/opus > anything, sorted by bitrate.
+      4. If only muxed streams exist, return (muxed_id, "none") and the
+         caller will skip the separate audio download.
 
-    Chain order for each quality tier:
-      1.  mp4 video + m4a audio            (preferred: h264+aac, ffmpeg merges)
-      2.  mp4 video + webm/opus audio      (mp4 video, opus audio — also fine)
-      3.  webm video + webm/opus audio     (tv_embedded / android clients)
-      4.  any video + any audio at height  (widest net, any codec)
-      5.  pre-muxed single file at height  (no separate audio stream)
-      6.  height+1 tier up (graceful upscale when exact height absent)
-      7.  absolute fallback: best split then best single file
+    Returns ("none", "none") only when the format list is completely empty.
     """
-    h = {
-        "360p":  360,
-        "480p":  480,
-        "720p":  720,
-        "1080p": 1080,
-    }.get(q)
+    target_h = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080}.get(quality)
 
-    if h is None:
-        # "best" — no height constraint, grab highest quality available
-        return (
-            "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-            "/bestvideo[ext=mp4]+bestaudio[ext=webm]"
-            "/bestvideo[ext=webm]+bestaudio[ext=webm]"
-            "/bestvideo[ext=webm]+bestaudio[ext=m4a]"
-            "/bestvideo+bestaudio"
-            "/best"
-        )
+    # ── Bucket formats ────────────────────────────────────────────────────
+    video_only, audio_only, muxed = [], [], []
+    for f in formats:
+        vc = (f.get("vcodec") or "none").lower()
+        ac = (f.get("acodec") or "none").lower()
+        has_v = vc != "none"
+        has_a = ac != "none"
+        if has_v and not has_a:
+            video_only.append(f)
+        elif has_a and not has_v:
+            audio_only.append(f)
+        elif has_v and has_a:
+            muxed.append(f)
 
-    # Allow up to one step above the target so a 720p request doesn't fail
-    # just because the video only has a 1080p stream (yt-dlp won't downscale
-    # unless we list a higher ceiling explicitly).
-    h_up = h + 360  # e.g. 720p → also try ≤1080p if exact tier missing
-
-    return (
-        # ── Exact height, split streams ───────────────────────────────────
-        # 1. mp4 + m4a  (best: h264+aac)
-        f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]"
-        # 2. mp4 video + opus/webm audio
-        f"/bestvideo[height<={h}][ext=mp4]+bestaudio[ext=webm]"
-        # 3. webm video + webm/opus audio  (tv_embedded / android_music)
-        f"/bestvideo[height<={h}][ext=webm]+bestaudio[ext=webm]"
-        # 4. webm video + m4a audio  (uncommon but possible)
-        f"/bestvideo[height<={h}][ext=webm]+bestaudio[ext=m4a]"
-        # 5. any video + any audio at target height  (codec-agnostic)
-        f"/bestvideo[height<={h}]+bestaudio"
-        # ── Pre-muxed single file at exact height ─────────────────────────
-        # 6. pre-muxed mp4 at or below target height
-        f"/best[height<={h}][ext=mp4]"
-        # 7. any pre-muxed at or below target height
-        f"/best[height<={h}]"
-        # ── Graceful upscale: one tier above (e.g. 720→≤1080) ────────────
-        f"/bestvideo[height<={h_up}][ext=mp4]+bestaudio[ext=m4a]"
-        f"/bestvideo[height<={h_up}][ext=mp4]+bestaudio[ext=webm]"
-        f"/bestvideo[height<={h_up}][ext=webm]+bestaudio[ext=webm]"
-        f"/bestvideo[height<={h_up}]+bestaudio"
-        f"/best[height<={h_up}]"
-        # ── Absolute fallback: ignore height entirely ─────────────────────
-        "/bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-        "/bestvideo[ext=mp4]+bestaudio[ext=webm]"
-        "/bestvideo[ext=webm]+bestaudio[ext=webm]"
-        "/bestvideo+bestaudio"
-        "/best"
+    logger.info(
+        "Format buckets — video-only: %d  audio-only: %d  muxed: %d",
+        len(video_only), len(audio_only), len(muxed),
     )
 
+    # ── Pick audio ────────────────────────────────────────────────────────
+    def audio_score(f):
+        ext    = (f.get("ext") or "").lower()
+        tbr    = f.get("tbr") or f.get("abr") or 0
+        prefer = {"m4a": 2, "mp4": 1}.get(ext, 0)   # prefer m4a container
+        return (prefer, tbr)
 
-def ydl_opts_download() -> dict:
-    """
-    Like ydl_opts_base() but reorders player_client so high-resolution clients
-    come first during actual downloads.
+    best_audio = None
+    if audio_only:
+        best_audio = max(audio_only, key=audio_score)
+    elif muxed:
+        # Fall back to a muxed stream just for audio extraction
+        best_audio = max(muxed, key=audio_score)
 
-    tv_embedded is great for bypassing age-gates but only serves up to 360p.
-    For downloads we want ios / web first (full resolution), with tv_embedded
-    and android_music as fallbacks for restricted content.
-    """
-    opts = ydl_opts_base()
-    opts["extractor_args"]["youtube"]["player_client"] = [
-        "ios",           # Full resolution, minimal bot-detection
-        "web",           # Standard web — all resolutions available
-        "mweb",          # Mobile web fallback
-        "tv_embedded",   # Bypass age-gate / sign-in (360p max)
-        "android_music", # Last resort
-    ]
-    return opts
+    # ── Pick video ────────────────────────────────────────────────────────
+    def video_score(f):
+        h   = f.get("height") or 0
+        tbr = f.get("tbr") or f.get("vbr") or 0
+        fps = f.get("fps") or 0
+        ext = (f.get("ext") or "").lower()
+        prefer_ext = 1 if ext == "mp4" else 0
+        return (h, tbr, fps, prefer_ext)
+
+    best_video = None
+
+    # Try video-only streams first (pure video, no muxed audio overhead)
+    candidates = video_only or muxed
+    if target_h:
+        # Exact-or-below match
+        at_height = [f for f in candidates
+                     if isinstance(f.get("height"), int) and f["height"] <= target_h]
+        if at_height:
+            best_video = max(at_height, key=video_score)
+        else:
+            # No format at/below target — take the closest above (graceful upscale)
+            above = [f for f in candidates if isinstance(f.get("height"), int)]
+            if above:
+                best_video = min(above, key=lambda f: abs(f["height"] - target_h))
+            else:
+                # No height metadata at all — take highest bitrate
+                best_video = max(candidates, key=video_score) if candidates else None
+    else:
+        # "best" quality — no height cap
+        best_video = max(candidates, key=video_score) if candidates else None
+
+    if best_video:
+        logger.info(
+            "Selected video format: id=%s ext=%s height=%s vcodec=%s",
+            best_video.get("format_id"), best_video.get("ext"),
+            best_video.get("height"), best_video.get("vcodec"),
+        )
+    if best_audio:
+        logger.info(
+            "Selected audio format: id=%s ext=%s tbr=%s acodec=%s",
+            best_audio.get("format_id"), best_audio.get("ext"),
+            best_audio.get("tbr"), best_audio.get("acodec"),
+        )
+
+    vid_id = best_video["format_id"] if best_video else "bestvideo*"
+    aud_id = best_audio["format_id"] if best_audio else "bestaudio*"
+    return vid_id, aud_id
+
+
+def quality_opts(q: str) -> dict:
+    """Fallback selector used only when we have no cached format list."""
+    return {"format": "bestvideo*+bestaudio*/best", "merge_output_format": "mp4"}
 
 
 def register_for_cleanup(path: str, minutes: int):
@@ -309,35 +328,41 @@ def is_youtube_url(text: str) -> bool:
 
 def friendly_error(e: Exception) -> str:
     msg = str(e).lower()
-    if "sign in" in msg or "not a bot" in msg or "confirm" in msg or "cookie" in msg:
+    logger.warning("Download error (raw): %s", str(e)[:300])
+
+    # ── Check most-specific patterns first ────────────────────────────────────
+    # "Requested format is not available" contains "not available", so this
+    # check MUST come before the generic "unavailable"/"not available" guard.
+    if "requested format" in msg:
         return (
-            "🔒 *YouTube is still blocking this video.*\n\n"
-            "Your cookies.txt may be expired or missing key cookies.\n\n"
-            "📋 *Run /cookiecheck to see what's wrong.*\n\n"
-            "*Common fixes:*\n"
-            "• Re-export cookies while actively logged into YouTube\n"
-            "• Make sure you export from `youtube.com` (not google.com)\n"
-            "• Use the *'Get cookies.txt LOCALLY'* extension (not other tools)\n"
-            "• Disable incognito mode — cookies won't exist there\n"
-            "• Try a different Google account"
+            "❌ *Format not available.*\n"
+            "Try a different quality or use ⭐ Best Available."
+        )
+    if "no video formats" in msg or "no formats" in msg:
+        return "❌ *No downloadable formats found.* The video may be private or region-locked."
+    if "sign in" in msg or "not a bot" in msg or "confirm" in msg or "bot" in msg:
+        return (
+            "🔒 *YouTube is blocking this download.*\n\n"
+            "Cookies may be expired. Run /cookiecheck for details.\n\n"
+            "*Quick fixes:*\n"
+            "• Re-export cookies while logged into YouTube\n"
+            "• Export from `youtube.com` (not google.com)\n"
+            "• Use *'Get cookies.txt LOCALLY'* extension\n"
+            "• Don't export from incognito mode"
         )
     if "private" in msg:
         return "🔒 This video is *private*."
-    if "unavailable" in msg or "not available" in msg:
-        return "❌ Video *unavailable* — may be region-blocked or removed."
-    if "age" in msg:
-        return "🔞 *Age-restricted.* Provide cookies from a verified/aged account."
     if "copyright" in msg or "blocked" in msg:
         return "⛔ Blocked due to *copyright restrictions*."
+    if "age" in msg:
+        return "🔞 *Age-restricted.* Provide cookies from a verified account."
     if "ffmpeg" in msg:
-        return "⚙️ *FFmpeg error.* Try a lower quality."
-    if "fragment" in msg:
-        return "🌐 *Network error* downloading fragments. Please retry."
-    if "requested format" in msg or "not available" in msg:
-        return "❌ *Requested format not available.* Retrying with best available…"
-    if "no video formats" in msg:
-        return "❌ *No downloadable formats found* for this video."
-    return f"❌ Download failed:\n`{str(e)[:400]}`"
+        return "⚙️ *FFmpeg error.* Try a lower quality or ⭐ Best Available."
+    if "fragment" in msg or "network" in msg:
+        return "🌐 *Network error* while downloading. Please retry."
+    if "unavailable" in msg or "not available" in msg:
+        return "❌ Video *unavailable* — may be region-blocked or removed."
+    return f"❌ Download failed:\n`{str(e)[:300]}`"
 
 
 # ── Core async wrappers ───────────────────────────────────────────────────────
@@ -350,18 +375,33 @@ async def extract_info(url: str, download: bool = False,
     loop = asyncio.get_event_loop()
     def _run():
         with YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=download)
+            info = ydl.extract_info(url, download=download)
+            fmts = info.get("formats", []) if info else []
+            if fmts:
+                exts    = sorted({f.get("ext") for f in fmts if f.get("ext")})
+                heights = sorted({f.get("height") for f in fmts
+                                  if isinstance(f.get("height"), int) and f["height"] > 0})
+                logger.info("Formats available — exts: %s | heights: %s", exts, heights)
+            return info
     return await loop.run_in_executor(None, _run)
 
 
 async def do_download(url: str, extra_opts: dict, progress_cb) -> dict:
-    opts = ydl_opts_download()
+    opts = ydl_opts_base()
     opts.update(extra_opts)
     opts["progress_hooks"] = [progress_cb]
     loop = asyncio.get_event_loop()
     def _run():
         with YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=True)
+            info = ydl.extract_info(url, download=True)
+            # Log a compact format summary to help diagnose selector mismatches
+            fmts = info.get("formats", []) if info else []
+            if fmts:
+                summary = [(f.get("format_id"), f.get("ext"), f.get("height"),
+                            f.get("vcodec","?")[:6], f.get("acodec","?")[:6])
+                           for f in fmts[-10:]]  # last 10 (highest quality)
+                logger.info("Available formats (last 10): %s", summary)
+            return info
     return await loop.run_in_executor(None, _run)
 
 
@@ -539,6 +579,16 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if cs["ok"] else cs["reason"]
     )
 
+    if pyro_client is not None:
+        upload_limit = "2 GB (MTProto)"
+        upload_icon  = "🚀"
+    elif not PYROGRAM_AVAILABLE:
+        upload_limit = "50 MB (pyrogram not installed)"
+        upload_icon  = "⚠️"
+    else:
+        upload_limit = "50 MB (TG_API_ID/HASH not set)"
+        upload_icon  = "⚠️"
+
     msg = (
         "📊 *Bot Statistics*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -555,6 +605,8 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "💾 *Download Folder*\n"
         f"  • Files: `{file_count}`\n"
         f"  • Size:  `{dir_mb:.2f} MB`\n\n"
+        f"📤 *Upload*\n"
+        f"  • Limit:  {upload_icon} `{upload_limit}`\n\n"
         "🍪 *Cookies*\n"
         f"  • Status: {cookie_icon} `{cookie_label}`\n"
     )
@@ -726,40 +778,175 @@ async def show_quality_menu(q, ctx):
     info    = ctx.user_data.get("info", {})
     formats = info.get("formats", [])
 
-    # Detect which standard heights are actually confirmed available in metadata.
-    # tv_embedded / android_music clients often omit format lists entirely, so
-    # we always show ALL standard tiers — quality_to_format() has an exhaustive
-    # fallback chain that gracefully retries with best if a tier is unavailable.
-    detected = set(
+    # Guard: height must be a real positive int; filter out None / 0 / "none"
+    heights = sorted(set(
         int(f["height"]) for f in formats
         if f.get("height")
         and isinstance(f["height"], (int, float))
         and int(f["height"]) > 0
         and f.get("vcodec") not in (None, "none")
-    )
+    ))
 
-    # Always offer all standard tiers. Mark confirmed-available ones with ✅.
-    # If detected is empty (common with bypass clients), show all without marks.
-    standard = [360, 480, 720, 1080]
+    # Common standard heights to offer even if yt-dlp returned none
+    # (happens when using tv_embedded / android_music clients)
+    if not heights:
+        heights = [360, 480, 720, 1080]
+
     rows, row = [], []
-    for h in standard:
-        label = f"✅ {h}p" if (detected and h in detected) else f"{h}p"
-        row.append(InlineKeyboardButton(label, callback_data=f"dl:quality:{h}p"))
-        if len(row) == 2:          # 2 per row keeps buttons readable
+    for h in heights:
+        row.append(InlineKeyboardButton(f"{h}p", callback_data=f"dl:quality:{h}p"))
+        if len(row) == 3:
             rows.append(row); row = []
     if row:
         rows.append(row)
     rows.append([InlineKeyboardButton("⭐ Best Available", callback_data="dl:quality:best")])
     rows.append([InlineKeyboardButton("❌ Cancel",         callback_data="dl:cancel")])
+    await q.message.edit_text("🎬 *Select video quality:*",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
 
-    note = ""
-    if not detected:
-        note = "\n_ℹ️ Format list unavailable — all qualities will be attempted._"
-    await q.message.edit_text(
-        f"🎬 *Select video quality:*{note}",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
+
+async def ffmpeg_merge(video_path: str, audio_path: str, out_path: str) -> None:
+    """
+    Merge a video-only file and an audio-only file into a single mp4.
+    Runs in a thread-pool executor so it doesn't block the event loop.
+    Raises RuntimeError with ffmpeg's stderr if the merge fails.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-c:v", "copy",   # no re-encode — just remux
+        "-c:a", "aac",    # normalise audio to aac for mp4 compatibility
+        "-b:a", "192k",
+        "-movflags", "+faststart",  # web-optimised atom order
+        out_path,
+    ]
+    logger.info("ffmpeg merge: %s + %s → %s", video_path, audio_path, out_path)
+    loop = asyncio.get_event_loop()
+
+    def _run():
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[-800:])
+        return result
+
+    await loop.run_in_executor(None, _run)
+
+
+# ─── Unified upload helper ────────────────────────────────────────────────────
+async def send_file(
+    chat_id: int,
+    filepath: str,
+    filename: str,
+    caption: str,
+    status_msg,
+    is_video: bool = True,
+) -> None:
+    """
+    Upload a file to Telegram choosing the right client automatically:
+
+      • file ≤ 50 MB  → Bot API (ctx.bot.send_document) — no extra creds needed
+      • file > 50 MB  → Pyrogram MTProto (pyro_client.send_document)
+                        requires TG_API_ID + TG_API_HASH env vars,
+                        raises RuntimeError if credentials are missing.
+
+    Pyrogram connects directly to Telegram's servers (same as official clients)
+    so the per-file limit is 2 GB instead of 50 MB.
+    """
+    file_size = os.path.getsize(filepath)
+    size_mb   = file_size / (1024 * 1024)
+    use_pyro  = file_size > LARGE_FILE_THRESHOLD
+
+    logger.info("Uploading %s (%.1f MB) via %s",
+                filename, size_mb, "Pyrogram MTProto" if use_pyro else "Bot API")
+
+    if use_pyro:
+        if not PYROGRAM_AVAILABLE:
+            raise RuntimeError(
+                "File is {:.0f} MB — install pyrogram to upload files >50 MB.\n"
+                "`pip install pyrogram`".format(size_mb)
+            )
+        if pyro_client is None:
+            raise RuntimeError(
+                "File is {:.0f} MB but TG_API_ID / TG_API_HASH are not set.\n\n"
+                "Get them from https://my.telegram.org/apps and add them as "
+                "environment variables.".format(size_mb)
+            )
+
+        # ── Pyrogram upload with live progress ────────────────────────────
+        last_edit = [0.0]
+
+        async def _progress(current: int, total: int):
+            now = asyncio.get_event_loop().time()
+            if now - last_edit[0] < 4:
+                return
+            last_edit[0] = now
+            pct      = current * 100 / total
+            done_mb  = current / (1024 * 1024)
+            total_mb = total   / (1024 * 1024)
+            bar_len  = 12
+            filled   = int(bar_len * current / total)
+            bar      = "█" * filled + "░" * (bar_len - filled)
+            try:
+                await status_msg.edit_text(
+                    f"📤 *Uploading via MTProto…*\n"
+                    f"`[{bar}] {pct:.1f}%`\n"
+                    f"`{done_mb:.1f} / {total_mb:.1f} MB`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass   # ignore edit conflicts
+
+        if is_video:
+            await pyro_client.send_video(
+                chat_id=chat_id,
+                video=filepath,
+                caption=caption,
+                file_name=filename,
+                supports_streaming=True,
+                progress=_progress,
+            )
+        else:
+            await pyro_client.send_document(
+                chat_id=chat_id,
+                document=filepath,
+                caption=caption,
+                file_name=filename,
+                progress=_progress,
+            )
+
+    else:
+        # ── Standard Bot API upload ───────────────────────────────────────
+        # send_document works for both video files and audio/mp3
+        with open(filepath, "rb") as fh:
+            # Try send_video for mp4 so Telegram shows an inline player
+            if is_video and filepath.endswith(".mp4"):
+                from telegram import InputFile
+                # PTB doesn't expose upload progress; just show a static message
+                await status_msg.edit_text(
+                    f"📤 *Uploading ({size_mb:.1f} MB)…*",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                fh.seek(0)
+                await status_msg._bot.send_video(
+                    chat_id=chat_id,
+                    video=fh,
+                    caption=caption,
+                    filename=filename,
+                    supports_streaming=True,
+                )
+            else:
+                await status_msg.edit_text(
+                    f"📤 *Uploading ({size_mb:.1f} MB)…*",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                fh.seek(0)
+                await status_msg._bot.send_document(
+                    chat_id=chat_id,
+                    document=fh,
+                    filename=filename,
+                    caption=caption,
+                )
 
 
 # ─── Video ────────────────────────────────────────────────────────────────────
@@ -768,87 +955,121 @@ async def do_video(q, ctx, uid: int, quality: str):
     if not url:
         await q.message.edit_text("❌ No URL stored. Please resend the link."); return
 
-    status = await q.message.edit_text(f"⬇️ *Downloading ({quality})…*",
-        parse_mode=ParseMode.MARKDOWN)
+    # ── Step 1: pick format IDs from cached info ──────────────────────────
+    cached_info = ctx.user_data.get("info", {})
+    formats     = cached_info.get("formats", [])
+    vid_id      = cached_info.get("id", "unknown")
+    title       = cached_info.get("title", vid_id)
+
+    if formats:
+        video_fmt_id, audio_fmt_id = pick_best_formats(formats, quality)
+    else:
+        # No cached info — fall back to generic selector
+        video_fmt_id, audio_fmt_id = "bestvideo*", "bestaudio*"
+        logger.warning("No cached format list; using generic selectors")
+
+    logger.info("Downloading %s | quality=%s | video_id=%s audio_id=%s",
+                vid_id, quality, video_fmt_id, audio_fmt_id)
+
     loop = asyncio.get_event_loop()
-    hook = build_progress_hook(loop, status, q.message.chat_id, ctx.bot)
+    base_opts = ydl_opts_base()
 
-    try:
-        info = await do_download(url, {
-            "format": quality_to_format(quality),
-        }, hook)
-    except (DownloadError, ExtractorError) as e:
-        err_str = str(e).lower()
-        # "Requested format not available" → retry with codec-agnostic fallback
-        if any(kw in err_str for kw in ("requested format", "not available", "no video formats")):
-            logger.warning("Format unavailable for %s @ %s — retrying with best", url, quality)
-            await status.edit_text(
-                f"⚠️ *{quality} not available — retrying with best quality…*",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            try:
-                info = await do_download(url, {
-                    "format": (
-                        "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-                        "/bestvideo[ext=mp4]+bestaudio[ext=webm]"
-                        "/bestvideo[ext=webm]+bestaudio[ext=webm]"
-                        "/bestvideo+bestaudio"
-                        "/best"
-                    ),
-                }, hook)
-            except Exception as e2:
-                await status.edit_text(friendly_error(e2), parse_mode=ParseMode.MARKDOWN)
-                return
-        else:
-            await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
-            return
-    except Exception as e:
-        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
-
-    # Find the downloaded file — look for mp4 first, then any extension
-    vid_id = info.get("id", "")
-    files  = (
-        list(DOWNLOAD_DIR.glob(f"{vid_id}.mp4"))
-        or list(DOWNLOAD_DIR.glob(f"{vid_id}.mkv"))
-        or list(DOWNLOAD_DIR.glob(f"{vid_id}.webm"))
-        or list(DOWNLOAD_DIR.glob(f"{vid_id}.*"))
+    # ── Step 2: download video-only stream ───────────────────────────────
+    status = await q.message.edit_text(
+        f"⬇️ *Downloading video stream ({quality})…*",
+        parse_mode=ParseMode.MARKDOWN,
     )
-    if not files:
-        await status.edit_text("❌ File not found after download."); return
+    video_path_raw: list[str] = []
 
-    filepath = str(files[0])
-    await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
-
-    # Fetch YouTube thumbnail — must be wrapped in InputFile for PTB v21
-    from io import BytesIO
-    from telegram import InputFile
-    thumb_input = None
-    thumb_url   = info.get("thumbnail")
-    if thumb_url:
-        try:
-            import urllib.request as _ur
-            with _ur.urlopen(thumb_url, timeout=10) as resp:
-                thumb_data = resp.read()
-            thumb_input = InputFile(BytesIO(thumb_data), filename="thumb.jpg")
-        except Exception:
-            thumb_input = None  # non-fatal — upload without thumb
+    def _download_stream(fmt_id: str, suffix: str) -> str:
+        """Download a single stream and return the path of the saved file."""
+        out_tmpl = str(DOWNLOAD_DIR / f"{vid_id}_{suffix}.%(ext)s")
+        opts = {**base_opts,
+                "format": fmt_id,
+                "outtmpl": out_tmpl,
+                "merge_output_format": None,  # no auto-merge — we do it ourselves
+                "postprocessors": [],}
+        last = [0.0]
+        def hook(d):
+            if d["status"] != "downloading": return
+            now = time.time()
+            if now - last[0] < 3: return
+            last[0] = now
+            pct   = d.get("_percent_str",  "?%").strip()
+            speed = d.get("_speed_str",    "?").strip()
+            eta   = d.get("_eta_str",      "?").strip()
+            label = "🎬 video" if suffix == "video" else "🔊 audio"
+            asyncio.run_coroutine_threadsafe(
+                status.edit_text(
+                    f"⬇️ *Downloading {label} stream ({quality})…*\n"
+                    f"`{pct}` at `{speed}` — ETA `{eta}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                ),
+                loop,
+            )
+        opts["progress_hooks"] = [hook]
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            # yt-dlp may change the extension — find what it actually wrote
+            found = sorted(DOWNLOAD_DIR.glob(f"{vid_id}_{suffix}.*"))
+            if not found:
+                raise FileNotFoundError(f"No {suffix} file written for {vid_id}")
+            return str(found[-1])   # take the most recently written match
 
     try:
-        with open(filepath, "rb") as f:
-            await ctx.bot.send_video(
-                chat_id=q.message.chat_id,
-                video=f,
-                caption=f"🎬 {info.get('title', '')} [{quality}]",
-                thumbnail=thumb_input,
-                supports_streaming=True,
-                width=info.get("width"),
-                height=info.get("height"),
-                duration=info.get("duration"),
-            )
+        video_file = await loop.run_in_executor(None, _download_stream, video_fmt_id, "video")
+        logger.info("Video stream saved: %s", video_file)
+    except Exception as e:
+        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ── Step 3: download audio-only stream ───────────────────────────────
+    await status.edit_text("⬇️ *Downloading audio stream…*", parse_mode=ParseMode.MARKDOWN)
+    try:
+        audio_file = await loop.run_in_executor(None, _download_stream, audio_fmt_id, "audio")
+        logger.info("Audio stream saved: %s", audio_file)
+    except Exception as e:
+        Path(video_file).unlink(missing_ok=True)
+        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ── Step 4: ffmpeg merge ──────────────────────────────────────────────
+    await status.edit_text("⚙️ *Merging streams…*", parse_mode=ParseMode.MARKDOWN)
+    merged_path = str(DOWNLOAD_DIR / f"{vid_id}_merged.mp4")
+    try:
+        await ffmpeg_merge(video_file, audio_file, merged_path)
+        logger.info("Merged: %s", merged_path)
+    except Exception as e:
+        logger.error("ffmpeg merge failed: %s", e)
+        Path(video_file).unlink(missing_ok=True)
+        Path(audio_file).unlink(missing_ok=True)
+        await status.edit_text(
+            f"⚙️ *FFmpeg merge failed.*\n`{str(e)[:300]}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    finally:
+        # Temp streams no longer needed regardless of merge outcome
+        Path(video_file).unlink(missing_ok=True)
+        Path(audio_file).unlink(missing_ok=True)
+
+    # ── Step 5: upload ────────────────────────────────────────────────────
+    await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
+    try:
+        await send_file(
+            chat_id  = q.message.chat_id,
+            filepath = merged_path,
+            filename = f"{title}.mp4",
+            caption  = f"🎬 {title} [{quality}]",
+            status_msg = status,
+            is_video = True,
+        )
         await status.delete()
     except Exception as e:
-        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-    register_for_cleanup(filepath, get_settings(uid)["cleanup_minutes"])
+        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    register_for_cleanup(merged_path, get_settings(uid)["cleanup_minutes"])
 
 
 # ─── Audio ────────────────────────────────────────────────────────────────────
@@ -882,12 +1103,14 @@ async def do_audio(q, ctx, uid: int):
     filepath = str(files[0])
     await status.edit_text("📤 *Uploading MP3…*", parse_mode=ParseMode.MARKDOWN)
     try:
-        with open(filepath, "rb") as f:
-            await ctx.bot.send_document(
-                chat_id=q.message.chat_id, document=f,
-                filename=f"{info.get('title', 'audio')}.mp3",
-                caption=f"🎵 {info.get('title', '')}",
-            )
+        await send_file(
+            chat_id    = q.message.chat_id,
+            filepath   = filepath,
+            filename   = f"{info.get('title', 'audio')}.mp3",
+            caption    = f"🎵 {info.get('title', '')}",
+            status_msg = status,
+            is_video   = False,
+        )
         await status.delete()
     except Exception as e:
         await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
@@ -957,6 +1180,8 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def main():
+    global pyro_client
+
     # Log cookie status on startup so it's visible in Render logs
     cs = cookie_status()
     if cs["ok"]:
@@ -965,6 +1190,22 @@ def main():
     else:
         logger.warning("⚠️ cookies.txt problem: %s", cs["reason"])
         logger.warning("   Bot will try client fallback chain (tv_embedded/android_music/ios)")
+
+    # ── Pyrogram large-file client ─────────────────────────────────────────
+    if PYROGRAM_AVAILABLE and TG_API_ID and TG_API_HASH:
+        pyro_client = PyroClient(
+            name       = "ytdl_bot",          # session file: ytdl_bot.session
+            api_id     = int(TG_API_ID),
+            api_hash   = TG_API_HASH,
+            bot_token  = BOT_TOKEN,
+            workdir    = str(DOWNLOAD_DIR),   # store session in downloads/
+        )
+        logger.info("✅ Pyrogram MTProto client configured (limit: 2 GB per file)")
+    else:
+        if not PYROGRAM_AVAILABLE:
+            logger.warning("⚠️ pyrogram not installed — uploads capped at 50 MB")
+        elif not TG_API_ID or not TG_API_HASH:
+            logger.warning("⚠️ TG_API_ID / TG_API_HASH not set — uploads capped at 50 MB")
 
     threading.Thread(target=start_health_server, daemon=True).start()
 
@@ -987,9 +1228,19 @@ def main():
             BotCommand("cookiecheck", "Diagnose cookie issues"),
             BotCommand("stats",       "Bot & dependency info"),
         ])
+        # Start Pyrogram client inside the running event loop
+        if pyro_client is not None:
+            await pyro_client.start()
+            logger.info("Pyrogram client started")
         asyncio.create_task(cleanup_worker())
 
-    app.post_init = post_init
+    async def post_shutdown(application: Application):
+        if pyro_client is not None:
+            await pyro_client.stop()
+            logger.info("Pyrogram client stopped")
+
+    app.post_init     = post_init
+    app.post_shutdown = post_shutdown
     logger.info("Bot started — polling")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

@@ -118,12 +118,24 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
       • mweb         → mobile web, lighter bot-detection
       • android_music → no sign-in enforcement
       • ios          → tertiary
+      • web          → standard web (last resort)
+
+    format_sort ensures yt-dlp prefers mp4/m4a so the format selectors
+    in quality_to_format() actually match what gets served.
     """
     opts: dict = {
         "quiet":       True,
         "no_warnings": True,
         "noplaylist":  True,
         "outtmpl":     str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
+
+        # Always merge to mp4 so the output is universally playable
+        "merge_output_format": "mp4",
+
+        # Prefer mp4/m4a containers and h264/aac codecs so format selectors match.
+        # Without this yt-dlp picks formats arbitrarily across clients, causing
+        # "Requested format not available" even when the video is accessible.
+        "format_sort": ["res", "ext:mp4:m4a", "codec:h264:aac", "size"],
 
         # Retries
         "retries":             10,
@@ -152,10 +164,13 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
         # android_music → YouTube Music Android app (no sign-in wall)
         # ios          → YouTube iOS app
         # web          → standard web (last resort)
+        #
+        # player_skip: omit "webpage" and "configs" to avoid bot-checked paths.
+        # NOTE: do NOT skip "js" — that breaks format extraction on tv_embedded.
         "extractor_args": {
             "youtube": {
-                "player_client":    ["tv_embedded", "mweb", "android_music", "ios", "web"],
-                "player_skip":      ["webpage", "configs"],   # skip bot-checked paths
+                "player_client": ["tv_embedded", "mweb", "android_music", "ios", "web"],
+                "player_skip":   ["webpage", "configs"],
             }
         },
 
@@ -191,19 +206,23 @@ def quality_to_format(q: str) -> str:
 
     Why so many fallbacks?
       - YouTube serves different containers per region/account/client:
-          mp4+m4a  (most common desktop)
-          webm+webm (common on android_music / tv_embedded clients)
-          mp4 with muxed audio (older / low-res videos)
-      - If the first selector fails yt-dlp raises "Requested format is not
-        available" instead of trying the next one — we must list ALL options.
+          mp4+m4a      (most common desktop/web)
+          webm+webm    (common on android_music / tv_embedded clients)
+          mp4+webm     (mixed — mp4 video, opus/webm audio)
+          mp4 pre-muxed (older / low-res videos, no separate audio track)
+      - If a selector fails, yt-dlp raises "Requested format is not available"
+        instead of trying the next one; ALL options must be listed explicitly.
+      - format_sort in ydl_opts_base already prefers mp4/m4a, so the first
+        arms of each chain will usually win; the later arms catch edge cases.
 
-    Chain order for each quality:
-      1. mp4 video  + m4a audio  (best quality, needs ffmpeg merge)
-      2. webm video + webm audio (common on non-web clients)
-      3. mp4 video  + any audio  (any audio codec)
-      4. any video  + any audio  at the target height (widest net)
-      5. single-file best at that height (pre-muxed, no merge needed)
-      6. absolute fallback: best single-file available
+    Chain order for each quality tier:
+      1.  mp4 video + m4a audio            (preferred: h264+aac, ffmpeg merges)
+      2.  mp4 video + webm/opus audio      (mp4 video, opus audio — also fine)
+      3.  webm video + webm/opus audio     (tv_embedded / android clients)
+      4.  any video + any audio at height  (widest net, any codec)
+      5.  pre-muxed single file at height  (no separate audio stream)
+      6.  height+1 tier up (graceful upscale when exact height absent)
+      7.  absolute fallback: best split then best single file
     """
     h = {
         "360p":  360,
@@ -213,27 +232,48 @@ def quality_to_format(q: str) -> str:
     }.get(q)
 
     if h is None:
-        # "best" — no height constraint, just grab the highest quality
+        # "best" — no height constraint, grab highest quality available
         return (
             "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[ext=mp4]+bestaudio[ext=webm]"
             "/bestvideo[ext=webm]+bestaudio[ext=webm]"
+            "/bestvideo[ext=webm]+bestaudio[ext=m4a]"
             "/bestvideo+bestaudio"
             "/best"
         )
 
+    # Allow up to one step above the target so a 720p request doesn't fail
+    # just because the video only has a 1080p stream (yt-dlp won't downscale
+    # unless we list a higher ceiling explicitly).
+    h_up = h + 360  # e.g. 720p → also try ≤1080p if exact tier missing
+
     return (
-        # 1. mp4 + m4a at or below target height
+        # ── Exact height, split streams ───────────────────────────────────
+        # 1. mp4 + m4a  (best: h264+aac)
         f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]"
-        # 2. webm + webm at or below target height
+        # 2. mp4 video + opus/webm audio
+        f"/bestvideo[height<={h}][ext=mp4]+bestaudio[ext=webm]"
+        # 3. webm video + webm/opus audio  (tv_embedded / android_music)
         f"/bestvideo[height<={h}][ext=webm]+bestaudio[ext=webm]"
-        # 3. mp4 + any audio at or below target height
-        f"/bestvideo[height<={h}][ext=mp4]+bestaudio"
-        # 4. any video + any audio at or below target height
+        # 4. webm video + m4a audio  (uncommon but possible)
+        f"/bestvideo[height<={h}][ext=webm]+bestaudio[ext=m4a]"
+        # 5. any video + any audio at target height  (codec-agnostic)
         f"/bestvideo[height<={h}]+bestaudio"
-        # 5. pre-muxed (single file) at or below target height
+        # ── Pre-muxed single file at exact height ─────────────────────────
+        # 6. pre-muxed mp4 at or below target height
+        f"/best[height<={h}][ext=mp4]"
+        # 7. any pre-muxed at or below target height
         f"/best[height<={h}]"
-        # 6. absolute fallback — ignore height, grab best available
+        # ── Graceful upscale: one tier above (e.g. 720→≤1080) ────────────
+        f"/bestvideo[height<={h_up}][ext=mp4]+bestaudio[ext=m4a]"
+        f"/bestvideo[height<={h_up}][ext=mp4]+bestaudio[ext=webm]"
+        f"/bestvideo[height<={h_up}][ext=webm]+bestaudio[ext=webm]"
+        f"/bestvideo[height<={h_up}]+bestaudio"
+        f"/best[height<={h_up}]"
+        # ── Absolute fallback: ignore height entirely ─────────────────────
         "/bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[ext=mp4]+bestaudio[ext=webm]"
+        "/bestvideo[ext=webm]+bestaudio[ext=webm]"
         "/bestvideo+bestaudio"
         "/best"
     )
@@ -707,26 +747,25 @@ async def do_video(q, ctx, uid: int, quality: str):
     try:
         info = await do_download(url, {
             "format": quality_to_format(quality),
-            # mp4 is preferred output; yt-dlp will re-mux webm→mp4 via ffmpeg
-            # if both streams are webm this produces a valid mp4 container
-            "merge_output_format": "mp4",
-            # If ffmpeg is unavailable and streams can't be merged, fall back
-            # to whatever single-file format exists rather than erroring out
-            "prefer_free_formats": False,
         }, hook)
     except (DownloadError, ExtractorError) as e:
-        err_str = str(e)
-        # "Requested format not available" → retry with absolute fallback
-        if "requested format" in err_str.lower() or "not available" in err_str.lower():
+        err_str = str(e).lower()
+        # "Requested format not available" → retry with codec-agnostic fallback
+        if any(kw in err_str for kw in ("requested format", "not available", "no video formats")):
+            logger.warning("Format unavailable for %s @ %s — retrying with best", url, quality)
             await status.edit_text(
-                f"⚠️ *{quality} not available for this video.*\n"
-                "⬇️ Retrying with best available quality…",
+                f"⚠️ *{quality} not available — retrying with best quality…*",
                 parse_mode=ParseMode.MARKDOWN,
             )
             try:
                 info = await do_download(url, {
-                    "format":              "bestvideo+bestaudio/best",
-                    "merge_output_format": "mp4",
+                    "format": (
+                        "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+                        "/bestvideo[ext=mp4]+bestaudio[ext=webm]"
+                        "/bestvideo[ext=webm]+bestaudio[ext=webm]"
+                        "/bestvideo+bestaudio"
+                        "/best"
+                    ),
                 }, hook)
             except Exception as e2:
                 await status.edit_text(friendly_error(e2), parse_mode=ParseMode.MARKDOWN)
@@ -775,7 +814,10 @@ async def do_audio(q, ctx, uid: int):
     hook = build_progress_hook(loop, status, q.message.chat_id, ctx.bot)
     try:
         info = await do_download(url, {
-            "format": "bestaudio/best",
+            # bestaudio/best covers both split-stream and pre-muxed sources.
+            # format_sort in ydl_opts_base already prefers m4a; this handles
+            # webm/opus streams served by tv_embedded / android_music clients.
+            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "postprocessors": [{"key": "FFmpegExtractAudio",
                                 "preferredcodec": "mp3",
                                 "preferredquality": "192"}],

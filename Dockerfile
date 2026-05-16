@@ -1,16 +1,14 @@
 FROM node:20-slim
 
-# Install system dependencies: ffmpeg, python3, pip, curl (for yt-dlp)
+# Install ffmpeg (required for audio conversion) and curl (to download yt-dlp)
 RUN apt-get update && apt-get install -y \
-    curl \
     ffmpeg \
-    python3 \
-    python3-pip \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp (pre-release)
-RUN pip3 uninstall -y yt-dlp || true && \
-    python3 -m pip install -U --pre "yt-dlp[default]"
+# Download yt-dlp binary (standalone, no Python needed)
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+    -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp
 
 WORKDIR /app
 
@@ -18,7 +16,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev
 
-# Copy cookies.txt (must exist in build context)
+# Copy cookies.txt (optional – if missing, bot will warn but still work)
 COPY cookies.txt /app/cookies.txt
 
 # Copy bot source

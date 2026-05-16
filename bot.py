@@ -281,13 +281,21 @@ def quality_to_format(q: str) -> str:
 
 def ydl_opts_download() -> dict:
     """
-    Like ydl_opts_base() but adds player_skip for speed/bypass during downloads.
-    player_skip: ["webpage", "configs"] avoids bot-checked paths during the
-    actual download request — safe here because format selection is already done.
-    Do NOT use this for extract_info() calls or you'll lose the format list.
+    Like ydl_opts_base() but reorders player_client so high-resolution clients
+    come first during actual downloads.
+
+    tv_embedded is great for bypassing age-gates but only serves up to 360p.
+    For downloads we want ios / web first (full resolution), with tv_embedded
+    and android_music as fallbacks for restricted content.
     """
     opts = ydl_opts_base()
-    opts["extractor_args"]["youtube"]["player_skip"] = ["webpage", "configs"]
+    opts["extractor_args"]["youtube"]["player_client"] = [
+        "ios",           # Full resolution, minimal bot-detection
+        "web",           # Standard web — all resolutions available
+        "mweb",          # Mobile web fallback
+        "tv_embedded",   # Bypass age-gate / sign-in (360p max)
+        "android_music", # Last resort
+    ]
     return opts
 
 
@@ -811,16 +819,19 @@ async def do_video(q, ctx, uid: int, quality: str):
     filepath = str(files[0])
     await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
 
-    # Fetch YouTube thumbnail to use as video cover art
-    thumb_bytes = None
+    # Fetch YouTube thumbnail — must be wrapped in InputFile for PTB v21
+    from io import BytesIO
+    from telegram import InputFile
+    thumb_input = None
     thumb_url   = info.get("thumbnail")
     if thumb_url:
         try:
             import urllib.request as _ur
             with _ur.urlopen(thumb_url, timeout=10) as resp:
-                thumb_bytes = resp.read()
+                thumb_data = resp.read()
+            thumb_input = InputFile(BytesIO(thumb_data), filename="thumb.jpg")
         except Exception:
-            thumb_bytes = None  # non-fatal — upload without thumb
+            thumb_input = None  # non-fatal — upload without thumb
 
     try:
         with open(filepath, "rb") as f:
@@ -828,7 +839,7 @@ async def do_video(q, ctx, uid: int, quality: str):
                 chat_id=q.message.chat_id,
                 video=f,
                 caption=f"🎬 {info.get('title', '')} [{quality}]",
-                thumbnail=thumb_bytes,
+                thumbnail=thumb_input,
                 supports_streaming=True,
                 width=info.get("width"),
                 height=info.get("height"),

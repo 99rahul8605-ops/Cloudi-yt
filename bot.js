@@ -12,12 +12,11 @@ const execPromise = util.promisify(exec);
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error('Missing BOT_TOKEN env var');
 
-// Custom Bot API server (set this to your local server URL, e.g., http://localhost:8081)
-// If not set, defaults to public Telegram API (50MB limit)
+// Custom Bot API server (for 2GB uploads). Set LOCAL_BOT_API_URL env var to your local server.
 const LOCAL_BOT_API_URL = process.env.LOCAL_BOT_API_URL || 'https://api.telegram.org';
 
 const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
-const COOKIE_PATH = '/app/cookies.txt';
+const COOKIE_PATH = process.env.COOKIE_PATH || '/app/cookies.txt';
 fs.ensureDirSync(DOWNLOAD_DIR);
 
 const YTDLP_TIMEOUT = 120000; // 2 minutes
@@ -30,7 +29,7 @@ const BOT_START_TIME = Date.now();
 
 // ---------- Pending downloads (with TTL) ----------
 const pendingDownloads = new Map();
-const PENDING_TTL = 10 * 60 * 1000;
+const PENDING_TTL = 10 * 60 * 1000; // 10 minutes
 setInterval(() => {
   const now = Date.now();
   for (const [chatId, entries] of pendingDownloads.entries()) {
@@ -49,7 +48,27 @@ const healthServer = http.createServer((req, res) => {
 });
 healthServer.listen(PORT, () => console.log(`✅ Health server on port ${PORT}`));
 
-// ---------- yt-dlp version cache ----------
+// ---------- Cookie helpers ----------
+async function cookieExists() {
+  try {
+    await fs.access(COOKIE_PATH);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getCookieArg() {
+  const exists = await cookieExists();
+  if (exists) {
+    console.log(`✅ cookies.txt found at ${COOKIE_PATH}`);
+    return `--cookies "${COOKIE_PATH}"`;
+  }
+  console.warn(`⚠️ cookies.txt not found at ${COOKIE_PATH} – some videos may be limited to 360p`);
+  return '';
+}
+
+// ---------- yt-dlp version ----------
 let ytdlpVersion = null;
 async function getYtdlpVersion() {
   if (ytdlpVersion) return ytdlpVersion;
@@ -62,21 +81,8 @@ async function getYtdlpVersion() {
   }
 }
 
-// ---------- Cookie helper ----------
-async function cookieExists() {
-  try {
-    await fs.access(COOKIE_PATH);
-    return true;
-  } catch {
-    return false;
-  }
-}
-async function getCookieArg() {
-  return (await cookieExists()) ? `--cookies "${COOKIE_PATH}"` : '';
-}
-
 // ---------- yt-dlp wrapper with optimizations ----------
-async function runYtdlp(args, timeout = YTDLP_TIMEOUT) {
+async function runYtdlp(args, timeout = YTDLP_TIMEOUT, verbose = false) {
   const cookieArg = await getCookieArg();
   const opts = [
     '--concurrent-fragments 50',
@@ -84,10 +90,12 @@ async function runYtdlp(args, timeout = YTDLP_TIMEOUT) {
     '--js-runtimes deno',
     '--remote-components ejs:github',
   ].join(' ');
-  const fullArgs = `${cookieArg} ${opts} ${args}`;
-  console.log(`[yt-dlp] Running: ${fullArgs.substring(0, 200)}...`);
+  const verboseFlag = verbose ? '--verbose' : '';
+  const fullArgs = `${cookieArg} ${opts} ${verboseFlag} ${args}`;
+  console.log(`[yt-dlp] Running: yt-dlp ${fullArgs.substring(0, 200)}...`);
   try {
     const { stdout, stderr } = await execPromise(`yt-dlp ${fullArgs}`, { timeout });
+    if (stderr) console.log(`[yt-dlp stderr]\n${stderr}`);
     if (stderr && !stderr.includes('WARNING') && !stderr.includes('[youtube]')) {
       throw new Error(stderr);
     }
@@ -103,7 +111,7 @@ async function runYtdlp(args, timeout = YTDLP_TIMEOUT) {
 // ---------- Get all available video heights (including video-only) ----------
 async function getAvailableQualities(url) {
   try {
-    const stdout = await runYtdlp(`-J "${url}"`);
+    const stdout = await runYtdlp(`-J "${url}"`, YTDLP_TIMEOUT, false);
     const data = JSON.parse(stdout);
     const heights = new Set();
     for (const f of data.formats || []) {
@@ -120,9 +128,9 @@ async function getAvailableQualities(url) {
   }
 }
 
-// ---------- Download video (separate video+audio, then merge) ----------
+// ---------- Download video (separate video+audio, merge with ffmpeg) ----------
 async function downloadVideo(url, quality) {
-  const infoJson = await runYtdlp(`-J "${url}"`);
+  const infoJson = await runYtdlp(`-J "${url}"`, YTDLP_TIMEOUT, false);
   const info = JSON.parse(infoJson);
   const title = info.title.replace(/[^\w\s]/gi, '');
   const videoId = info.id;
@@ -132,24 +140,31 @@ async function downloadVideo(url, quality) {
   if (quality !== 'best') {
     const target = parseInt(quality);
     if (!isNaN(target)) {
-      formatArg = `-f 'bestvideo[height<=${target}]+bestaudio/best[height<=${target}]'`;
+      // Force separate video and audio streams, then merge with ffmpeg
+      formatArg = `-f "bestvideo[height<=${target}]+bestaudio/best[height<=${target}]"`;
     }
   } else {
-    formatArg = `-f 'bestvideo+bestaudio/best'`;
+    formatArg = `-f "bestvideo+bestaudio/best"`;
   }
   const cmd = `${formatArg} -o "${outputPath}" --merge-output-format mp4 --verbose "${url}"`;
-  console.log(`Download command: yt-dlp ${cmd}`);
-  await runYtdlp(cmd);
+  console.log(`[yt-dlp] Download command: yt-dlp ${cmd}`);
+  
+  await runYtdlp(cmd, YTDLP_TIMEOUT, true);
+  
+  const stats = await fs.stat(outputPath);
+  if (stats.size === 0) throw new Error('Downloaded file is empty');
+  console.log(`Downloaded ${outputPath} (${stats.size} bytes)`);
+  
   return { outputPath, title, videoId, info };
 }
 
 async function downloadAudio(url) {
-  const infoJson = await runYtdlp(`-J "${url}"`);
+  const infoJson = await runYtdlp(`-J "${url}"`, YTDLP_TIMEOUT, false);
   const info = JSON.parse(infoJson);
   const title = info.title.replace(/[^\w\s]/gi, '');
   const videoId = info.id;
   const mp3Path = path.join(DOWNLOAD_DIR, `${videoId}.mp3`);
-  await runYtdlp(`-f bestaudio --extract-audio --audio-format mp3 --audio-quality 192K -o "${mp3Path}" "${url}"`);
+  await runYtdlp(`-f bestaudio --extract-audio --audio-format mp3 --audio-quality 192K -o "${mp3Path}" "${url}"`, YTDLP_TIMEOUT, true);
   return { mp3Path, title, videoId };
 }
 
@@ -231,9 +246,8 @@ function formatUptime(ms) {
 // ---------- Telegram bot with custom API server ----------
 const bot = new TelegramBot(BOT_TOKEN, {
   polling: true,
-  apiRoot: LOCAL_BOT_API_URL   // <-- use local server for 2GB uploads
+  apiRoot: LOCAL_BOT_API_URL
 });
-
 console.log(`Bot using API root: ${LOCAL_BOT_API_URL}`);
 
 // ---------- Inline keyboards ----------
@@ -270,22 +284,47 @@ function qualityKeyboard(qualities) {
 // ---------- Command handlers ----------
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id,
-    `👋 *Welcome to YT Downloader Bot (2GB Upload Ready)*\n\n` +
+    `👋 *Welcome to YT Downloader Bot (2GB Upload + FFmpeg Merge)*\n\n` +
     `Send me a YouTube URL.\n` +
     `⚙️ /settings – Preferences\n` +
     `📊 /stats – Bot statistics\n` +
-    `🔍 /formats <url> – Debug available qualities`,
+    `🔍 /formats <url> – Debug available qualities\n` +
+    `🍪 /checkcookie – Check cookie status`,
     { parse_mode: 'Markdown' }
   );
 });
 
-// Debug command to list all available formats
+// Cookie check command
+bot.onText(/\/checkcookie/, async (msg) => {
+  const chatId = msg.chat.id;
+  const exists = await cookieExists();
+  if (exists) {
+    const stats = await fs.stat(COOKIE_PATH);
+    await bot.sendMessage(chatId,
+      `🍪 *Cookie file found*\n\n` +
+      `📁 Path: \`${COOKIE_PATH}\`\n` +
+      `📦 Size: ${stats.size} bytes\n` +
+      `✅ Cookies will be used for yt-dlp.`,
+      { parse_mode: 'Markdown' }
+    );
+  } else {
+    await bot.sendMessage(chatId,
+      `🍪 *Cookie file NOT found*\n\n` +
+      `📁 Expected path: \`${COOKIE_PATH}\`\n` +
+      `⚠️ Without cookies, some videos may be limited to 360p or blocked.\n\n` +
+      `To fix: export cookies from a logged‑in YouTube session (using "Get cookies.txt LOCALLY" extension) and place the file at \`${COOKIE_PATH}\`.`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+});
+
+// Formats debug command
 bot.onText(/\/formats (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const url = match[1];
   const processing = await bot.sendMessage(chatId, '🔍 Fetching formats...');
   try {
-    const stdout = await runYtdlp(`-J "${url}"`);
+    const stdout = await runYtdlp(`-J "${url}"`, YTDLP_TIMEOUT, false);
     const data = JSON.parse(stdout);
     const formats = data.formats || [];
     const lines = [];
@@ -305,6 +344,7 @@ bot.onText(/\/formats (.+)/, async (msg, match) => {
   }
 });
 
+// Stats command
 bot.onText(/\/stats/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
@@ -325,6 +365,7 @@ bot.onText(/\/stats/, async (msg) => {
       `🍪 *Cookies*: ${cookiePresent ? '✅ Present' : '❌ Missing'}\n` +
       `🚀 *Optimizations*: concurrent fragments=50, geo-bypass, deno runtime\n` +
       `📤 *Upload limit*: ${LOCAL_BOT_API_URL !== 'https://api.telegram.org' ? '2GB (custom API server)' : '50MB (public API)'}\n` +
+      `🎞️ *FFmpeg merge*: Enabled (separate video+audio streams)\n` +
       `⏱ *Uptime*: ${uptime}\n` +
       `👥 *Active users*: ${activeUsers}\n` +
       `💻 *Node.js*: ${nodeVersion}\n` +
@@ -344,7 +385,7 @@ bot.onText(/\/settings/, async (msg) => {
   });
 });
 
-// ---------- Callback queries (answer immediately, then work) ----------
+// ---------- Callback queries (fixed: answer immediately, then work) ----------
 bot.on('callback_query', async (callbackQuery) => {
   const chatId = callbackQuery.message.chat.id;
   const messageId = callbackQuery.message.message_id;
@@ -530,6 +571,7 @@ async function startVideoDownload(chatId, userId, url, quality, statusMsgId) {
     scheduleCleanup(outputPath, minutes);
     if (thumb) scheduleCleanup(thumb, minutes);
   } catch (err) {
+    console.error(`Download error: ${err.message}`);
     await bot.editMessageText(`❌ Download failed: \`${err.message}\``, {
       chat_id: chatId,
       message_id: statusMsgId,
@@ -564,7 +606,7 @@ async function startAudioDownload(chatId, userId, url, statusMsgId) {
 
 async function startThumbnailDownload(chatId, userId, url, statusMsgId) {
   try {
-    const infoJson = await runYtdlp(`-J "${url}"`);
+    const infoJson = await runYtdlp(`-J "${url}"`, YTDLP_TIMEOUT, false);
     const info = JSON.parse(infoJson);
     const thumb = await downloadThumbnail(info.id);
     if (!thumb) throw new Error('No thumbnail');
@@ -596,7 +638,7 @@ bot.on('message', async (msg) => {
   const processingMsg = await bot.sendMessage(chatId, '⏳ *Fetching video info...*', { parse_mode: 'Markdown' });
 
   try {
-    const infoJson = await runYtdlp(`-J "${url}"`);
+    const infoJson = await runYtdlp(`-J "${url}"`, YTDLP_TIMEOUT, false);
     const info = JSON.parse(infoJson);
     const dur = info.duration ? `${Math.floor(info.duration / 60)}m ${info.duration % 60}s` : '?';
     const sent = await bot.sendMessage(chatId,
@@ -615,6 +657,13 @@ bot.on('message', async (msg) => {
   }
 });
 
+// ---------- Startup cookie log ----------
+(async () => {
+  const cookiePresent = await cookieExists();
+  if (cookiePresent) console.log('✅ cookies.txt found – will use it for yt-dlp');
+  else console.warn('⚠️ cookies.txt NOT found – some videos may be limited to 360p');
+})();
+
 // ---------- Start cleanup worker and bot ----------
 cleanupWorker();
-console.log('✅ Bot started with custom Bot API server (2GB upload support)');
+console.log('✅ Bot started with FFmpeg merge, 2GB upload support, and full cookie handling');

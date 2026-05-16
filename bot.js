@@ -20,6 +20,9 @@ const userSettings = new Map();
 const defaultSettings = { quality: '720p', mode: 'manual', cleanupMinutes: 10 };
 const cleanupRegistry = new Map();
 
+// Bot start time
+const BOT_START_TIME = Date.now();
+
 // ---------- Health server ----------
 const PORT = process.env.PORT || 8080;
 const healthServer = http.createServer((req, res) => {
@@ -29,6 +32,20 @@ const healthServer = http.createServer((req, res) => {
 healthServer.listen(PORT, () => {
   console.log(`✅ Health server listening on port ${PORT}`);
 });
+
+// ---------- yt-dlp version cache ----------
+let ytdlpVersion = null;
+
+async function getYtdlpVersion() {
+  if (ytdlpVersion) return ytdlpVersion;
+  try {
+    const { stdout } = await execPromise('yt-dlp --version');
+    ytdlpVersion = stdout.trim();
+    return ytdlpVersion;
+  } catch (err) {
+    return 'unknown';
+  }
+}
 
 // ---------- Cookie helper ----------
 async function cookieExists() {
@@ -149,10 +166,40 @@ async function cleanupWorker() {
         try {
           await fs.remove(filePath);
           cleanupRegistry.delete(filePath);
+          console.log(`Cleaned: ${filePath}`);
         } catch {}
       }
     }
   }, 60000);
+}
+
+// ---------- Stats helper ----------
+async function getDownloadDirStats() {
+  try {
+    const files = await fs.readdir(DOWNLOAD_DIR);
+    let totalSize = 0;
+    for (const file of files) {
+      const stat = await fs.stat(path.join(DOWNLOAD_DIR, file));
+      if (stat.isFile()) totalSize += stat.size;
+    }
+    return { count: files.length, sizeMB: (totalSize / (1024 * 1024)).toFixed(2) };
+  } catch {
+    return { count: 0, sizeMB: '0.00' };
+  }
+}
+
+function formatUptime(ms) {
+  const seconds = Math.floor(ms / 1000);
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  const parts = [];
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (minutes) parts.push(`${minutes}m`);
+  parts.push(`${secs}s`);
+  return parts.join(' ');
 }
 
 // ---------- Telegram bot ----------
@@ -200,21 +247,53 @@ bot.onText(/\/start/, (msg) => {
   bot.sendMessage(chatId,
     `👋 *Welcome to YT Downloader Bot (Node.js + yt-dlp + EJS fix)!*\n\n` +
     `Send me a YouTube URL.\n` +
-    `⚙️ /settings – Preferences`,
+    `⚙️ /settings – Preferences\n` +
+    `📊 /stats – Bot statistics`,
     { parse_mode: 'Markdown' }
   );
+});
+
+bot.onText(/\/stats/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    const ytVersion = await getYtdlpVersion();
+    const cookiePresent = await cookieExists();
+    const cookieStatus = cookiePresent ? '✅ Present' : '❌ Missing (some videos may be limited)';
+    const ejsStatus = '✅ Enabled (--remote-components ejs:npm)';
+    const uptime = formatUptime(Date.now() - BOT_START_TIME);
+    const activeUsers = userSettings.size;
+    const nodeVersion = process.version;
+    const { count: fileCount, sizeMB: dirSizeMB } = await getDownloadDirStats();
+    const pendingCleanup = cleanupRegistry.size;
+
+    const statsText = 
+      `📊 *Bot Statistics*\n\n` +
+      `🔧 *yt-dlp version*: \`${ytVersion}\`\n` +
+      `🍪 *Cookies*: ${cookieStatus}\n` +
+      `🧩 *EJS remote components*: ${ejsStatus}\n` +
+      `⏱ *Uptime*: ${uptime}\n` +
+      `👥 *Active users*: ${activeUsers}\n` +
+      `💻 *Node.js*: ${nodeVersion}\n` +
+      `💾 *Download folder*: ${fileCount} files, ${dirSizeMB} MB\n` +
+      `🧹 *Pending cleanup*: ${pendingCleanup} files\n` +
+      `⚙️ *Settings*: Default quality = ${getSettings(msg.from.id).quality}, Mode = ${getSettings(msg.from.id).mode}, Cleanup = ${getSettings(msg.from.id).cleanupMinutes === 0 ? 'Never' : getSettings(msg.from.id).cleanupMinutes + ' min'}`;
+
+    await bot.sendMessage(chatId, statsText, { parse_mode: 'Markdown' });
+  } catch (err) {
+    await bot.sendMessage(chatId, `❌ Failed to get stats: \`${err.message}\``, { parse_mode: 'Markdown' });
+  }
 });
 
 bot.onText(/\/settings/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id;
-  const sent = await bot.sendMessage(chatId, '⚙️ *Your Settings*', {
+  await bot.sendMessage(chatId, '⚙️ *Your Settings*', {
     parse_mode: 'Markdown',
     reply_markup: settingsKeyboard(userId),
   });
 });
 
-// ---------- Callback queries ----------
+// ---------- Callback queries (same as before, but keep all) ----------
 bot.on('callback_query', async (callbackQuery) => {
   const chatId = callbackQuery.message.chat.id;
   const messageId = callbackQuery.message.message_id;
@@ -223,7 +302,7 @@ bot.on('callback_query', async (callbackQuery) => {
 
   await bot.answerCallbackQuery(callbackQuery.id);
 
-  // --- Settings callbacks ---
+  // Settings callbacks
   if (data === 'close_settings') {
     await bot.deleteMessage(chatId, messageId);
     return;
@@ -357,7 +436,7 @@ bot.on('callback_query', async (callbackQuery) => {
     return;
   }
 
-  // --- Download callbacks ---
+  // Download callbacks
   if (data === 'dl_video') {
     const url = pendingDownloads.get(chatId)?.[messageId];
     if (!url) {
@@ -418,7 +497,7 @@ bot.on('callback_query', async (callbackQuery) => {
   }
 });
 
-// ---------- Download implementations ----------
+// ---------- Download implementations (unchanged) ----------
 async function startVideoDownload(chatId, userId, url, quality, statusMsgId) {
   try {
     const { outputPath, title, videoId } = await downloadVideo(url, quality);
@@ -520,4 +599,4 @@ bot.on('message', async (msg) => {
 
 // ---------- Start cleanup worker ----------
 cleanupWorker();
-console.log('✅ Bot started (Node.js + yt-dlp + EJS fix + health server)');
+console.log('✅ Bot started (Node.js + yt-dlp + EJS fix + health server + stats command)');

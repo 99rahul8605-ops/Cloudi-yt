@@ -701,10 +701,70 @@ async def settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+
+    # ── Quality selection by number reply (like reference bot logic) ──────
+    if ctx.user_data.get("awaiting_quality"):
+        await handle_quality_reply(update, ctx, text)
+        return
+
     if is_youtube_url(text):
         await handle_youtube_url(update, ctx, text)
     else:
         await handle_search(update, ctx, text)
+
+
+async def handle_quality_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    """Handle the user's numbered quality reply, matching reference bot logic."""
+    uid             = update.effective_user.id
+    quality_formats = ctx.user_data.get("quality_formats", [])
+    best_idx        = len(quality_formats) + 1   # last option = Best Available
+
+    try:
+        selection = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            "⚠️ Please reply with a number from the quality list."
+        )
+        return
+
+    if selection < 1 or selection > best_idx:
+        await update.message.reply_text(
+            f"⚠️ Please enter a number between 1 and {best_idx}."
+        )
+        return
+
+    # Clear awaiting flag immediately so stray messages don't re-trigger
+    ctx.user_data["awaiting_quality"] = False
+    ctx.user_data.pop("quality_formats", None)
+
+    if selection == best_idx:
+        quality = "best"
+    else:
+        chosen_fmt = quality_formats[selection - 1]
+        h = chosen_fmt.get("height")
+        quality = f"{h}p" if h else "best"
+
+    # Simulate a callback-query-like call to do_video by building a thin shim
+    class _MsgShim:
+        """Minimal shim so do_video can call status.edit_text."""
+        def __init__(self, msg):
+            self._msg = msg
+            self._bot = msg._bot if hasattr(msg, "_bot") else None
+        async def edit_text(self, *a, **kw):
+            # edit_text doesn't exist on a fresh reply — use reply_text instead
+            return await self._msg.reply_text(*a, **kw)
+
+    status_msg = await update.message.reply_text(
+        f"⏳ *Starting download ({quality})…*", parse_mode=ParseMode.MARKDOWN
+    )
+
+    # Patch status_msg so do_video's edit_text calls work
+    original_reply = status_msg.reply_text
+    async def _edit_text(*a, **kw):
+        return await status_msg.edit_text(*a, **kw)
+    status_msg.edit_text = _edit_text   # already has edit_text, this is fine
+
+    await _do_video_direct(update, ctx, uid, quality, status_msg)
 
 
 async def handle_youtube_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
@@ -781,37 +841,53 @@ async def show_quality_menu(q, ctx):
     info    = ctx.user_data.get("info", {})
     formats = info.get("formats", [])
 
-    # Heights actually reported by yt-dlp for this video
-    actual_heights = set(
-        int(f["height"]) for f in formats
-        if f.get("height")
-        and isinstance(f["height"], (int, float))
-        and int(f["height"]) > 0
-        and f.get("vcodec") not in (None, "none")
+    # Build a deduplicated list of ALL downloadable formats:
+    # adaptive video-only streams + muxed streams (like reference code logic
+    # but without the acodec!=none filter that hides high-res adaptive streams)
+    seen_heights = set()
+    quality_formats = []
+
+    for f in formats:
+        vc = (f.get("vcodec") or "none").lower()
+        ac = (f.get("acodec") or "none").lower()
+        has_v = vc != "none"
+        h = f.get("height")
+        if not has_v or not h:
+            continue
+        if h in seen_heights:
+            continue
+        seen_heights.add(h)
+        quality_formats.append(f)
+
+    # Sort by height ascending
+    quality_formats.sort(key=lambda f: f.get("height", 0))
+
+    # Add "Best Available" at the end
+    # Store the format list in user_data so number reply can resolve it
+    ctx.user_data["quality_formats"] = quality_formats
+    ctx.user_data["awaiting_quality"] = True
+
+    lines = []
+    for idx, f in enumerate(quality_formats):
+        h        = f.get("height", "?")
+        note     = f.get("format_note") or f"{h}p"
+        size     = f.get("filesize") or f.get("filesize_approx")
+        size_str = f"{size // 1024 // 1024} MB" if size else "? MB"
+        ac       = (f.get("acodec") or "none").lower()
+        tag      = "🔊" if ac != "none" else "🎬"  # muxed vs video-only
+        lines.append(f"{idx + 1}. {tag} {note} — {size_str}")
+
+    lines.append(f"{len(quality_formats) + 1}. ⭐ Best Available")
+
+    quality_list = "\n".join(lines)
+    title = info.get("title", "Video")
+
+    await q.message.edit_text(
+        f"🎬 *{title}*\n\n"
+        f"Choose a quality by replying with the number:\n\n"
+        f"{quality_list}",
+        parse_mode=ParseMode.MARKDOWN,
     )
-
-    # Always show standard options regardless of what yt-dlp reports.
-    # tv_embedded/mweb clients often return only 360p in the manifest,
-    # but yt-dlp can still fetch higher streams at download time.
-    # pick_best_formats already handles graceful fallback if a height
-    # isn't truly available — it picks the closest one below.
-    STANDARD = {360, 480, 720, 1080, 1440, 2160}
-
-    # Merge actual + standard so we never show fewer than 6 options
-    heights = sorted(actual_heights | STANDARD)
-
-    rows, row = [], []
-    for h in heights:
-        label = f"🔵 4K ({h}p)" if h == 2160 else (f"🟣 2K ({h}p)" if h == 1440 else f"{h}p")
-        row.append(InlineKeyboardButton(label, callback_data=f"dl:quality:{h}p"))
-        if len(row) == 3:
-            rows.append(row); row = []
-    if row:
-        rows.append(row)
-    rows.append([InlineKeyboardButton("⭐ Best Available", callback_data="dl:quality:best")])
-    rows.append([InlineKeyboardButton("❌ Cancel",         callback_data="dl:cancel")])
-    await q.message.edit_text("🎬 *Select video quality:*",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def ffmpeg_merge(video_path: str, audio_path: str, out_path: str) -> None:
@@ -912,6 +988,130 @@ async def send_file(
 
 
 # ─── Video ────────────────────────────────────────────────────────────────────
+async def _do_video_direct(update: Update, ctx, uid: int, quality: str, status_msg):
+    """
+    Called from handle_quality_reply (number-reply flow).
+    Mimics what do_video does but takes a status_msg directly instead of
+    a callback query object, since we came from a text message not a button tap.
+    """
+    url = ctx.user_data.get("url")
+    if not url:
+        await status_msg.edit_text("❌ No URL stored. Please resend the link.")
+        return
+
+    cached_info  = ctx.user_data.get("info", {})
+    formats      = cached_info.get("formats", [])
+    vid_id       = cached_info.get("id", "unknown")
+    title        = cached_info.get("title", vid_id)
+
+    if formats:
+        video_fmt_id, audio_fmt_id = pick_best_formats(formats, quality)
+    else:
+        video_fmt_id, audio_fmt_id = "bestvideo*", "bestaudio*"
+        logger.warning("No cached format list; using generic selectors")
+
+    logger.info("Downloading %s | quality=%s | video_id=%s audio_id=%s",
+                vid_id, quality, video_fmt_id, audio_fmt_id)
+
+    loop      = asyncio.get_event_loop()
+    base_opts = ydl_opts_base()
+
+    await status_msg.edit_text(
+        f"⬇️ *Downloading video stream ({quality})…*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    def _download_stream(fmt_id: str, suffix: str) -> str:
+        out_tmpl = str(DOWNLOAD_DIR / f"{vid_id}_{suffix}.%(ext)s")
+        opts = {**base_opts,
+                "format": fmt_id,
+                "outtmpl": out_tmpl,
+                "merge_output_format": None,
+                "postprocessors": []}
+        last = [0.0]
+        def hook(d):
+            if d["status"] != "downloading": return
+            now = time.time()
+            if now - last[0] < 3: return
+            last[0] = now
+            pct   = d.get("_percent_str", "?%").strip()
+            speed = d.get("_speed_str",   "?").strip()
+            eta   = d.get("_eta_str",     "?").strip()
+            label = "🎬 video" if suffix == "video" else "🔊 audio"
+            asyncio.run_coroutine_threadsafe(
+                status_msg.edit_text(
+                    f"⬇️ *Downloading {label} stream ({quality})…*\n"
+                    f"`{pct}` at `{speed}` — ETA `{eta}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                ), loop)
+        opts["progress_hooks"] = [hook]
+        with YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
+            found = sorted(DOWNLOAD_DIR.glob(f"{vid_id}_{suffix}.*"))
+            if not found:
+                raise FileNotFoundError(f"No {suffix} file written for {vid_id}")
+            return str(found[-1])
+
+    try:
+        video_file = await loop.run_in_executor(None, _download_stream, video_fmt_id, "video")
+    except Exception as e:
+        await status_msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    video_only_fmts = [f for f in formats
+                       if (f.get("vcodec") or "none") != "none"
+                       and (f.get("acodec") or "none") == "none"]
+    is_muxed_only = len(video_only_fmts) == 0
+
+    if is_muxed_only:
+        merged_path = video_file
+    else:
+        await status_msg.edit_text("⬇️ *Downloading audio stream…*", parse_mode=ParseMode.MARKDOWN)
+        try:
+            audio_file = await loop.run_in_executor(None, _download_stream, audio_fmt_id, "audio")
+        except Exception as e:
+            Path(video_file).unlink(missing_ok=True)
+            await status_msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+            return
+
+        await status_msg.edit_text("⚙️ *Merging streams…*", parse_mode=ParseMode.MARKDOWN)
+        merged_path = str(DOWNLOAD_DIR / f"{vid_id}_merged.mp4")
+        try:
+            await ffmpeg_merge(video_file, audio_file, merged_path)
+        except Exception as e:
+            Path(video_file).unlink(missing_ok=True)
+            Path(audio_file).unlink(missing_ok=True)
+            await status_msg.edit_text(
+                f"⚙️ *FFmpeg merge failed.*\n`{str(e)[:300]}`",
+                parse_mode=ParseMode.MARKDOWN)
+            return
+        finally:
+            Path(video_file).unlink(missing_ok=True)
+            Path(audio_file).unlink(missing_ok=True)
+
+    safe_title = re.sub(r'[^\w\s-]', '', title)[:50].strip()
+    filename   = f"{safe_title}_{quality}.mp4"
+    caption    = f"🎬 *{title}*\n🎞 Quality: `{quality}`"
+    s          = get_settings(uid)
+
+    try:
+        await send_file(
+            chat_id    = update.effective_chat.id,
+            filepath   = merged_path,
+            filename   = filename,
+            caption    = caption,
+            status_msg = status_msg,
+            is_video   = True,
+        )
+    except Exception as e:
+        await status_msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+        return
+    finally:
+        register_for_cleanup(merged_path, s["cleanup_minutes"])
+
+    await status_msg.edit_text(f"✅ *Done!* `{filename}`", parse_mode=ParseMode.MARKDOWN)
+
+
 async def do_video(q, ctx, uid: int, quality: str):
     url = ctx.user_data.get("url")
     if not url:

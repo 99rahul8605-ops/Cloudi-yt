@@ -26,12 +26,11 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, ExtractorError
 import yt_dlp as _yt_dlp_module
 
-try:
-    from pyrogram import Client as PyroClient
-    from pyrogram.errors import FloodWait
-    PYROGRAM_AVAILABLE = True
-except ImportError:
-    PYROGRAM_AVAILABLE = False
+# ── Local Bot API Server (2 GB uploads on Render) ────────────────────────────
+# Run telegram-bot-api locally on Render as a separate service.
+# Set LOCAL_API_URL=http://<your-render-service>:8081 to enable 2 GB uploads.
+# If not set, falls back to official api.telegram.org (50 MB limit).
+LOCAL_API_URL = os.environ.get("LOCAL_API_URL", "").rstrip("/")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -47,15 +46,8 @@ COOKIES_FILE = "cookies.txt"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 BOT_START_TIME = time.time()
 
-# ── Telegram MTProto (large-file upload, up to 2 GB) ─────────────────────────
-# Set TG_API_ID and TG_API_HASH from https://my.telegram.org/apps
-# If not set the bot still works but is capped at 50 MB per file.
-TG_API_ID   = os.environ.get("TG_API_ID")
-TG_API_HASH = os.environ.get("TG_API_HASH")
-LARGE_FILE_THRESHOLD = 50 * 1024 * 1024   # 50 MB — Bot API hard limit
-
-# Initialised in main() if credentials are present
-pyro_client = None
+# 50 MB = official Bot API limit. Local server removes this cap entirely.
+LARGE_FILE_THRESHOLD = 50 * 1024 * 1024
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -183,7 +175,10 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
         # and every format selector throws "Requested format is not available".
         "extractor_args": {
             "youtube": {
-                "player_client": ["tv_embedded", "mweb", "android_music", "ios", "web"],
+                # ios + android → return full adaptive format list (360p–1080p+)
+                # tv_embedded   → age-gate bypass (only returns muxed 360p — fallback only)
+                # android_music → last resort
+                "player_client": ["ios", "android", "tv_embedded", "android_music"],
             }
         },
 
@@ -250,6 +245,14 @@ def pick_best_formats(formats: list, quality: str) -> tuple[str, str]:
         "Format buckets — video-only: %d  audio-only: %d  muxed: %d",
         len(video_only), len(audio_only), len(muxed),
     )
+    if not video_only and muxed:
+        logger.warning(
+            "⚠️ No adaptive streams found — only %d muxed format(s) available. "
+            "Max quality will be 360p. This usually means the client chain "
+            "returned format 18 only (tv_embedded limitation). "
+            "Try adding valid cookies.txt for higher resolutions.",
+            len(muxed),
+        )
 
     # ── Pick audio ────────────────────────────────────────────────────────
     def audio_score(f):
@@ -580,14 +583,11 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if cs["ok"] else cs["reason"]
     )
 
-    if pyro_client is not None:
-        upload_limit = "2 GB (MTProto)"
+    if LOCAL_API_URL:
+        upload_limit = f"2 GB (local server: {LOCAL_API_URL})"
         upload_icon  = "🚀"
-    elif not PYROGRAM_AVAILABLE:
-        upload_limit = "50 MB (pyrogram not installed)"
-        upload_icon  = "⚠️"
     else:
-        upload_limit = "50 MB (TG_API_ID/HASH not set)"
+        upload_limit = "50 MB (set LOCAL_API_URL for 2 GB)"
         upload_icon  = "⚠️"
 
     msg = (
@@ -852,117 +852,63 @@ async def send_file(
     is_video: bool = True,
 ) -> None:
     """
-    Upload a file to Telegram choosing the right client automatically:
+    Upload a file to Telegram.
 
-      • file ≤ 50 MB  → Bot API (ctx.bot.send_document) — no extra creds needed
-      • file > 50 MB  → Pyrogram MTProto (pyro_client.send_document)
-                        requires TG_API_ID + TG_API_HASH env vars,
-                        raises RuntimeError if credentials are missing.
+    • LOCAL_API_URL set → uses local Bot API server (up to 2 GB, HTTP only,
+      works perfectly on Render — no MTProto TCP needed).
+    • LOCAL_API_URL not set → official api.telegram.org (50 MB hard limit).
 
-    Pyrogram connects directly to Telegram's servers (same as official clients)
-    so the per-file limit is 2 GB instead of 50 MB.
+    To enable 2 GB uploads on Render:
+      1. Deploy telegram-bot-api as a separate Render service (Docker image:
+         aiogram/telegram-bot-api or ghcr.io/tdlib/telegram-bot-api).
+      2. Set LOCAL_API_URL=http://<service-name>:8081 in this bot's env vars.
+      3. Also set TG_API_ID and TG_API_HASH (from https://my.telegram.org/apps)
+         in the telegram-bot-api service env vars.
     """
     file_size = os.path.getsize(filepath)
     size_mb   = file_size / (1024 * 1024)
-    # Use Pyrogram for ALL video uploads when available (no 50 MB cap, faster)
-    # For audio/docs: Pyrogram only when >50 MB
-    use_pyro  = (pyro_client is not None) and (is_video or file_size > LARGE_FILE_THRESHOLD)
+    via_local = bool(LOCAL_API_URL)
 
     logger.info("Uploading %s (%.1f MB) via %s",
-                filename, size_mb, "Pyrogram MTProto" if use_pyro else "Bot API")
+                filename, size_mb, f"local API ({LOCAL_API_URL})" if via_local else "official Bot API")
 
-    if use_pyro:
-        if not PYROGRAM_AVAILABLE:
-            raise RuntimeError(
-                "File is {:.0f} MB — install pyrogram to upload files >50 MB.\n"
-                "`pip install pyrogram`".format(size_mb)
-            )
-        if pyro_client is None:
-            raise RuntimeError(
-                "File is {:.0f} MB but TG_API_ID / TG_API_HASH are not set.\n\n"
-                "Get them from https://my.telegram.org/apps and add them as "
-                "environment variables.\n\n"
-                "📝 *Steps:*\n"
-                "1. Go to https://my.telegram.org/apps\n"
-                "2. Create an app → copy API ID and API Hash\n"
-                "3. Add `TG_API_ID` and `TG_API_HASH` as environment variables\n"
-                "4. Redeploy the bot".format(size_mb)
-            )
+    if not via_local and file_size > LARGE_FILE_THRESHOLD:
+        raise RuntimeError(
+            f"File is {size_mb:.0f} MB which exceeds the 50 MB Bot API limit.\n\n"
+            "To upload files up to 2 GB on Render, set up a local Bot API server:\n"
+            "1. Deploy telegram-bot-api on Render (Docker: aiogram/telegram-bot-api)\n"
+            "2. Set LOCAL_API_URL=http://<service>:8081 in this bot's env vars\n"
+            "3. Set TG_API_ID + TG_API_HASH in the telegram-bot-api service"
+        )
 
-        # ── Pyrogram upload with live progress ────────────────────────────
-        last_edit = [0.0]
+    await status_msg.edit_text(
+        f"📤 *Uploading ({size_mb:.1f} MB)…*" +
+        (" via local server" if via_local else ""),
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
-        async def _progress(current: int, total: int):
-            now = asyncio.get_event_loop().time()
-            if now - last_edit[0] < 4:
-                return
-            last_edit[0] = now
-            pct      = current * 100 / total
-            done_mb  = current / (1024 * 1024)
-            total_mb = total   / (1024 * 1024)
-            bar_len  = 12
-            filled   = int(bar_len * current / total)
-            bar      = "█" * filled + "░" * (bar_len - filled)
-            try:
-                await status_msg.edit_text(
-                    f"📤 *Uploading via MTProto…*\n"
-                    f"`[{bar}] {pct:.1f}%`\n"
-                    f"`{done_mb:.1f} / {total_mb:.1f} MB`",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-            except Exception:
-                pass   # ignore edit conflicts
-
-        if is_video:
-            await pyro_client.send_video(
+    with open(filepath, "rb") as fh:
+        if is_video and filepath.endswith(".mp4"):
+            await status_msg._bot.send_video(
                 chat_id=chat_id,
-                video=filepath,
+                video=fh,
                 caption=caption,
-                file_name=filename,
+                filename=filename,
                 supports_streaming=True,
-                progress=_progress,
+                read_timeout=300,
+                write_timeout=300,
+                connect_timeout=30,
             )
         else:
-            await pyro_client.send_document(
+            await status_msg._bot.send_document(
                 chat_id=chat_id,
-                document=filepath,
+                document=fh,
+                filename=filename,
                 caption=caption,
-                file_name=filename,
-                progress=_progress,
+                read_timeout=300,
+                write_timeout=300,
+                connect_timeout=30,
             )
-
-    else:
-        # ── Standard Bot API upload ───────────────────────────────────────
-        # send_document works for both video files and audio/mp3
-        with open(filepath, "rb") as fh:
-            # Try send_video for mp4 so Telegram shows an inline player
-            if is_video and filepath.endswith(".mp4"):
-                from telegram import InputFile
-                # PTB doesn't expose upload progress; just show a static message
-                await status_msg.edit_text(
-                    f"📤 *Uploading ({size_mb:.1f} MB)…*",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-                fh.seek(0)
-                await status_msg._bot.send_video(
-                    chat_id=chat_id,
-                    video=fh,
-                    caption=caption,
-                    filename=filename,
-                    supports_streaming=True,
-                )
-            else:
-                await status_msg.edit_text(
-                    f"📤 *Uploading ({size_mb:.1f} MB)…*",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-                fh.seek(0)
-                await status_msg._bot.send_document(
-                    chat_id=chat_id,
-                    document=fh,
-                    filename=filename,
-                    caption=caption,
-                )
 
 
 # ─── Video ────────────────────────────────────────────────────────────────────
@@ -1040,34 +986,44 @@ async def do_video(q, ctx, uid: int, quality: str):
         return
 
     # ── Step 3: download audio-only stream ───────────────────────────────
-    await status.edit_text("⬇️ *Downloading audio stream…*", parse_mode=ParseMode.MARKDOWN)
-    try:
-        audio_file = await loop.run_in_executor(None, _download_stream, audio_fmt_id, "audio")
-        logger.info("Audio stream saved: %s", audio_file)
-    except Exception as e:
-        Path(video_file).unlink(missing_ok=True)
-        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
-        return
+    # Skip if video stream already has audio (muxed format like format 18)
+    video_only_formats = [f for f in formats
+                          if (f.get("vcodec") or "none") != "none"
+                          and (f.get("acodec") or "none") == "none"]
+    is_muxed_only = len(video_only_formats) == 0
 
-    # ── Step 4: ffmpeg merge ──────────────────────────────────────────────
-    await status.edit_text("⚙️ *Merging streams…*", parse_mode=ParseMode.MARKDOWN)
-    merged_path = str(DOWNLOAD_DIR / f"{vid_id}_merged.mp4")
-    try:
-        await ffmpeg_merge(video_file, audio_file, merged_path)
-        logger.info("Merged: %s", merged_path)
-    except Exception as e:
-        logger.error("ffmpeg merge failed: %s", e)
-        Path(video_file).unlink(missing_ok=True)
-        Path(audio_file).unlink(missing_ok=True)
-        await status.edit_text(
-            f"⚙️ *FFmpeg merge failed.*\n`{str(e)[:300]}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-    finally:
-        # Temp streams no longer needed regardless of merge outcome
-        Path(video_file).unlink(missing_ok=True)
-        Path(audio_file).unlink(missing_ok=True)
+    if is_muxed_only:
+        logger.info("Muxed-only stream — skipping separate audio download and merge")
+        merged_path = video_file  # already has audio, use directly
+    else:
+        await status.edit_text("⬇️ *Downloading audio stream…*", parse_mode=ParseMode.MARKDOWN)
+        try:
+            audio_file = await loop.run_in_executor(None, _download_stream, audio_fmt_id, "audio")
+            logger.info("Audio stream saved: %s", audio_file)
+        except Exception as e:
+            Path(video_file).unlink(missing_ok=True)
+            await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+            return
+
+        # ── Step 4: ffmpeg merge ──────────────────────────────────────────────
+        await status.edit_text("⚙️ *Merging streams…*", parse_mode=ParseMode.MARKDOWN)
+        merged_path = str(DOWNLOAD_DIR / f"{vid_id}_merged.mp4")
+        try:
+            await ffmpeg_merge(video_file, audio_file, merged_path)
+            logger.info("Merged: %s", merged_path)
+        except Exception as e:
+            logger.error("ffmpeg merge failed: %s", e)
+            Path(video_file).unlink(missing_ok=True)
+            Path(audio_file).unlink(missing_ok=True)
+            await status.edit_text(
+                f"⚙️ *FFmpeg merge failed.*\n`{str(e)[:300]}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        finally:
+            # Temp streams no longer needed regardless of merge outcome
+            Path(video_file).unlink(missing_ok=True)
+            Path(audio_file).unlink(missing_ok=True)
 
     # ── Step 5: upload ────────────────────────────────────────────────────
     await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
@@ -1196,8 +1152,6 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def main():
-    global pyro_client
-
     # Log cookie status on startup so it's visible in Render logs
     cs = cookie_status()
     if cs["ok"]:
@@ -1207,25 +1161,21 @@ def main():
         logger.warning("⚠️ cookies.txt problem: %s", cs["reason"])
         logger.warning("   Bot will try client fallback chain (tv_embedded/android_music/ios)")
 
-    # ── Pyrogram large-file client ─────────────────────────────────────────
-    if PYROGRAM_AVAILABLE and TG_API_ID and TG_API_HASH:
-        pyro_client = PyroClient(
-            name       = "ytdl_bot",          # session file: ytdl_bot.session
-            api_id     = int(TG_API_ID),
-            api_hash   = TG_API_HASH,
-            bot_token  = BOT_TOKEN,
-            workdir    = str(DOWNLOAD_DIR),   # store session in downloads/
-        )
-        logger.info("✅ Pyrogram MTProto client configured (limit: 2 GB per file)")
+    # ── Upload limit check ────────────────────────────────────────────────
+    if LOCAL_API_URL:
+        logger.info("✅ Local Bot API server: %s (limit: 2 GB per file)", LOCAL_API_URL)
     else:
-        if not PYROGRAM_AVAILABLE:
-            logger.warning("⚠️ pyrogram not installed — uploads capped at 50 MB")
-        elif not TG_API_ID or not TG_API_HASH:
-            logger.warning("⚠️ TG_API_ID / TG_API_HASH not set — uploads capped at 50 MB")
+        logger.warning("⚠️ LOCAL_API_URL not set — uploads capped at 50 MB (official Bot API)")
 
     threading.Thread(target=start_health_server, daemon=True).start()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    # Point python-telegram-bot at the local server when configured.
+    # The local server accepts the same HTTP API but with no file-size cap.
+    builder = Application.builder().token(BOT_TOKEN)
+    if LOCAL_API_URL:
+        builder = builder.base_url(f"{LOCAL_API_URL}/bot")
+        builder = builder.base_file_url(f"{LOCAL_API_URL}/file/bot")
+    app = builder.build()
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("help",        cmd_help))
     app.add_handler(CommandHandler("settings",    cmd_settings))
@@ -1244,16 +1194,10 @@ def main():
             BotCommand("cookiecheck", "Diagnose cookie issues"),
             BotCommand("stats",       "Bot & dependency info"),
         ])
-        # Start Pyrogram client inside the running event loop
-        if pyro_client is not None:
-            await pyro_client.start()
-            logger.info("Pyrogram client started")
         asyncio.create_task(cleanup_worker())
 
     async def post_shutdown(application: Application):
-        if pyro_client is not None:
-            await pyro_client.stop()
-            logger.info("Pyrogram client stopped")
+        pass
 
     app.post_init     = post_init
     app.post_shutdown = post_shutdown

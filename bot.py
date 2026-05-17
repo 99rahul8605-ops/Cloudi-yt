@@ -189,17 +189,14 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
         "noplaylist":  True,
         "outtmpl":     str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
 
-        # Prefer H.264/mp4 video + m4a audio — copied into mp4 container by
-        # ffmpeg without re-encoding ("-c:v copy"), preserving original quality.
-        # VP9/webm would require a lossy transcode to mp4 which degrades quality.
-        # Fallback chain ensures something always downloads.
-        "format": (
-            "bestvideo[height<=1080][vcodec^=avc]+bestaudio[ext=m4a]"
-            "/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
-            "/bestvideo[height<=1080]+bestaudio"
-            "/best[height<=1080]"
-            "/best"
-        ),
+        # Use simple best+best selector — no codec/ext constraints.
+        # Constraints like [vcodec^=avc] or [ext=mp4] cause silent fallback
+        # to low-quality muxed streams when android_vr returns VP9/webm at
+        # 1080p (which it commonly does). Let yt-dlp pick the best available
+        # streams; ensure_telegram_compatible() converts to H264+AAC for
+        # Telegram before upload.
+        "format": "bestvideo+bestaudio/best",
+        "format_sort": ["res", "br", "vcodec:vp9", "acodec:opus"],
         "merge_output_format": "mp4",
 
         # Retries
@@ -304,22 +301,15 @@ def pick_best_formats(formats: list, quality: str) -> tuple[str, str]:
         )
 
     if not target_h or quality == "best":
-        # Best available: prefer H.264/mp4 so ffmpeg copies without re-encoding
-        vid_sel = "bestvideo[vcodec^=avc][ext=mp4]/bestvideo[ext=mp4]/bestvideo"
-        aud_sel = "bestaudio[ext=m4a]/bestaudio"
+        vid_sel = "bestvideo"
+        aud_sel = "bestaudio"
         logger.info("Selector: %s + %s", vid_sel, aud_sel)
         return vid_sel, aud_sel
 
-    # Height-based selector: prefer H.264/mp4 at or below target height.
-    # vcodec^=avc matches avc1/h264 — no re-encode needed during ffmpeg merge.
-    vid_sel = (
-        f"bestvideo[height<={target_h}][vcodec^=avc][ext=mp4]"
-        f"/bestvideo[height<={target_h}][ext=mp4]"
-        f"/bestvideo[height<={target_h}]"
-        f"/bestvideo[vcodec^=avc][ext=mp4]"
-        f"/bestvideo"
-    )
-    aud_sel = "bestaudio[ext=m4a]/bestaudio"
+    # No codec/ext constraints — let yt-dlp pick best at or below target height.
+    # ensure_telegram_compatible() will convert VP9/webm to H264 if needed.
+    vid_sel = f"bestvideo[height<={target_h}]/bestvideo"
+    aud_sel = "bestaudio"
 
     logger.info("Selector for %s: video=%s  audio=%s", quality, vid_sel, aud_sel)
     return vid_sel, aud_sel
@@ -1289,25 +1279,16 @@ async def do_video(q, ctx, uid: int, quality: str):
     vid_id      = cached_info.get("id", "unknown")
     title       = cached_info.get("title", vid_id)
 
-    # Use H.264/mp4 video + m4a audio so ffmpeg can copy streams without
-    # re-encoding (no quality loss). VP9/webm fallback only if unavailable.
+    # Simple height-capped selector with no codec/ext constraints.
+    # Codec constraints ([vcodec^=avc], [ext=mp4]) silently fall through
+    # to low-quality muxed streams when the client returns VP9/webm.
+    # ensure_telegram_compatible() converts the result to H264+AAC for Telegram.
     if quality == "best":
-        fmt = (
-            "bestvideo[vcodec^=avc]+bestaudio[ext=m4a]"
-            "/bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-            "/bestvideo+bestaudio/best"
-        )
+        fmt = "bestvideo+bestaudio/best"
     else:
         target_h = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080,
                     "1440p": 1440, "2160p": 2160}.get(quality, 1080)
-        fmt = (
-            f"bestvideo[height<={target_h}][vcodec^=avc]+bestaudio[ext=m4a]"
-            f"/bestvideo[height<={target_h}][ext=mp4]+bestaudio[ext=m4a]"
-            f"/bestvideo[height<={target_h}]+bestaudio"
-            f"/best[height<={target_h}]"
-            f"/bestvideo+bestaudio"
-            f"/best"
-        )
+        fmt = f"bestvideo[height<={target_h}]+bestaudio/best[height<={target_h}]/bestvideo+bestaudio/best"
 
     logger.info("Downloading %s | quality=%s | format=%s", vid_id, quality, fmt)
 
@@ -1342,15 +1323,24 @@ async def do_video(q, ctx, uid: int, quality: str):
         opts = {
             **base_opts,
             "format":              fmt,
+            "format_sort":         ["res", "br", "vcodec:vp9", "acodec:opus"],
             "merge_output_format": "mp4",
             "outtmpl":             out_path,
             "progress_hooks":      [hook],
-            # Override quiet so real error messages surface in exceptions
+            # Surface real error messages so failures are diagnosable
             "quiet":               False,
             "no_warnings":         False,
+            # Log the selected format so quality issues are visible in logs
+            "verbose":             False,
         }
         with YoutubeDL(opts) as ydl:
-            ydl.extract_info(url, download=True)
+            info = ydl.extract_info(url, download=True)
+            # Log exactly which format was selected
+            if info:
+                sel_fmt = info.get("format", "?")
+                sel_h   = info.get("height", "?")
+                sel_vc  = info.get("vcodec", "?")
+                logger.info("Selected format: %s | height=%s | vcodec=%s", sel_fmt, sel_h, sel_vc)
 
         # Find the merged mp4 yt-dlp wrote
         found = sorted(DOWNLOAD_DIR.glob(f"{vid_id}_{quality}.*"))

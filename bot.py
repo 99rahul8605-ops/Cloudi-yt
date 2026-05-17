@@ -1353,7 +1353,10 @@ def main():
     app.post_init     = post_init
     app.post_shutdown = post_shutdown
     logger.info("Bot started — polling")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,   # discard stale updates from previous session
+    )
 
 
 if __name__ == "__main__":

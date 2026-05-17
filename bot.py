@@ -210,36 +210,31 @@ def get_settings(uid: int) -> dict:
 
 def pick_best_formats(formats: list, quality: str) -> tuple[str, str]:
     """
-    Inspect the raw format list from extract_info and return
-    (video_format_id, audio_format_id) using actual IDs — no selector
-    strings that can misfire.
+    Return yt-dlp FORMAT SELECTOR STRINGS (not raw format IDs).
 
-    Logic:
-      1. Separate formats into video-only, audio-only, and muxed buckets.
-      2. For video: prefer the highest-resolution video-only stream at or
-         below the requested height; fall back to muxed if none found.
-      3. For audio: prefer m4a > webm/opus > anything, sorted by bitrate.
-      4. If only muxed streams exist, return (muxed_id, "none") and the
-         caller will skip the separate audio download.
+    Using selector strings instead of format IDs avoids the
+    "Requested format is not available" error that occurs when:
+      - Info was extracted with one client (ios/android) but download
+        uses a different client session with different format IDs.
+      - Format IDs are session-scoped and can change between requests.
 
-    Returns ("none", "none") only when the format list is completely empty.
+    Returns (video_selector, audio_selector) where each is a valid
+    yt-dlp -f string. The caller passes these directly to yt-dlp's
+    "format" option.
     """
     target_h = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080,
                 "1440p": 1440, "2160p": 2160, "4k": 2160}.get(quality)
 
-    # ── Bucket formats ────────────────────────────────────────────────────
-    video_only, audio_only, muxed = [], [], []
-    for f in formats:
-        vc = (f.get("vcodec") or "none").lower()
-        ac = (f.get("acodec") or "none").lower()
-        has_v = vc != "none"
-        has_a = ac != "none"
-        if has_v and not has_a:
-            video_only.append(f)
-        elif has_a and not has_v:
-            audio_only.append(f)
-        elif has_v and has_a:
-            muxed.append(f)
+    # Count buckets just for logging
+    video_only = [f for f in formats
+                  if (f.get("vcodec") or "none") != "none"
+                  and (f.get("acodec") or "none") == "none"]
+    audio_only = [f for f in formats
+                  if (f.get("acodec") or "none") != "none"
+                  and (f.get("vcodec") or "none") == "none"]
+    muxed      = [f for f in formats
+                  if (f.get("vcodec") or "none") != "none"
+                  and (f.get("acodec") or "none") != "none"]
 
     logger.info(
         "Format buckets — video-only: %d  audio-only: %d  muxed: %d",
@@ -247,74 +242,30 @@ def pick_best_formats(formats: list, quality: str) -> tuple[str, str]:
     )
     if not video_only and muxed:
         logger.warning(
-            "⚠️ No adaptive streams found — only %d muxed format(s) available. "
-            "Max quality will be 360p. This usually means the client chain "
-            "returned format 18 only (tv_embedded limitation). "
-            "Try adding valid cookies.txt for higher resolutions.",
+            "⚠️ No adaptive streams — only %d muxed format(s). Max quality: 360p.",
             len(muxed),
         )
 
-    # ── Pick audio ────────────────────────────────────────────────────────
-    def audio_score(f):
-        ext    = (f.get("ext") or "").lower()
-        tbr    = f.get("tbr") or f.get("abr") or 0
-        prefer = {"m4a": 2, "mp4": 1}.get(ext, 0)   # prefer m4a container
-        return (prefer, tbr)
+    if not target_h or quality == "best":
+        # Best available: yt-dlp picks the highest quality adaptive pair
+        vid_sel = "bestvideo[ext=mp4]/bestvideo"
+        aud_sel = "bestaudio[ext=m4a]/bestaudio"
+        logger.info("Selector: %s + %s", vid_sel, aud_sel)
+        return vid_sel, aud_sel
 
-    best_audio = None
-    if audio_only:
-        best_audio = max(audio_only, key=audio_score)
-    elif muxed:
-        # Fall back to a muxed stream just for audio extraction
-        best_audio = max(muxed, key=audio_score)
+    # Height-based selector: at or below target, best available below that
+    # The [height<=N] filter is evaluated fresh at download time against the
+    # actual available formats — no stale format ID problem.
+    vid_sel = (
+        f"bestvideo[height<={target_h}][ext=mp4]"
+        f"/bestvideo[height<={target_h}]"
+        f"/bestvideo[ext=mp4]"
+        f"/bestvideo"
+    )
+    aud_sel = "bestaudio[ext=m4a]/bestaudio"
 
-    # ── Pick video ────────────────────────────────────────────────────────
-    def video_score(f):
-        h   = f.get("height") or 0
-        tbr = f.get("tbr") or f.get("vbr") or 0
-        fps = f.get("fps") or 0
-        ext = (f.get("ext") or "").lower()
-        prefer_ext = 1 if ext == "mp4" else 0
-        return (h, tbr, fps, prefer_ext)
-
-    best_video = None
-
-    # Try video-only streams first (pure video, no muxed audio overhead)
-    candidates = video_only or muxed
-    if target_h:
-        # Exact-or-below match
-        at_height = [f for f in candidates
-                     if isinstance(f.get("height"), int) and f["height"] <= target_h]
-        if at_height:
-            best_video = max(at_height, key=video_score)
-        else:
-            # No format at/below target — take the closest above (graceful upscale)
-            above = [f for f in candidates if isinstance(f.get("height"), int)]
-            if above:
-                best_video = min(above, key=lambda f: abs(f["height"] - target_h))
-            else:
-                # No height metadata at all — take highest bitrate
-                best_video = max(candidates, key=video_score) if candidates else None
-    else:
-        # "best" quality — no height cap
-        best_video = max(candidates, key=video_score) if candidates else None
-
-    if best_video:
-        logger.info(
-            "Selected video format: id=%s ext=%s height=%s vcodec=%s",
-            best_video.get("format_id"), best_video.get("ext"),
-            best_video.get("height"), best_video.get("vcodec"),
-        )
-    if best_audio:
-        logger.info(
-            "Selected audio format: id=%s ext=%s tbr=%s acodec=%s",
-            best_audio.get("format_id"), best_audio.get("ext"),
-            best_audio.get("tbr"), best_audio.get("acodec"),
-        )
-
-    vid_id = best_video["format_id"] if best_video else "bestvideo*"
-    aud_id = best_audio["format_id"] if best_audio else "bestaudio*"
-    return vid_id, aud_id
+    logger.info("Selector for %s: video=%s  audio=%s", quality, vid_sel, aud_sel)
+    return vid_sel, aud_sel
 
 
 def quality_opts(q: str) -> dict:

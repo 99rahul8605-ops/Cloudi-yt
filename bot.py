@@ -5,7 +5,7 @@ python-telegram-bot v21 | yt-dlp | FFmpeg | Pyrogram | Render
 YouTube bypass strategy (ordered by reliability):
   1. cookies.txt auto-detected + validated on startup
   2. /cookiecheck command – shows cookie status + first valid line
-  3. tv_embedded + mweb + android_music + ios client chain
+  3. android_vr + tv + tv_downgraded + web client chain (no PO token required)
   4. age_gate bypass via embed extraction
   5. Rotating User-Agents
   6. Extractor / fragment retries + pacing
@@ -210,22 +210,33 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
         "socket_timeout":      30,
     }
 
-    # ── PO Token via bgutil HTTP server ──────────────────────────────────
-    # bgutil-ytdlp-pot-provider runs a Deno HTTP server on port 4416.
-    # It automatically generates PO Tokens for YouTube's SABR bypass.
-    # Without this, YouTube forces SABR streaming and returns only
-    # format 18 (360p). bgutil is the official yt-dlp recommended solution.
+    # ── YouTube client chain — no PO token / bgutil / Deno required ─────
     #
-    # The plugin (bgutil-ytdlp-pot-provider pip package) auto-connects to
-    # http://127.0.0.1:4416 — no extractor_args needed, it hooks in
-    # automatically via yt-dlp's PO Token Provider Framework.
-    # We still set player_client to "default" to use all available clients.
+    # Root cause of 1080p+ quality loss (researched from yt-dlp source):
+    #   YouTube's SABR (Server ABR) system forces adaptive streams through
+    #   its own servers when it detects an unknown/unsupported client or
+    #   when a valid GVS PO Token is missing. This degrades quality.
+    #
+    # Client analysis (yt-dlp 2026.03.17 _base.py):
+    #   android_vr   — NO PO token required, NO JS player, returns full
+    #                  adaptive streams (1080p+). Version MUST stay at 1.65
+    #                  — yt-dlp source comment: ">1.65 returns SABR only".
+    #   tv           — NO PO token required, returns adaptive streams,
+    #                  good fallback for videos android_vr can't access.
+    #   tv_downgraded— Secondary TV fallback, also no PO token needed.
+    #   web          — Last resort metadata fallback only (JS player needed,
+    #                  no PO token, but limited adaptive streams).
+    #
+    # Do NOT use: ios, android, mweb, tv_simply, web_creator, web_music
+    #   — all require PO token (required=True in GVS_PO_TOKEN_POLICY),
+    #   which means they fall back to low-quality muxed streams without
+    #   a token provider running.
     opts["extractor_args"] = {
         "youtube": {
-            "player_client": ["default"],
+            "player_client": ["android_vr", "tv", "tv_downgraded", "web"],
         }
     }
-    logger.info("yt-dlp PO token: bgutil-ytdlp-pot-provider plugin active (port 4416)")
+    logger.info("yt-dlp client chain: android_vr + tv + tv_downgraded + web (no PO token needed)")
 
     # ── Proxy ─────────────────────────────────────────────────────────────
     if YTDL_PROXY:
@@ -1391,7 +1402,7 @@ async def do_audio(q, ctx, uid: int):
         info = await do_download(url, {
             # bestaudio/best covers both split-stream and pre-muxed sources.
             # format_sort in ydl_opts_base already prefers m4a; this handles
-            # webm/opus streams served by tv_embedded / android_music clients.
+            # webm/opus streams served by tv / android_vr clients.
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "postprocessors": [{"key": "FFmpegExtractAudio",
                                 "preferredcodec": "mp3",
@@ -1505,7 +1516,7 @@ def main():
                     cs.get("yt_lines", 0), cs.get("has_sapisid", False))
     else:
         logger.warning("⚠️ cookies.txt problem: %s", cs["reason"])
-        logger.warning("   Bot will try client fallback chain (tv_embedded/android_music/ios)")
+        logger.warning("   Bot will try client fallback chain (android_vr/tv/tv_downgraded/web)")
 
     # ── Launch Pyrogram MTProto upload client ────────────────────────────
     # Pyrogram is started inside post_init (event loop already running).

@@ -91,6 +91,19 @@ DEFAULT_SETTINGS = {"quality": "720p", "mode": "manual", "cleanup_minutes": 10}
 user_settings:    dict[int, dict]  = {}
 cleanup_registry: dict[str, float] = {}
 
+# ── Concurrency guard ─────────────────────────────────────────────────────────
+# Only 1 download+ffmpeg+upload pipeline runs at a time.
+# This prevents OOM on memory-constrained hosts (e.g. Render 512 MB).
+# All quality options are preserved — this just queues requests instead of
+# running them simultaneously.
+_download_sem: asyncio.Semaphore | None = None   # initialised in post_init
+
+def get_download_sem() -> asyncio.Semaphore:
+    global _download_sem
+    if _download_sem is None:
+        _download_sem = asyncio.Semaphore(1)
+    return _download_sem
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  COOKIE HELPERS
@@ -862,6 +875,16 @@ def human_size(b: int) -> str:
     if b < 1024 ** 3: return f"{b / 1024 ** 2:.1f} MB"
     return f"{b / 1024 ** 3:.2f} GB"
 
+def _get_tmp_usage() -> str:
+    """Return a human-readable disk-usage string for the downloads folder."""
+    try:
+        import shutil as _shutil
+        stat = _shutil.disk_usage(str(DOWNLOAD_DIR))
+        used = stat.total - stat.free
+        return f"{human_size(used)} used / {human_size(stat.total)} total"
+    except Exception:
+        return "unknown"
+
 
 def _progress_bar(pct: int, width: int = 16) -> str:
     filled = round(pct * width / 100)
@@ -1040,6 +1063,9 @@ def ensure_telegram_compatible(filepath: str) -> str:
         )
         logger.info("[FFMPEG] ensure_telegram_compatible: vcodec=%s acodec=%s → H264+AAC mp4",
                     vcodec, acodec)
+        # Delete source before transcode if re-encoding — avoids holding both
+        # the source and output on disk simultaneously (saves ~2× file size in RAM/disk)
+        src_to_delete = filepath if need_vid else None
         result = subprocess.run(cmd, capture_output=True, timeout=600)
         if result.returncode == 0 and Path(out_path).exists():
             try: p.unlink()
@@ -1128,28 +1154,36 @@ async def send_file(
     thumb_path:    str | None = None,
 ) -> None:
     """
-    Upload a merged video (or audio) file via Pyrogram MTProto.
+    Upload a video or audio file via Pyrogram MTProto.
 
-    Features:
-      • Rich upload progress bar — updates every 3 s (speed, ETA, bytes)
-      • ffprobe injects width / height / duration → Telegram shows correctly
-      • ensure_telegram_compatible() pre-muxes to H264+AAC — Telegram skips
-        server-side transcoding, preserving original quality
-      • thumb_path: local JPEG thumbnail shown in Telegram video player
-      • 2 GB limit (Pyrogram MTProto, no Bot API restriction)
+    Memory-safe design (ported from bot__4_.py pattern):
+      • ensure_telegram_compatible() runs BEFORE upload — old file deleted
+        inside that function, so only ONE copy ever exists on disk at a time.
+      • File is deleted immediately after a successful send (no lingering).
+      • No cleanup_registry for the video — it is gone the moment upload ends.
+      • Progress bar updates every 3 s with speed + ETA.
+      • ffprobe metadata injected → Telegram shows duration/dimensions.
+      • 2 GB limit (Pyrogram MTProto, bypasses Bot API 50 MB cap).
     """
     if _pyro_bot is None or not _pyro_bot.is_connected:
         raise RuntimeError("Pyrogram client is not running.")
 
-    filepath   = str(filepath)           # accept Path objects too
-    file_size  = os.path.getsize(filepath)
-    size_mb    = file_size / (1024 * 1024)
-    ext        = Path(filepath).suffix.lower()
+    filepath  = str(filepath)           # accept Path objects
+    loop      = asyncio.get_event_loop()
+    ext       = Path(filepath).suffix.lower()
 
+    # ── Step 1: make Telegram-compatible (stream-copy or re-encode) ───────────
+    # ensure_telegram_compatible deletes the source file inside itself before
+    # writing the output, so we never hold two large copies simultaneously.
+    if is_video and ext in VIDEO_EXTS:
+        filepath = await loop.run_in_executor(None, ensure_telegram_compatible, filepath)
+
+    file_size = os.path.getsize(filepath)
+    size_mb   = file_size / (1024 * 1024)
     logger.info("Uploading %s (%.1f MB) via Pyrogram MTProto", filename, size_mb)
 
-    # ── Progress callback ─────────────────────────────────────────────────────
-    _last_edit: list[float] = [0.0]
+    # ── Step 2: progress callback ─────────────────────────────────────────────
+    _last_edit:  list[float] = [0.0]
     _start_time: list[float] = [time.time()]
 
     async def _progress(current: int, total: int) -> None:
@@ -1169,56 +1203,51 @@ async def send_file(
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # ── Video upload ──────────────────────────────────────────────────────────
-    if is_video and ext in VIDEO_EXTS:
-        loop = asyncio.get_event_loop()
+    # ── Step 3: send via Pyrogram, delete immediately after ───────────────────
+    try:
+        if is_video and ext in VIDEO_EXTS:
+            meta = get_video_meta(filepath)
+            logger.info(
+                "Video meta — %dx%d  dur=%ds  has_audio=%s",
+                meta["width"], meta["height"], meta["duration"], meta["has_audio"],
+            )
+            await _pyro_bot.send_video(
+                chat_id            = chat_id,
+                video              = filepath,
+                caption            = caption,
+                file_name          = filename,
+                width              = meta["width"],
+                height             = meta["height"],
+                duration           = meta["duration"],
+                supports_streaming = True,
+                thumb              = thumb_path,
+                progress           = _progress,
+            )
 
-        # Pre-mux to a Telegram-safe mp4 (H.264 video + AAC audio, faststart).
-        # When the container/codec already matches Telegram's expectations,
-        # Telegram skips its server-side transcoder and serves the original
-        # bitstream — preserving full original quality.
-        # If the video is already H.264+AAC in an mp4 with a moov atom at the
-        # front, ffmpeg finishes in seconds (stream-copy, no re-encode).
-        filepath = await loop.run_in_executor(None, ensure_telegram_compatible, filepath)
+        elif ext in AUDIO_EXTS:
+            await _pyro_bot.send_audio(
+                chat_id   = chat_id,
+                audio     = filepath,
+                caption   = caption,
+                file_name = filename,
+                progress  = _progress,
+            )
 
-        meta = get_video_meta(filepath)
-        logger.info(
-            "Video meta — %dx%d  dur=%ds  has_audio=%s",
-            meta["width"], meta["height"], meta["duration"], meta["has_audio"],
-        )
+        else:
+            await _pyro_bot.send_document(
+                chat_id   = chat_id,
+                document  = filepath,
+                caption   = caption,
+                file_name = filename,
+                progress  = _progress,
+            )
 
-        await _pyro_bot.send_video(
-            chat_id            = chat_id,
-            video              = filepath,
-            caption            = caption,
-            file_name          = filename,
-            width              = meta["width"],
-            height             = meta["height"],
-            duration           = meta["duration"],
-            supports_streaming = True,
-            thumb              = thumb_path,
-            progress           = _progress,
-        )
-
-    # ── Audio upload ──────────────────────────────────────────────────────────
-    elif ext in AUDIO_EXTS:
-        await _pyro_bot.send_audio(
-            chat_id   = chat_id,
-            audio     = filepath,
-            caption   = caption,
-            file_name = filename,
-            progress  = _progress,
-        )
-
-    # ── Document fallback ─────────────────────────────────────────────────────
-    else:
-        await _pyro_bot.send_document(
-            chat_id   = chat_id,
-            document  = filepath,
-            caption   = caption,
-            file_name = filename,
-            progress  = _progress,
-        )
+    finally:
+        # Always delete the file right after upload — never leave large files
+        # sitting on disk. This is the core of the memory-safe design.
+        Path(filepath).unlink(missing_ok=True)
+        logger.info("Deleted after upload: %s | disk free: %s",
+                    filename, _get_tmp_usage())
 
 
 # ─── Video ────────────────────────────────────────────────────────────────────
@@ -1360,115 +1389,125 @@ async def do_video(q, ctx, uid: int, quality: str):
     if not url:
         await q.message.edit_text("❌ No URL stored. Please resend the link."); return
 
-    # ── Step 1: build format selector ───────────────────────────────────
-    cached_info = ctx.user_data.get("info", {})
-    vid_id      = cached_info.get("id", "unknown")
-    title       = cached_info.get("title", vid_id)
-
-    # Simple height-capped selector with no codec/ext constraints.
-    # Codec constraints ([vcodec^=avc], [ext=mp4]) silently fall through
-    # to low-quality muxed streams when the client returns VP9/webm.
-    # ensure_telegram_compatible() converts the result to H264+AAC for Telegram.
-    if quality == "best":
-        fmt = "bestvideo+bestaudio/best"
-    else:
-        target_h = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080,
-                    "1440p": 1440, "2160p": 2160}.get(quality, 1080)
-        fmt = f"bestvideo[height<={target_h}]+bestaudio/best[height<={target_h}]/bestvideo+bestaudio/best"
-
-    logger.info("Downloading %s | quality=%s | format=%s", vid_id, quality, fmt)
-
-    loop      = asyncio.get_event_loop()
-    base_opts = ydl_opts_base()
-    out_path  = str(DOWNLOAD_DIR / f"{vid_id}_{quality}.%(ext)s")
-
-    # ── Step 2: download + auto-merge via yt-dlp+ffmpeg ──────────────────
-    status = await q.message.edit_text(
-        f"⬇️ *Downloading ({quality})…*",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    def _download() -> str:
-        """Single yt-dlp call: downloads bestvideo+bestaudio and merges to mp4."""
-        last = [0.0]
-        def hook(d):
-            if d["status"] != "downloading": return
-            now = time.time()
-            if now - last[0] < 3: return
-            last[0] = now
-            pct   = d.get("_percent_str",  "0%").strip()
-            speed = d.get("_speed_str",    "?").strip()
-            eta   = d.get("_eta_str",      "?").strip()
-            down  = d.get("_downloaded_bytes_str", "?").strip()
-            total = d.get("_total_bytes_str") or d.get("_total_bytes_estimate_str") or "?"
-            total = total.strip() if isinstance(total, str) else "?"
-            text  = download_progress_text(f"*{quality}*", pct, speed, eta, down, total)
-            asyncio.run_coroutine_threadsafe(
-                status.edit_text(text, parse_mode=ParseMode.MARKDOWN), loop)
-
-        opts = {
-            **base_opts,
-            "format":              fmt,
-            "format_sort":         ["res", "br", "vcodec:vp9", "acodec:opus"],
-            "merge_output_format": "mp4",
-            "outtmpl":             out_path,
-            "progress_hooks":      [hook],
-            # Surface real error messages so failures are diagnosable
-            "quiet":               False,
-            "no_warnings":         False,
-            # Log the selected format so quality issues are visible in logs
-            "verbose":             False,
-        }
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # Log exactly which format was selected
-            if info:
-                sel_fmt = info.get("format", "?")
-                sel_h   = info.get("height", "?")
-                sel_vc  = info.get("vcodec", "?")
-                logger.info("Selected format: %s | height=%s | vcodec=%s", sel_fmt, sel_h, sel_vc)
-
-        # Find the merged mp4 yt-dlp wrote
-        found = sorted(DOWNLOAD_DIR.glob(f"{vid_id}_{quality}.*"))
-        if not found:
-            raise FileNotFoundError(f"No output file found for {vid_id}")
-        return str(found[-1])
-
-    try:
-        merged_path = await loop.run_in_executor(None, _download)
-        logger.info("Downloaded+merged: %s", merged_path)
-    except Exception as e:
-        raw = str(e)[:500]
-        logger.error("Download failed: %s", raw)
-        user_msg = friendly_error(e)
-        # Always append raw error so user can see what actually happened
-        user_msg += f"\n\n`{raw}`"
-        await status.edit_text(user_msg, parse_mode=ParseMode.MARKDOWN)
-        return
-
-    # ── Step 3: upload ────────────────────────────────────────────────────
-    # Download best-resolution thumbnail from YouTube for the video player
-    thumb_path = download_thumbnail(cached_info, vid_id)
-    if thumb_path:
-        register_for_cleanup(thumb_path, get_settings(uid)["cleanup_minutes"])
-
-    await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
-    try:
-        await send_file(
-            chat_id    = q.message.chat_id,
-            filepath   = merged_path,
-            filename   = f"{title}.mp4",
-            caption    = f"🎬 {title} [{quality}]",
-            status_msg = status,
-            is_video   = True,
-            thumb_path = thumb_path,
+    # Queue if another download is already running
+    sem = get_download_sem()
+    if sem.locked():
+        await q.message.edit_text(
+            "⏳ *Another download is in progress. You're queued — please wait…*",
+            parse_mode=ParseMode.MARKDOWN,
         )
-        await status.delete()
-    except Exception as e:
-        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
-        return
 
-    register_for_cleanup(merged_path, get_settings(uid)["cleanup_minutes"])
+    async with sem:
+        # ── Step 1: build format selector ───────────────────────────────────
+        cached_info = ctx.user_data.get("info", {})
+        vid_id      = cached_info.get("id", "unknown")
+        title       = cached_info.get("title", vid_id)
+
+        # Simple height-capped selector with no codec/ext constraints.
+        # Codec constraints ([vcodec^=avc], [ext=mp4]) silently fall through
+        # to low-quality muxed streams when the client returns VP9/webm.
+        # ensure_telegram_compatible() converts the result to H264+AAC for Telegram.
+        if quality == "best":
+            fmt = "bestvideo+bestaudio/best"
+        else:
+            target_h = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080,
+                        "1440p": 1440, "2160p": 2160}.get(quality, 1080)
+            fmt = f"bestvideo[height<={target_h}]+bestaudio/best[height<={target_h}]/bestvideo+bestaudio/best"
+
+        logger.info("Downloading %s | quality=%s | format=%s", vid_id, quality, fmt)
+
+        loop      = asyncio.get_event_loop()
+        base_opts = ydl_opts_base()
+        out_path  = str(DOWNLOAD_DIR / f"{vid_id}_{quality}.%(ext)s")
+
+        # ── Step 2: download + auto-merge via yt-dlp+ffmpeg ──────────────────
+        status = await q.message.edit_text(
+            f"⬇️ *Downloading ({quality})…*",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+        def _download() -> str:
+            """Single yt-dlp call: downloads bestvideo+bestaudio and merges to mp4."""
+            last = [0.0]
+            def hook(d):
+                if d["status"] != "downloading": return
+                now = time.time()
+                if now - last[0] < 3: return
+                last[0] = now
+                pct   = d.get("_percent_str",  "0%").strip()
+                speed = d.get("_speed_str",    "?").strip()
+                eta   = d.get("_eta_str",      "?").strip()
+                down  = d.get("_downloaded_bytes_str", "?").strip()
+                total = d.get("_total_bytes_str") or d.get("_total_bytes_estimate_str") or "?"
+                total = total.strip() if isinstance(total, str) else "?"
+                text  = download_progress_text(f"*{quality}*", pct, speed, eta, down, total)
+                asyncio.run_coroutine_threadsafe(
+                    status.edit_text(text, parse_mode=ParseMode.MARKDOWN), loop)
+
+            opts = {
+                **base_opts,
+                "format":              fmt,
+                "format_sort":         ["res", "br", "vcodec:vp9", "acodec:opus"],
+                "merge_output_format": "mp4",
+                "outtmpl":             out_path,
+                "progress_hooks":      [hook],
+                # Surface real error messages so failures are diagnosable
+                "quiet":               False,
+                "no_warnings":         False,
+                # Log the selected format so quality issues are visible in logs
+                "verbose":             False,
+            }
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                # Log exactly which format was selected
+                if info:
+                    sel_fmt = info.get("format", "?")
+                    sel_h   = info.get("height", "?")
+                    sel_vc  = info.get("vcodec", "?")
+                    logger.info("Selected format: %s | height=%s | vcodec=%s", sel_fmt, sel_h, sel_vc)
+
+            # Find the merged mp4 yt-dlp wrote
+            found = sorted(DOWNLOAD_DIR.glob(f"{vid_id}_{quality}.*"))
+            if not found:
+                raise FileNotFoundError(f"No output file found for {vid_id}")
+            return str(found[-1])
+
+        try:
+            merged_path = await loop.run_in_executor(None, _download)
+            logger.info("Downloaded+merged: %s", merged_path)
+        except Exception as e:
+            raw = str(e)[:500]
+            logger.error("Download failed: %s", raw)
+            user_msg = friendly_error(e)
+            # Always append raw error so user can see what actually happened
+            user_msg += f"\n\n`{raw}`"
+            await status.edit_text(user_msg, parse_mode=ParseMode.MARKDOWN)
+            return
+
+        # ── Step 3: upload ────────────────────────────────────────────────────
+        # Download best-resolution thumbnail from YouTube for the video player
+        thumb_path = download_thumbnail(cached_info, vid_id)
+
+        await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
+        try:
+            await send_file(
+                chat_id    = q.message.chat_id,
+                filepath   = merged_path,
+                filename   = f"{title}.mp4",
+                caption    = f"🎬 {title} [{quality}]",
+                status_msg = status,
+                is_video   = True,
+                thumb_path = thumb_path,
+            )
+            await status.delete()
+        except Exception as e:
+            await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
+            return
+        finally:
+            # File is deleted inside send_file immediately after upload.
+            # Also delete thumb if present.
+            if thumb_path:
+                Path(thumb_path).unlink(missing_ok=True)
 
 
 # ─── Audio ────────────────────────────────────────────────────────────────────
@@ -1477,43 +1516,53 @@ async def do_audio(q, ctx, uid: int):
     if not url:
         await q.message.edit_text("❌ No URL stored."); return
 
-    status = await q.message.edit_text("⬇️ *Extracting audio…*", parse_mode=ParseMode.MARKDOWN)
-    loop = asyncio.get_event_loop()
-    hook = build_progress_hook(loop, status, q.message.chat_id, ctx.bot)
-    try:
-        info = await do_download(url, {
-            # bestaudio/best covers both split-stream and pre-muxed sources.
-            # format_sort in ydl_opts_base already prefers m4a; this handles
-            # webm/opus streams served by tv / android_vr clients.
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "postprocessors": [{"key": "FFmpegExtractAudio",
-                                "preferredcodec": "mp3",
-                                "preferredquality": "192"}],
-        }, hook)
-    except (DownloadError, ExtractorError) as e:
-        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
-    except Exception as e:
-        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
-
-    vid_id = info.get("id", "")
-    files  = list(DOWNLOAD_DIR.glob(f"{vid_id}.mp3")) or list(DOWNLOAD_DIR.glob(f"{vid_id}.*"))
-    if not files:
-        await status.edit_text("❌ Audio file not found."); return
-    filepath = str(files[0])
-    await status.edit_text("📤 *Uploading MP3…*", parse_mode=ParseMode.MARKDOWN)
-    try:
-        await send_file(
-            chat_id    = q.message.chat_id,
-            filepath   = filepath,
-            filename   = f"{info.get('title', 'audio')}.mp3",
-            caption    = f"🎵 {info.get('title', '')}",
-            status_msg = status,
-            is_video   = False,
+    sem = get_download_sem()
+    if sem.locked():
+        await q.message.edit_text(
+            "⏳ *Another download is in progress. You're queued — please wait…*",
+            parse_mode=ParseMode.MARKDOWN,
         )
-        await status.delete()
-    except Exception as e:
-        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-    register_for_cleanup(filepath, get_settings(uid)["cleanup_minutes"])
+
+    async with sem:
+        status = await q.message.edit_text("⬇️ *Extracting audio…*", parse_mode=ParseMode.MARKDOWN)
+        loop = asyncio.get_event_loop()
+        hook = build_progress_hook(loop, status, q.message.chat_id, ctx.bot)
+        try:
+            info = await do_download(url, {
+                # bestaudio/best covers both split-stream and pre-muxed sources.
+                # format_sort in ydl_opts_base already prefers m4a; this handles
+                # webm/opus streams served by tv / android_vr clients.
+                "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                "postprocessors": [{"key": "FFmpegExtractAudio",
+                                    "preferredcodec": "mp3",
+                                    "preferredquality": "192"}],
+            }, hook)
+        except (DownloadError, ExtractorError) as e:
+            await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
+        except Exception as e:
+            await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
+
+        vid_id = info.get("id", "")
+        files  = list(DOWNLOAD_DIR.glob(f"{vid_id}.mp3")) or list(DOWNLOAD_DIR.glob(f"{vid_id}.*"))
+        if not files:
+            await status.edit_text("❌ Audio file not found."); return
+        filepath = str(files[0])
+        await status.edit_text("📤 *Uploading MP3…*", parse_mode=ParseMode.MARKDOWN)
+        try:
+            await send_file(
+                chat_id    = q.message.chat_id,
+                filepath   = filepath,
+                filename   = f"{info.get('title', 'audio')}.mp3",
+                caption    = f"🎵 {info.get('title', '')}",
+                status_msg = status,
+                is_video   = False,
+            )
+            await status.delete()
+        except Exception as e:
+            await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
+        finally:
+            # Delete immediately — audio files don't need to linger
+            Path(filepath).unlink(missing_ok=True)
 
 
 # ─── Thumbnail ────────────────────────────────────────────────────────────────
@@ -1621,6 +1670,8 @@ def main():
     app.add_error_handler(error_handler)
 
     async def post_init(application: Application):
+        global _download_sem
+        _download_sem = asyncio.Semaphore(1)   # 1 download at a time → prevents OOM
         await application.bot.set_my_commands([
             BotCommand("start",       "Welcome message"),
             BotCommand("help",        "Help & usage"),

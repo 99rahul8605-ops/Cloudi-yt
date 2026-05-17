@@ -287,9 +287,32 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
     try:
         info = await extract_info(url)
     except (DownloadError, ExtractorError) as e:
-        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
+        err_lower = str(e).lower()
+        # Pinterest image pins / Instagram photo posts raise "No video formats found"
+        # because yt-dlp can't find a video stream. Re-probe without format filter
+        # to still get title + thumbnail so we can offer an image download.
+        if "no video formats" in err_lower or "no formats" in err_lower:
+            try:
+                info = await extract_info(url, extra_opts={"format": "best"})
+            except Exception:
+                info = None
+            if not info:
+                await msg.edit_text(
+                    "📷 *Image post detected.*\n\n"
+                    "Could not extract image data automatically.\n"
+                    "Please right-click → Save image, or open in browser.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+            # Force is_image_post=True below by clearing formats
+            info["formats"] = []
+            info.setdefault("duration", 0)
+        else:
+            await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+            return
     except Exception as e:
-        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
+        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+        return
 
     title    = info.get("title", "Unknown")
     duration = info.get("duration", 0)
@@ -567,8 +590,10 @@ async def do_audio(q, ctx, uid: int):
 async def do_image(q, ctx, uid: int):
     """
     Download and send image post(s).
-    Handles single images and multi-image carousels (Instagram albums, etc.)
-    Falls back to thumbnail URL if no direct image format is found.
+    For Pinterest pins and Instagram photo posts, the full-size image is
+    served via the thumbnail URL — we use that directly without calling
+    yt-dlp again (which would just raise 'No video formats found' again).
+    Also handles multi-image carousels via yt-dlp for platforms that support it.
     """
     info     = ctx.user_data.get("info", {})
     url      = ctx.user_data.get("url", "")
@@ -579,66 +604,73 @@ async def do_image(q, ctx, uid: int):
     s        = get_settings(uid)
 
     status = await q.message.edit_text(
-        f"⬇️ *Downloading image…*", parse_mode=ParseMode.MARKDOWN)
+        "⬇️ *Downloading image…*", parse_mode=ParseMode.MARKDOWN)
 
-    # ── Try to download via yt-dlp (handles carousels / direct image URLs)
-    loop = asyncio.get_event_loop()
-    from utils import build_progress_hook
-    hook = build_progress_hook(loop, status, "🖼 image")
+    # ── Step 1: Try thumbnail URL first (works for Pinterest, most IG photos)
+    # Pick the highest-resolution thumbnail available.
+    thumb_url = None
+    thumbnails = info.get("thumbnails") or []
+    if thumbnails:
+        best = sorted(thumbnails, key=lambda t: t.get("width") or 0, reverse=True)
+        thumb_url = best[0].get("url")
+    if not thumb_url:
+        thumb_url = info.get("thumbnail")
 
     downloaded_files: list[str] = []
-    try:
-        from yt_dlp import YoutubeDL
-        from platforms import ydl_opts_for
 
-        opts = ydl_opts_for(url)
-        opts.update({
-            "format":         "best",            # grab whatever is available
-            "outtmpl":        str(DOWNLOAD_DIR / f"{vid_id}_%(autonumber)s.%(ext)s"),
-            "progress_hooks": [hook],
-        })
-
-        def _download():
-            before = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
-            with YoutubeDL(opts) as ydl:
-                ydl.extract_info(url, download=True)
-            after = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
-            return [str(f) for f in (after - before)
-                    if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif")]
-
-        downloaded_files = await loop.run_in_executor(None, _download)
-    except Exception as e:
-        logger.warning("yt-dlp image download failed: %s — trying thumbnail fallback", e)
-
-    # ── Fallback: use thumbnail URL directly
-    if not downloaded_files:
-        thumb_url = info.get("thumbnail")
-        if not thumb_url and info.get("thumbnails"):
-            thumb_url = sorted(
-                info["thumbnails"], key=lambda t: t.get("width") or 0, reverse=True
-            )[0].get("url")
-
-        if not thumb_url:
-            await status.edit_text(
-                "❌ Could not find any image to download.\n"
-                "The post may be private or require login.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
-
+    if thumb_url:
         outpath = str(DOWNLOAD_DIR / f"{vid_id}_img.jpg")
         try:
             urllib.request.urlretrieve(thumb_url, outpath)
-            downloaded_files = [outpath]
+            if Path(outpath).stat().st_size > 2000:   # sanity: >2 KB means real image
+                downloaded_files = [outpath]
+                logger.info("Image downloaded via thumbnail URL: %s", outpath)
         except Exception as e:
-            await status.edit_text(
-                f"❌ Image download failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
-            return
+            logger.warning("Thumbnail URL fetch failed: %s", e)
 
-    # ── Send all downloaded images
+    # ── Step 2: If thumbnail fetch didn't work, try yt-dlp (handles carousels)
+    if not downloaded_files:
+        loop = asyncio.get_event_loop()
+        from utils import build_progress_hook
+        hook = build_progress_hook(loop, status, "🖼 image")
+        try:
+            from yt_dlp import YoutubeDL
+            from platforms import ydl_opts_for
+
+            opts = ydl_opts_for(url)
+            opts.update({
+                "format":         "best",
+                "outtmpl":        str(DOWNLOAD_DIR / f"{vid_id}_%(autonumber)s.%(ext)s"),
+                "progress_hooks": [hook],
+            })
+
+            def _download():
+                before = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
+                with YoutubeDL(opts) as ydl:
+                    ydl.extract_info(url, download=True)
+                after = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
+                return [
+                    str(f) for f in (after - before)
+                    if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif")
+                ]
+
+            downloaded_files = await loop.run_in_executor(None, _download)
+        except Exception as e:
+            logger.warning("yt-dlp image download also failed: %s", e)
+
+    if not downloaded_files:
+        await status.edit_text(
+            "❌ Could not download image.\n"
+            "The post may be private, removed, or require login.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # ── Send all images
     await status.edit_text(
-        f"📤 *Sending {len(downloaded_files)} image(s)…*", parse_mode=ParseMode.MARKDOWN)
-
+        f"📤 *Sending {len(downloaded_files)} image(s)…*",
+        parse_mode=ParseMode.MARKDOWN,
+    )
     caption = f"{emoji} *{title}*"
     sent = 0
     for fpath in sorted(downloaded_files):
@@ -652,14 +684,14 @@ async def do_image(q, ctx, uid: int):
             sent += 1
             register_for_cleanup(fpath, s["cleanup_minutes"])
         except Exception:
-            # If send_photo fails (e.g. webp), try send_document
+            # send_photo fails for webp/large — fall back to document
             try:
                 with open(fpath, "rb") as f:
                     await ctx.bot.send_document(
-                        chat_id   = q.message.chat_id,
-                        document  = f,
-                        filename  = Path(fpath).name,
-                        caption   = caption if sent == 0 else "",
+                        chat_id  = q.message.chat_id,
+                        document = f,
+                        filename = Path(fpath).name,
+                        caption  = caption if sent == 0 else "",
                     )
                 sent += 1
                 register_for_cleanup(fpath, s["cleanup_minutes"])
@@ -669,7 +701,8 @@ async def do_image(q, ctx, uid: int):
     if sent:
         await status.delete()
     else:
-        await status.edit_text("❌ Failed to send any images.", parse_mode=ParseMode.MARKDOWN)
+        await status.edit_text(
+            "❌ Failed to send image.", parse_mode=ParseMode.MARKDOWN)
 
 
 # ── Thumbnail ─────────────────────────────────────────────────────────────────

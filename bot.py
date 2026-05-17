@@ -1,6 +1,6 @@
 """
 Advanced Telegram YouTube Downloader Bot
-python-telegram-bot v21 | yt-dlp | FFmpeg | Render
+python-telegram-bot v21 | yt-dlp | FFmpeg | Pyrogram | Render
 
 YouTube bypass strategy (ordered by reliability):
   1. cookies.txt auto-detected + validated on startup
@@ -10,9 +10,28 @@ YouTube bypass strategy (ordered by reliability):
   5. Rotating User-Agents
   6. Extractor / fragment retries + pacing
   7. compat_opts workarounds
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  UPLOAD ENGINE — Pyrogram MTProto (no 50 MB limit → 2 GB)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Uploads use Pyrogram directly over MTProto, which bypasses the HTTP
+Bot API 50 MB restriction.  Only two env vars needed (no user session):
+
+  TELEGRAM_API_ID   — integer, from https://my.telegram.org/apps
+  TELEGRAM_API_HASH — string,  from https://my.telegram.org/apps
+
+requirements.txt additions:
+  pyrogram
+  tgcrypto        ← C extension for fast MTProto encryption (strongly recommended)
+
+Extra features vs plain Bot API:
+  • Live upload progress bar (updates every 3 s)
+  • ffprobe metadata injected → Telegram shows duration/dimensions correctly
+  • Silent-audio-track patch → Telegram never converts videos to GIFs
 """
 
 import os, asyncio, time, logging, re, threading, random, urllib.request, sys, platform, subprocess
+import json as _json
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -26,11 +45,15 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, ExtractorError
 import yt_dlp as _yt_dlp_module
 
-# ── Local Bot API Server (2 GB uploads on Render) ────────────────────────────
-# Run telegram-bot-api locally on Render as a separate service.
-# Set LOCAL_API_URL=http://<your-render-service>:8081 to enable 2 GB uploads.
-# If not set, falls back to official api.telegram.org (50 MB limit).
-LOCAL_API_URL = os.environ.get("LOCAL_API_URL", "").rstrip("/")
+# ── Pyrogram client (MTProto upload engine) ───────────────────────────────────
+# Bot-mode client: api_id + api_hash + bot_token only. No user session needed.
+from pyrogram import Client as PyroClient
+
+TELEGRAM_API_ID   = int(os.environ.get("TELEGRAM_API_ID",  "0"))
+TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
+
+# Module-level singleton started in post_init, stopped in post_shutdown.
+_pyro_bot: "PyroClient | None" = None
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -45,9 +68,6 @@ DOWNLOAD_DIR = Path("downloads")
 COOKIES_FILE = "cookies.txt"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 BOT_START_TIME = time.time()
-
-# 50 MB = official Bot API limit. Local server removes this cap entirely.
-LARGE_FILE_THRESHOLD = 50 * 1024 * 1024
 
 # ── Proxy (required for YouTube on Render to bypass bot-detection) ────────────
 # Set YTDL_PROXY=http://your-proxy:port in Render environment variables.
@@ -552,12 +572,15 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if cs["ok"] else cs["reason"]
     )
 
-    if LOCAL_API_URL:
-        upload_limit = f"2 GB (local server: {LOCAL_API_URL})"
+    if _pyro_bot and _pyro_bot.is_connected:
+        upload_limit = "2 GB ✅ (Pyrogram MTProto)"
         upload_icon  = "🚀"
-    else:
-        upload_limit = "50 MB (set LOCAL_API_URL for 2 GB)"
+    elif TELEGRAM_API_ID and TELEGRAM_API_HASH:
+        upload_limit = "⚠️ Creds set but Pyrogram not connected yet"
         upload_icon  = "⚠️"
+    else:
+        upload_limit = "❌ TELEGRAM_API_ID / TELEGRAM_API_HASH not set"
+        upload_icon  = "❌"
 
     msg = (
         "📊 *Bot Statistics*\n"
@@ -873,73 +896,211 @@ async def ffmpeg_merge(video_path: str, audio_path: str, out_path: str) -> None:
     await loop.run_in_executor(None, _run)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  PYROGRAM UPLOAD ENGINE
+#  Ported from the reference upload bot — pg_send logic adapted for this bot.
+# ═════════════════════════════════════════════════════════════════════════════
+
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v", ".3gp"}
+AUDIO_EXTS = {".mp3", ".m4a", ".ogg", ".flac", ".wav", ".aac", ".opus"}
+
+
+def human_size(b: int) -> str:
+    if b < 1024 ** 2: return f"{b / 1024:.1f} KB"
+    if b < 1024 ** 3: return f"{b / 1024 ** 2:.1f} MB"
+    return f"{b / 1024 ** 3:.2f} GB"
+
+
+def upload_bar(current: int, total: int) -> str:
+    """20-block progress bar with % and transferred/total."""
+    pct    = min(int(current * 100 / total), 100) if total else 0
+    filled = pct // 5
+    bar    = "█" * filled + "░" * (20 - filled)
+    return f"{bar} {pct}%\n📤 {human_size(current)} / {human_size(total)}"
+
+
+def get_video_meta(filepath: str) -> dict:
+    """Return width, height, duration (s), has_audio via ffprobe."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", filepath],
+            capture_output=True, text=True, timeout=15,
+        )
+        data    = _json.loads(result.stdout)
+        streams = data.get("streams", [])
+        vs      = next((s for s in streams if s.get("codec_type") == "video"), {})
+        has_aud = any(s.get("codec_type") == "audio" for s in streams)
+        dur_str = vs.get("duration") or "0"
+        return {
+            "width":     max(0, int(vs.get("width")  or 0)),
+            "height":    max(0, int(vs.get("height") or 0)),
+            "duration":  max(0, int(float(dur_str))),
+            "has_audio": has_aud,
+        }
+    except Exception:
+        return {"width": 0, "height": 0, "duration": 0, "has_audio": False}
+
+
+def ensure_audio_track(filepath: str) -> str:
+    """
+    If the video has no audio stream, add a silent AAC track via ffmpeg.
+    Telegram converts audio-less videos to GIFs regardless of file size —
+    this patch prevents that.
+    Returns path to the fixed file (new temp file), or original on failure.
+    """
+    try:
+        meta = get_video_meta(filepath)
+        if meta.get("has_audio", True):
+            return filepath                          # already has audio
+        p        = Path(filepath)
+        out_path = str(p.parent / (p.stem + "_audio" + p.suffix))
+        result   = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", filepath,
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-c:v", "copy", "-c:a", "aac", "-shortest",
+                "-movflags", "+faststart",
+                out_path,
+            ],
+            capture_output=True, timeout=120,
+        )
+        if result.returncode == 0 and Path(out_path).exists():
+            logger.info("[FFMPEG] Added silent audio track: %s", p.name)
+            try: p.unlink()
+            except Exception: pass
+            return out_path
+    except Exception as e:
+        logger.warning("[FFMPEG] ensure_audio_track failed: %s", e)
+    return filepath
+
+
+async def start_pyro_bot() -> None:
+    """Create and start the Pyrogram bot client (called from post_init)."""
+    global _pyro_bot
+    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
+        logger.error(
+            "❌  TELEGRAM_API_ID / TELEGRAM_API_HASH not set.\n"
+            "     Get them at https://my.telegram.org/apps and add to env vars."
+        )
+        raise RuntimeError("TELEGRAM_API_ID and TELEGRAM_API_HASH are required.")
+    _pyro_bot = PyroClient(
+        name      = "yt_dl_bot",
+        api_id    = TELEGRAM_API_ID,
+        api_hash  = TELEGRAM_API_HASH,
+        bot_token = BOT_TOKEN,
+        no_updates = True,   # pure upload client — PTB handles all updates
+    )
+    await _pyro_bot.start()
+    me = await _pyro_bot.get_me()
+    logger.info("✅ Pyrogram MTProto client ready — @%s (2 GB upload limit active)",
+                me.username or "?")
+
+
+async def stop_pyro_bot() -> None:
+    """Disconnect Pyrogram on shutdown (called from post_shutdown)."""
+    global _pyro_bot
+    if _pyro_bot and _pyro_bot.is_connected:
+        await _pyro_bot.stop()
+        logger.info("Pyrogram client stopped.")
+
+
 # ─── Unified upload helper ────────────────────────────────────────────────────
 async def send_file(
-    chat_id: int,
-    filepath: str,
-    filename: str,
-    caption: str,
+    chat_id:    int,
+    filepath:   str,
+    filename:   str,
+    caption:    str,
     status_msg,
-    is_video: bool = True,
+    is_video:   bool = True,
 ) -> None:
     """
-    Upload a file to Telegram.
+    Upload a merged video (or audio) file via Pyrogram MTProto.
 
-    • LOCAL_API_URL set → uses local Bot API server (up to 2 GB, HTTP only,
-      works perfectly on Render — no MTProto TCP needed).
-    • LOCAL_API_URL not set → official api.telegram.org (50 MB hard limit).
-
-    To enable 2 GB uploads on Render:
-      1. Deploy telegram-bot-api as a separate Render service (Docker image:
-         aiogram/telegram-bot-api or ghcr.io/tdlib/telegram-bot-api).
-      2. Set LOCAL_API_URL=http://<service-name>:8081 in this bot's env vars.
-      3. Also set TG_API_ID and TG_API_HASH (from https://my.telegram.org/apps)
-         in the telegram-bot-api service env vars.
+    Features (ported from reference upload bot):
+      • Live upload progress bar — updates every 3 s
+      • ffprobe injects width / height / duration → Telegram shows correctly
+      • ensure_audio_track() patches audio-less videos → never rendered as GIF
+      • Audio files routed through send_audio; anything else as send_document
+      • 2 GB limit (Pyrogram MTProto, no Bot API restriction)
     """
-    file_size = os.path.getsize(filepath)
-    size_mb   = file_size / (1024 * 1024)
-    via_local = bool(LOCAL_API_URL)
+    if _pyro_bot is None or not _pyro_bot.is_connected:
+        raise RuntimeError("Pyrogram client is not running.")
 
-    logger.info("Uploading %s (%.1f MB) via %s",
-                filename, size_mb, f"local API ({LOCAL_API_URL})" if via_local else "official Bot API")
+    filepath   = str(filepath)           # accept Path objects too
+    file_size  = os.path.getsize(filepath)
+    size_mb    = file_size / (1024 * 1024)
+    ext        = Path(filepath).suffix.lower()
 
-    if not via_local and file_size > LARGE_FILE_THRESHOLD:
-        raise RuntimeError(
-            f"File is {size_mb:.0f} MB which exceeds the 50 MB Bot API limit.\n\n"
-            "To upload files up to 2 GB on Render, set up a local Bot API server:\n"
-            "1. Deploy telegram-bot-api on Render (Docker: aiogram/telegram-bot-api)\n"
-            "2. Set LOCAL_API_URL=http://<service>:8081 in this bot's env vars\n"
-            "3. Set TG_API_ID + TG_API_HASH in the telegram-bot-api service"
-        )
+    logger.info("Uploading %s (%.1f MB) via Pyrogram MTProto", filename, size_mb)
+
+    # ── Progress callback ─────────────────────────────────────────────────────
+    _last_edit: list[float] = [0.0]
+
+    async def _progress(current: int, total: int) -> None:
+        now = time.time()
+        if now - _last_edit[0] < 3:
+            return
+        _last_edit[0] = now
+        try:
+            line = upload_bar(current, total)
+            await status_msg.edit_text(
+                f"📤 *{filename}*\n{line}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
 
     await status_msg.edit_text(
-        f"📤 *Uploading ({size_mb:.1f} MB)…*" +
-        (" via local server" if via_local else ""),
+        f"📤 *Uploading ({human_size(file_size)})…*",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    with open(filepath, "rb") as fh:
-        if is_video and filepath.endswith(".mp4"):
-            await status_msg._bot.send_video(
-                chat_id=chat_id,
-                video=fh,
-                caption=caption,
-                filename=filename,
-                supports_streaming=True,
-                read_timeout=300,
-                write_timeout=300,
-                connect_timeout=30,
-            )
-        else:
-            await status_msg._bot.send_document(
-                chat_id=chat_id,
-                document=fh,
-                filename=filename,
-                caption=caption,
-                read_timeout=300,
-                write_timeout=300,
-                connect_timeout=30,
-            )
+    # ── Video upload ──────────────────────────────────────────────────────────
+    if is_video and ext in VIDEO_EXTS:
+        loop = asyncio.get_event_loop()
+
+        # Patch: add silent audio track if the merged file has no audio stream
+        # (prevents Telegram converting the video to a GIF).
+        filepath = await loop.run_in_executor(None, ensure_audio_track, filepath)
+
+        meta = get_video_meta(filepath)
+        logger.info(
+            "Video meta — %dx%d  dur=%ds  has_audio=%s",
+            meta["width"], meta["height"], meta["duration"], meta["has_audio"],
+        )
+
+        await _pyro_bot.send_video(
+            chat_id            = chat_id,
+            video              = filepath,
+            caption            = caption,
+            file_name          = filename,
+            width              = meta["width"],
+            height             = meta["height"],
+            duration           = meta["duration"],
+            supports_streaming = True,
+            progress           = _progress,
+        )
+
+    # ── Audio upload ──────────────────────────────────────────────────────────
+    elif ext in AUDIO_EXTS:
+        await _pyro_bot.send_audio(
+            chat_id   = chat_id,
+            audio     = filepath,
+            caption   = caption,
+            file_name = filename,
+            progress  = _progress,
+        )
+
+    # ── Document fallback ─────────────────────────────────────────────────────
+    else:
+        await _pyro_bot.send_document(
+            chat_id   = chat_id,
+            document  = filepath,
+            caption   = caption,
+            file_name = filename,
+            progress  = _progress,
+        )
 
 
 # ─── Video ────────────────────────────────────────────────────────────────────
@@ -1304,20 +1465,15 @@ def main():
         logger.warning("⚠️ cookies.txt problem: %s", cs["reason"])
         logger.warning("   Bot will try client fallback chain (tv_embedded/android_music/ios)")
 
-    # ── Upload limit check ────────────────────────────────────────────────
-    if LOCAL_API_URL:
-        logger.info("✅ Local Bot API server: %s (limit: 2 GB per file)", LOCAL_API_URL)
-    else:
-        logger.warning("⚠️ LOCAL_API_URL not set — uploads capped at 50 MB (official Bot API)")
+    # ── Launch Pyrogram MTProto upload client ────────────────────────────
+    # Pyrogram is started inside post_init (event loop already running).
+    # If TELEGRAM_API_ID / TELEGRAM_API_HASH are missing, post_init raises
+    # and the bot exits with a clear error message.
+    logger.info("Pyrogram MTProto upload engine will start in post_init.")
 
     threading.Thread(target=start_health_server, daemon=True).start()
 
-    # Point python-telegram-bot at the local server when configured.
-    # The local server accepts the same HTTP API but with no file-size cap.
     builder = Application.builder().token(BOT_TOKEN)
-    if LOCAL_API_URL:
-        builder = builder.base_url(f"{LOCAL_API_URL}/bot")
-        builder = builder.base_file_url(f"{LOCAL_API_URL}/file/bot")
     app = builder.build()
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("help",        cmd_help))
@@ -1337,17 +1493,18 @@ def main():
             BotCommand("cookiecheck", "Diagnose cookie issues"),
             BotCommand("stats",       "Bot & dependency info"),
         ])
+        await start_pyro_bot()          # ← Pyrogram MTProto client (2 GB uploads)
         asyncio.create_task(cleanup_worker())
 
     async def post_shutdown(application: Application):
-        pass
+        await stop_pyro_bot()           # ← graceful disconnect
 
     app.post_init     = post_init
     app.post_shutdown = post_shutdown
     logger.info("Bot started — polling")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,   # discard stale updates from previous session
+        drop_pending_updates=True,
     )
 
 

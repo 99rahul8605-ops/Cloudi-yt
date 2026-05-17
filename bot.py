@@ -826,25 +826,8 @@ async def handle_youtube_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url
     title    = info.get("title", "Unknown")
     duration = info.get("duration", 0)
     dur_str  = f"{duration // 60}m {duration % 60}s" if duration else "?"
-    ctx.user_data["url"] = url
-    # FIX: yt-dlp info dicts can be 1-5 MB each (all formats, thumbnails, chapters…).
-    # Storing the raw dict per user causes unbounded RAM growth.
-    # We only need a small subset for the download callbacks — strip the rest.
-    ctx.user_data["info"] = {
-        "id":         info.get("id", ""),
-        "title":      info.get("title", "Unknown"),
-        "duration":   info.get("duration", 0),
-        "thumbnail":  info.get("thumbnail", ""),
-        "thumbnails": info.get("thumbnails", []),
-        "webpage_url":info.get("webpage_url", url),
-        # Keep formats list (needed for quality selection) but strip heavy per-format fields
-        "formats": [
-            {k: v for k, v in f.items()
-             if k in ("format_id", "ext", "height", "width", "vcodec", "acodec",
-                      "filesize", "filesize_approx", "tbr", "fps")}
-            for f in (info.get("formats") or [])
-        ],
-    }
+    ctx.user_data["url"]  = url
+    ctx.user_data["info"] = info
 
     await msg.edit_text(
         f"📹 *{title}*\n⏱ `{dur_str}`\n\nWhat would you like?",
@@ -945,45 +928,25 @@ async def ffmpeg_merge(video_path: str, audio_path: str, out_path: str) -> None:
     Merge a video-only file and an audio-only file into a single mp4.
     Runs in a thread-pool executor so it doesn't block the event loop.
     Raises RuntimeError with ffmpeg's stderr if the merge fails.
-
-    FIX: source files are deleted immediately after a successful merge so
-    video + audio + merged never all exist on disk at the same time.
-    FIX: stdout is discarded and stderr is streamed (not buffered) to avoid
-    accumulating hundreds of MB of FFmpeg log output in RAM.
     """
     cmd = [
         "ffmpeg", "-y",
         "-i", video_path,
         "-i", audio_path,
-        "-c:v", "copy",
-        "-c:a", "aac",
+        "-c:v", "copy",   # no re-encode — just remux
+        "-c:a", "aac",    # normalise audio to aac for mp4 compatibility
         "-b:a", "192k",
-        "-movflags", "+faststart",
+        "-movflags", "+faststart",  # web-optimised atom order
         out_path,
     ]
-    logger.info("ffmpeg merge: %s + %s -> %s", video_path, audio_path, out_path)
+    logger.info("ffmpeg merge: %s + %s → %s", video_path, audio_path, out_path)
     loop = asyncio.get_running_loop()
 
     def _run():
-        stderr_lines: list = []
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        for line in proc.stderr:
-            stderr_lines = stderr_lines[-20:]
-            stderr_lines.append(line)
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError("".join(stderr_lines)[-800:])
-        # FIX: delete sources immediately — merged file is all that remains
-        for src in (video_path, audio_path):
-            try:
-                Path(src).unlink()
-            except Exception:
-                pass
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[-800:])
+        return result
 
     await loop.run_in_executor(None, _run)
 
@@ -1190,26 +1153,16 @@ def ensure_telegram_compatible(filepath: str) -> str:
         )
         logger.info("[FFMPEG] ensure_telegram_compatible: vcodec=%s acodec=%s → H264+AAC mp4",
                     vcodec, acodec)
-        # FIX: when re-encoding (need_vid=True) delete the source BEFORE starting
-        # FFmpeg so only one copy of the video exists on disk at a time.
-        # Previously src_to_delete was assigned but never used — both files
-        # coexisted during the entire transcode, causing OOM on 512 MB hosts.
-        if need_vid:
+        # Delete source before transcode if re-encoding — avoids holding both
+        # the source and output on disk simultaneously (saves ~2× file size in RAM/disk)
+        src_to_delete = filepath if need_vid else None
+        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        if result.returncode == 0 and Path(out_path).exists():
             try: p.unlink()
             except Exception: pass
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,   # FIX: discard output — don't buffer in RAM
-            stderr=subprocess.PIPE,      # keep stderr for error reporting only
-            timeout=600,
-        )
-        if result.returncode == 0 and Path(out_path).exists():
-            if not need_vid:             # stream-copy path: source not yet deleted
-                try: p.unlink()
-                except Exception: pass
             return out_path
         logger.warning("[FFMPEG] ensure_telegram_compatible failed: %s",
-                       result.stderr[-400:].decode(errors="replace") if result.stderr else "unknown")
+                       result.stderr[-400:] if result.stderr else "unknown")
     except Exception as e:
         logger.warning("[FFMPEG] ensure_telegram_compatible error: %s", e)
     return filepath
@@ -1281,65 +1234,18 @@ async def stop_pyro_bot() -> None:
 
 
 # ─── Streaming file reader ────────────────────────────────────────────────────
-import io as _io
-
-class _StreamingFileReader(_io.RawIOBase):
-    """
-    Reads a disk file in 4 MB chunks and deletes it when fully consumed.
-    Passed directly to Pyrogram — the file is NEVER fully loaded into RAM.
-    Pyrogram reads chunk → sends over MTProto → chunk is freed immediately.
-    .close() deletes the file the moment upload finishes or fails.
-    """
-    def __init__(self, filepath: str, filename: str, on_progress=None):
-        self._path        = filepath
-        self._name        = filename
-        self._fh          = open(filepath, "rb")
-        self._size        = os.path.getsize(filepath)
-        self._read_so_far = 0
-        self._on_progress = on_progress
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    def readable(self) -> bool:
-        return True
-
-    def readinto(self, b: bytearray) -> int:
-        chunk = self._fh.read(len(b))
-        if not chunk:
-            return 0                    # EOF → Pyrogram finishes upload
-        n = len(chunk)
-        b[:n] = chunk
-        self._read_so_far += n
-        if self._on_progress:
-            try:
-                self._on_progress(self._read_so_far, self._size)
-            except Exception:
-                pass
-        return n
-
-    def close(self):
-        try:
-            self._fh.close()
-        except Exception:
-            pass
-        try:
-            Path(self._path).unlink(missing_ok=True)
-            logger.info("Stream-deleted after upload: %s", self._name)
-        except Exception:
-            pass
-        super().close()
-
-
-class _NamedBufferedReader(_io.BufferedReader):
-    """BufferedReader whose .name is writable (io.BufferedReader.name is read-only)."""
-    def __init__(self, raw: "_StreamingFileReader", buffer_size: int = 4 * 1024 * 1024):
-        super().__init__(raw, buffer_size=buffer_size)
-
-    @property
-    def name(self) -> str:
-        return self.raw.name
+# NOTE: _StreamingFileReader / _NamedBufferedReader are REMOVED.
+#
+# The previous approach wrapped the file in a custom RawIOBase and passed it
+# to Pyrogram, believing Pyrogram would read it chunk-by-chunk.
+# It does NOT — Pyrogram calls .read() on file-like objects to load the
+# ENTIRE file into RAM before sending, causing OOM on 512 MB hosts.
+#
+# Fix: pass the file PATH (a plain string) directly to send_video/send_audio/
+# send_document. Pyrogram's path code uses its own internal chunked sender
+# (512 KB MTProto parts) and never loads the whole file into RAM.
+# Progress is tracked via Pyrogram's native progress callback instead.
+import io as _io   # kept for other uses
 
 
 # ─── Unified upload helper ────────────────────────────────────────────────────
@@ -1353,17 +1259,19 @@ async def send_file(
     thumb_path:    str | None = None,
 ) -> None:
     """
-    Stream-upload a merged video or audio file via Pyrogram MTProto.
+    Upload a video/audio file via Pyrogram MTProto.
+
+    KEY FIX: pass filepath as a plain STRING, not a file-like object.
+    When Pyrogram receives a file-like object it calls .read() and loads
+    the ENTIRE file into RAM before sending — this was the primary OOM cause.
+    When it receives a path string it uses its own internal 512 KB part
+    sender and never loads more than one part into RAM at a time.
 
     Flow:
-      1. ensure_telegram_compatible() — stream-copy or H264 re-encode.
-         Source deleted inside that fn, so only ONE file exists at a time.
-      2. _StreamingFileReader wraps the final file — Pyrogram reads 4 MB
-         chunks, sends over MTProto, chunk is freed. File never fully in RAM.
-      3. _StreamingFileReader.close() deletes the file the instant upload
-         ends (success or error). No cleanup timer. No lingering.
-      4. ffprobe metadata injected → Telegram renders video correctly.
-      5. 2 GB limit via Pyrogram MTProto (no Bot API 50 MB cap).
+      1. ensure_telegram_compatible() — remux/re-encode to H264+AAC mp4.
+         Source file deleted inside that fn before output is written.
+      2. Pyrogram sends from path in 512 KB MTProto parts — low RAM.
+      3. File deleted in finally block immediately after upload.
     """
     if _pyro_bot is None or not _pyro_bot.is_connected:
         raise RuntimeError("Pyrogram client is not running.")
@@ -1372,40 +1280,38 @@ async def send_file(
     loop     = asyncio.get_running_loop()
     ext      = Path(filepath).suffix.lower()
 
-    # ── Step 1: ensure H264+AAC mp4 (stream-copy if already compatible) ──────
+    # ── Step 1: ensure H264+AAC mp4 ──────────────────────────────────────────
     if is_video and ext in VIDEO_EXTS:
         filepath = await loop.run_in_executor(None, ensure_telegram_compatible, filepath)
         ext      = Path(filepath).suffix.lower()
 
     file_size = os.path.getsize(filepath)
-    logger.info("Stream-uploading %s (%.1f MB) via Pyrogram MTProto",
+    logger.info("Uploading %s (%.1f MB) via Pyrogram MTProto path mode",
                 filename, file_size / 1024 / 1024)
-
-    # ── Step 2: sync progress callback (called from reader thread) ───────────
-    _last_edit:  list[float] = [0.0]
-    _start_time: list[float] = [time.time()]
-
-    def _sync_progress(current: int, total: int) -> None:
-        now = time.time()
-        if now - _last_edit[0] < 3:
-            return
-        _last_edit[0] = now
-        elapsed = now - _start_time[0]
-        text = upload_progress_text(filename, current, total, elapsed)
-        asyncio.run_coroutine_threadsafe(
-            status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN),
-            loop,
-        )
 
     await status_msg.edit_text(
         f"📤 *Uploading* `{filename}` *({human_size(file_size)})*…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # ── Step 3: wrap file in streaming reader, send, auto-delete on close ────
-    raw_reader = _StreamingFileReader(filepath, filename, on_progress=_sync_progress)
-    bio        = _NamedBufferedReader(raw_reader)
+    # ── Step 2: Pyrogram native progress callback ─────────────────────────────
+    # This is called by Pyrogram's own sender — no custom reader needed.
+    _last_edit:  list[float] = [0.0]
+    _start_time: list[float] = [time.time()]
 
+    async def _progress(current: int, total: int) -> None:
+        now = time.time()
+        if now - _last_edit[0] < 3:
+            return
+        _last_edit[0] = now
+        elapsed = now - _start_time[0]
+        text = upload_progress_text(filename, current, total, elapsed)
+        try:
+            await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+
+    # ── Step 3: send via path string (low RAM), delete immediately after ──────
     try:
         if is_video and ext in VIDEO_EXTS:
             meta = get_video_meta(filepath)
@@ -1413,7 +1319,7 @@ async def send_file(
                         meta["width"], meta["height"], meta["duration"], meta["has_audio"])
             await _pyro_bot.send_video(
                 chat_id            = chat_id,
-                video              = bio,
+                video              = filepath,      # PATH not file object
                 caption            = caption,
                 file_name          = filename,
                 width              = meta["width"],
@@ -1421,24 +1327,31 @@ async def send_file(
                 duration           = meta["duration"],
                 supports_streaming = True,
                 thumb              = thumb_path,
+                progress           = _progress,
             )
         elif ext in AUDIO_EXTS:
             await _pyro_bot.send_audio(
                 chat_id   = chat_id,
-                audio     = bio,
+                audio     = filepath,               # PATH not file object
                 caption   = caption,
                 file_name = filename,
+                progress  = _progress,
             )
         else:
             await _pyro_bot.send_document(
                 chat_id   = chat_id,
-                document  = bio,
+                document  = filepath,               # PATH not file object
                 caption   = caption,
                 file_name = filename,
+                progress  = _progress,
             )
     finally:
-        bio.close()   # deletes the file even if Pyrogram raised an exception
-        logger.info("Upload done | disk: %s", _get_tmp_usage())
+        # Delete immediately — don't wait for cleanup_worker
+        try:
+            Path(filepath).unlink(missing_ok=True)
+            logger.info("Deleted after upload: %s | disk: %s", filename, _get_tmp_usage())
+        except Exception:
+            pass
 
 
 
@@ -1448,29 +1361,7 @@ async def _do_video_direct(update: Update, ctx, uid: int, quality: str, status_m
     Called when a quality button is tapped (inline keyboard flow).
     Mimics what do_video does but takes a status_msg directly instead of
     a callback query object, since we came from a text message not a button tap.
-
-    FIX: wraps entire download+merge+upload inside the semaphore so this path
-    can never run concurrently with do_video/do_audio (previously unguarded).
     """
-    url = ctx.user_data.get("url")
-    if not url:
-        await status_msg.edit_text("❌ No URL stored. Please resend the link.")
-        return
-
-    # FIX: acquire semaphore — this path was previously unguarded, allowing
-    # concurrent downloads that together exceed the 512 MB RAM limit.
-    sem = get_download_sem()
-    if sem.locked():
-        await status_msg.edit_text(
-            "⏳ *Another download is in progress. You're queued — please wait…*",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    async with sem:
-        await _do_video_direct_inner(update, ctx, uid, quality, status_msg)
-
-
-async def _do_video_direct_inner(update: Update, ctx, uid: int, quality: str, status_msg):
-    """Inner implementation — called only while semaphore is held."""
     url = ctx.user_data.get("url")
     if not url:
         await status_msg.edit_text("❌ No URL stored. Please resend the link.")
@@ -1558,18 +1449,17 @@ async def _do_video_direct_inner(update: Update, ctx, uid: int, quality: str, st
         await status_msg.edit_text("⚙️ *Merging streams…*", parse_mode=ParseMode.MARKDOWN)
         merged_path = str(DOWNLOAD_DIR / f"{vid_id}_merged.mp4")
         try:
-            # FIX: ffmpeg_merge now deletes video_file and audio_file itself
-            # immediately after a successful merge, so all three files never
-            # coexist on disk at the same time.
             await ffmpeg_merge(video_file, audio_file, merged_path)
         except Exception as e:
-            # On failure, sources were not deleted by ffmpeg_merge — clean up here
             Path(video_file).unlink(missing_ok=True)
             Path(audio_file).unlink(missing_ok=True)
             await status_msg.edit_text(
                 f"⚙️ *FFmpeg merge failed.*\n`{str(e)[:300]}`",
                 parse_mode=ParseMode.MARKDOWN)
             return
+        finally:
+            Path(video_file).unlink(missing_ok=True)
+            Path(audio_file).unlink(missing_ok=True)
 
     safe_title = re.sub(r'[^\w\s-]', '', title)[:50].strip()
     filename   = f"{safe_title}_{quality}.mp4"

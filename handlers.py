@@ -294,8 +294,13 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
         if ("no video formats" in err_lower or "no formats" in err_lower
                 or "no video in this post" in err_lower
                 or "there is no video" in err_lower):
+            # Re-probe with skip_download so yt-dlp only fetches page metadata
+            # and thumbnail URL — it won't hit the "no video formats" check again.
             try:
-                info = await extract_info(url, extra_opts={"format": "best"})
+                info = await extract_info(url, extra_opts={
+                    "skip_download": True,
+                    "format":        None,
+                })
             except Exception:
                 info = None
             if not info:
@@ -306,7 +311,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
                     parse_mode=ParseMode.MARKDOWN,
                 )
                 return
-            # Force is_image_post=True below by clearing formats
+            # Force image-post path by clearing video formats
             info["formats"] = []
             info.setdefault("duration", 0)
         else:

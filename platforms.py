@@ -42,7 +42,8 @@ _PLATFORM_PATTERNS: list[tuple[str, re.Pattern]] = [
         re.IGNORECASE,
     )),
     ("pinterest",  re.compile(
-        r"(https?://)?(www\.|[a-z]{2}\.)?pinterest\.(com|ca|co\.uk|fr|de|es|it|jp|nz|ru|se|com\.au|com\.mx|com\.br)/.+",
+        r"(https?://)?(www\.|[a-z]{2}\.)?pinterest\.(com|ca|co\.uk|fr|de|es|it|jp|nz|ru|se|com\.au|com\.mx|com\.br)/.+"
+        r"|https?://(www\.)?pin\.it/.+",
         re.IGNORECASE,
     )),
     ("tiktok",     re.compile(

@@ -2,7 +2,6 @@ FROM python:3.13
 
 WORKDIR /app
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y \
     curl \
     ffmpeg \
@@ -10,28 +9,28 @@ RUN apt-get update && apt-get install -y \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Deno — required for yt-dlp PO token / BotGuard challenge solver.
-# Without Deno, YouTube blocks adaptive streams and returns only 360p (format 18).
+# Install Deno >= 2.0.0 (required by bgutil-ytdlp-pot-provider)
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
-
-# Make sure deno is on PATH for yt-dlp to find it
 ENV PATH="/usr/local/bin:$PATH"
 ENV DENO_INSTALL="/usr/local"
+RUN deno --version
 
-# Copy requirements and install Python dependencies
+# Install bgutil server (PO Token provider for YouTube SABR bypass)
+# This is the official yt-dlp recommended solution for 720p+ downloads
+RUN git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /bgutil && \
+    cd /bgutil/server && \
+    deno install --allow-scripts=npm:canvas --frozen && \
+    deno --version
+
+# Install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Always upgrade yt-dlp to the absolute latest at build time.
-# YouTube extractor patches ship WEEKLY — stale yt-dlp = bot detection fails.
-RUN pip install --no-cache-dir --upgrade yt-dlp
+# Install yt-dlp latest + bgutil plugin
+RUN pip install --no-cache-dir --upgrade yt-dlp bgutil-ytdlp-pot-provider
 
-# Verify deno is accessible
-RUN deno --version
-
-# Copy application code
+# Copy app
 COPY . .
-
 RUN mkdir -p /app/downloads
 
 EXPOSE 8080
@@ -39,4 +38,5 @@ EXPOSE 8080
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-CMD ["python3", "bot.py"]
+# Start bgutil HTTP server (port 4416) in background, then run bot
+CMD deno run --allow-all /bgutil/server/main.ts & sleep 3 && python3 bot.py

@@ -208,8 +208,11 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
         # 1080p (which it commonly does). Let yt-dlp pick the best available
         # streams; ensure_telegram_compatible() converts to H264+AAC for
         # Telegram before upload.
-        "format": "bestvideo+bestaudio/best",
-        "format_sort": ["res", "br", "vcodec:vp9", "acodec:opus"],
+        # Prefer H264+AAC natively — avoids FFmpeg re-encode entirely.
+        # vcodec:h264 sorts h264 highest; falls back to vp9/av1 only if h264
+        # is unavailable at the requested resolution.
+        "format": "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best",
+        "format_sort": ["res", "br", "vcodec:h264", "acodec:aac"],
         "merge_output_format": "mp4",
 
         # Retries
@@ -1126,7 +1129,7 @@ def ensure_telegram_compatible(filepath: str) -> str:
                  "-c", "copy",
                  "-movflags", "+faststart",
                  out_path],
-                capture_output=True, timeout=300,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300,
             )
             if result.returncode == 0 and Path(out_path).exists():
                 logger.info("[FFMPEG] faststart copy: %s", p.name)
@@ -1137,32 +1140,38 @@ def ensure_telegram_compatible(filepath: str) -> str:
 
         # Need transcode/remux
         out_path   = str(p.parent / (p.stem + "_tg.mp4"))
-        v_args     = ["-c:v", "libx264", "-crf", "18", "-preset", "fast",
+        # ultrafast: minimal RAM — crf 23 is visually fine for delivery
+        v_args     = ["-c:v", "libx264", "-crf", "23", "-preset", "ultrafast",
                       "-pix_fmt", "yuv420p"] if need_vid else ["-c:v", "copy"]
-        a_args     = ["-c:a", "aac", "-b:a", "192k"] if need_aud else ["-c:a", "copy"]
-        # Add silent audio if no audio stream at all
+        a_args     = ["-c:a", "aac", "-b:a", "128k"] if need_aud else ["-c:a", "copy"]
         input_args = ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"] if not as_ else []
         extra_map  = ["-map", "0:v:0", "-map", "1:a:0", "-shortest"] if not as_ else []
+
+        # Delete source BEFORE transcode so both files never coexist on disk
+        if need_vid:
+            try: p.unlink()
+            except Exception: pass
 
         cmd = (
             ["ffmpeg", "-y", "-i", filepath]
             + input_args
             + v_args + a_args
             + extra_map
-            + ["-movflags", "+faststart", out_path]
+            + ["-movflags", "+faststart",
+               "-threads", "1",
+               out_path]
         )
-        logger.info("[FFMPEG] ensure_telegram_compatible: vcodec=%s acodec=%s → H264+AAC mp4",
+        logger.info("[FFMPEG] transcode: vcodec=%s acodec=%s → H264+AAC ultrafast",
                     vcodec, acodec)
-        # Delete source before transcode if re-encoding — avoids holding both
-        # the source and output on disk simultaneously (saves ~2× file size in RAM/disk)
-        src_to_delete = filepath if need_vid else None
-        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        # stderr→DEVNULL: never buffer ffmpeg output in RAM
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=600)
         if result.returncode == 0 and Path(out_path).exists():
-            try: p.unlink()
-            except Exception: pass
+            if not need_vid:
+                try: p.unlink()
+                except Exception: pass
             return out_path
-        logger.warning("[FFMPEG] ensure_telegram_compatible failed: %s",
-                       result.stderr[-400:] if result.stderr else "unknown")
+        logger.warning("[FFMPEG] ensure_telegram_compatible transcode failed")
     except Exception as e:
         logger.warning("[FFMPEG] ensure_telegram_compatible error: %s", e)
     return filepath

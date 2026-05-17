@@ -387,7 +387,7 @@ async def extract_info(url: str, download: bool = False,
     opts = ydl_opts_base()
     if extra_opts:
         opts.update(extra_opts)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     def _run():
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=download)
@@ -405,19 +405,109 @@ async def do_download(url: str, extra_opts: dict, progress_cb) -> dict:
     opts = ydl_opts_base()
     opts.update(extra_opts)
     opts["progress_hooks"] = [progress_cb]
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     def _run():
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            # Log a compact format summary to help diagnose selector mismatches
             fmts = info.get("formats", []) if info else []
             if fmts:
                 summary = [(f.get("format_id"), f.get("ext"), f.get("height"),
                             f.get("vcodec","?")[:6], f.get("acodec","?")[:6])
-                           for f in fmts[-10:]]  # last 10 (highest quality)
+                           for f in fmts[-10:]]
                 logger.info("Available formats (last 10): %s", summary)
             return info
     return await loop.run_in_executor(None, _run)
+
+
+async def do_download_subprocess(
+    url: str,
+    fmt: str,
+    out_path: str,
+    status_msg,
+    loop,
+    label: str = "",
+    extra_args: list | None = None,
+) -> str:
+    """
+    Run yt-dlp as a subprocess (like bot__4_.py) so its RAM lives in a
+    separate OS process — completely outside the bot's 512 MB heap.
+
+    Returns the path of the downloaded file.
+    Parses yt-dlp's --progress output to show live progress in Telegram.
+    """
+    opts     = ydl_opts_base()
+    cmd      = ["yt-dlp", "--no-playlist", "-f", fmt,
+                "--merge-output-format", "mp4",
+                "--output", out_path,
+                "--newline",          # one progress line per chunk — parseable
+                "--progress",
+                "--no-warnings",
+    ]
+
+    # Pass cookies if available
+    if opts.get("cookiefile") and Path(opts["cookiefile"]).exists():
+        cmd += ["--cookies", opts["cookiefile"]]
+
+    # Pass proxy if set
+    if opts.get("proxy"):
+        cmd += ["--proxy", opts["proxy"]]
+
+    # Pass extractor args (client chain)
+    cmd += [
+        "--extractor-args",
+        "youtube:player_client=android_vr,tv,tv_downgraded,web",
+    ]
+
+    if extra_args:
+        cmd += extra_args
+
+    cmd.append(url)
+
+    logger.info("yt-dlp subprocess: %s", " ".join(cmd))
+
+    _last_edit = [0.0]
+    _proc: list[subprocess.Popen | None] = [None]
+
+    def _parse_and_run():
+        _proc[0] = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        last_pct = last_speed = last_eta = last_down = last_total = ""
+        for line in _proc[0].stdout:
+            line = line.strip()
+            # yt-dlp --newline --progress lines look like:
+            # [download]  23.4% of  145.23MiB at  3.50MiB/s ETA 00:35
+            if "[download]" in line and "%" in line:
+                m = re.search(
+                    r"([\d.]+)%\s+of\s+([\S]+)\s+at\s+([\S]+)\s+ETA\s+(\S+)", line
+                )
+                if m:
+                    last_pct, last_total, last_speed, last_eta = (
+                        m.group(1) + "%", m.group(2), m.group(3), m.group(4)
+                    )
+                    now = time.time()
+                    if now - _last_edit[0] >= 3:
+                        _last_edit[0] = now
+                        text = download_progress_text(
+                            label or "video", last_pct, last_speed,
+                            last_eta, last_down or "?", last_total,
+                        )
+                        asyncio.run_coroutine_threadsafe(
+                            status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN),
+                            loop,
+                        )
+        _proc[0].wait()
+        return _proc[0].returncode
+
+    loop2 = asyncio.get_running_loop()
+    rc    = await loop2.run_in_executor(None, _parse_and_run)
+
+    if rc != 0:
+        raise RuntimeError(f"yt-dlp exited with code {rc} for {url}")
 
 
 def build_progress_hook(loop, status_msg, _cid, _bot, label: str = ""):
@@ -850,7 +940,7 @@ async def ffmpeg_merge(video_path: str, audio_path: str, out_path: str) -> None:
         out_path,
     ]
     logger.info("ffmpeg merge: %s + %s → %s", video_path, audio_path, out_path)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _run():
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -1169,7 +1259,7 @@ async def send_file(
         raise RuntimeError("Pyrogram client is not running.")
 
     filepath  = str(filepath)           # accept Path objects
-    loop      = asyncio.get_event_loop()
+    loop      = asyncio.get_running_loop()
     ext       = Path(filepath).suffix.lower()
 
     # ── Step 1: make Telegram-compatible (stream-copy or re-encode) ───────────
@@ -1276,7 +1366,7 @@ async def _do_video_direct(update: Update, ctx, uid: int, quality: str, status_m
     logger.info("Downloading %s | quality=%s | video_id=%s audio_id=%s",
                 vid_id, quality, video_fmt_id, audio_fmt_id)
 
-    loop      = asyncio.get_event_loop()
+    loop      = asyncio.get_running_loop()
     base_opts = ydl_opts_base()
 
     await status_msg.edit_text(
@@ -1416,73 +1506,40 @@ async def do_video(q, ctx, uid: int, quality: str):
 
         logger.info("Downloading %s | quality=%s | format=%s", vid_id, quality, fmt)
 
-        loop      = asyncio.get_event_loop()
-        base_opts = ydl_opts_base()
+        loop      = asyncio.get_running_loop()
         out_path  = str(DOWNLOAD_DIR / f"{vid_id}_{quality}.%(ext)s")
 
-        # ── Step 2: download + auto-merge via yt-dlp+ffmpeg ──────────────────
+        # ── Step 2: download via yt-dlp subprocess (separate OS process = no RAM hit) ──
         status = await q.message.edit_text(
             f"⬇️ *Downloading ({quality})…*",
             parse_mode=ParseMode.MARKDOWN,
         )
 
-        def _download() -> str:
-            """Single yt-dlp call: downloads bestvideo+bestaudio and merges to mp4."""
-            last = [0.0]
-            def hook(d):
-                if d["status"] != "downloading": return
-                now = time.time()
-                if now - last[0] < 3: return
-                last[0] = now
-                pct   = d.get("_percent_str",  "0%").strip()
-                speed = d.get("_speed_str",    "?").strip()
-                eta   = d.get("_eta_str",      "?").strip()
-                down  = d.get("_downloaded_bytes_str", "?").strip()
-                total = d.get("_total_bytes_str") or d.get("_total_bytes_estimate_str") or "?"
-                total = total.strip() if isinstance(total, str) else "?"
-                text  = download_progress_text(f"*{quality}*", pct, speed, eta, down, total)
-                asyncio.run_coroutine_threadsafe(
-                    status.edit_text(text, parse_mode=ParseMode.MARKDOWN), loop)
-
-            opts = {
-                **base_opts,
-                "format":              fmt,
-                "format_sort":         ["res", "br", "vcodec:vp9", "acodec:opus"],
-                "merge_output_format": "mp4",
-                "outtmpl":             out_path,
-                "progress_hooks":      [hook],
-                # Surface real error messages so failures are diagnosable
-                "quiet":               False,
-                "no_warnings":         False,
-                # Log the selected format so quality issues are visible in logs
-                "verbose":             False,
-            }
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                # Log exactly which format was selected
-                if info:
-                    sel_fmt = info.get("format", "?")
-                    sel_h   = info.get("height", "?")
-                    sel_vc  = info.get("vcodec", "?")
-                    logger.info("Selected format: %s | height=%s | vcodec=%s", sel_fmt, sel_h, sel_vc)
-
-            # Find the merged mp4 yt-dlp wrote
-            found = sorted(DOWNLOAD_DIR.glob(f"{vid_id}_{quality}.*"))
-            if not found:
-                raise FileNotFoundError(f"No output file found for {vid_id}")
-            return str(found[-1])
-
         try:
-            merged_path = await loop.run_in_executor(None, _download)
-            logger.info("Downloaded+merged: %s", merged_path)
+            await do_download_subprocess(
+                url        = url,
+                fmt        = fmt,
+                out_path   = out_path,
+                status_msg = status,
+                loop       = loop,
+                label      = f"*{quality}*",
+            )
+            logger.info("yt-dlp subprocess finished")
         except Exception as e:
             raw = str(e)[:500]
             logger.error("Download failed: %s", raw)
             user_msg = friendly_error(e)
-            # Always append raw error so user can see what actually happened
             user_msg += f"\n\n`{raw}`"
             await status.edit_text(user_msg, parse_mode=ParseMode.MARKDOWN)
             return
+
+        # Find the file yt-dlp wrote
+        found = sorted(DOWNLOAD_DIR.glob(f"{vid_id}_{quality}.*"))
+        if not found:
+            await status.edit_text("❌ No output file found after download.")
+            return
+        merged_path = str(found[-1])
+        logger.info("Downloaded: %s", merged_path)
 
         # ── Step 3: upload ────────────────────────────────────────────────────
         # Download best-resolution thumbnail from YouTube for the video player
@@ -1525,35 +1582,45 @@ async def do_audio(q, ctx, uid: int):
 
     async with sem:
         status = await q.message.edit_text("⬇️ *Extracting audio…*", parse_mode=ParseMode.MARKDOWN)
-        loop = asyncio.get_event_loop()
-        hook = build_progress_hook(loop, status, q.message.chat_id, ctx.bot)
+        loop = asyncio.get_running_loop()
+        out_path = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
         try:
-            info = await do_download(url, {
-                # bestaudio/best covers both split-stream and pre-muxed sources.
-                # format_sort in ydl_opts_base already prefers m4a; this handles
-                # webm/opus streams served by tv / android_vr clients.
-                "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-                "postprocessors": [{"key": "FFmpegExtractAudio",
-                                    "preferredcodec": "mp3",
-                                    "preferredquality": "192"}],
-            }, hook)
-        except (DownloadError, ExtractorError) as e:
-            await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
+            await do_download_subprocess(
+                url        = url,
+                fmt        = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
+                out_path   = out_path,
+                status_msg = status,
+                loop       = loop,
+                label      = "audio",
+                extra_args = [
+                    "--extract-audio",
+                    "--audio-format", "mp3",
+                    "--audio-quality", "192K",
+                ],
+            )
         except Exception as e:
             await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
 
-        vid_id = info.get("id", "")
-        files  = list(DOWNLOAD_DIR.glob(f"{vid_id}.mp3")) or list(DOWNLOAD_DIR.glob(f"{vid_id}.*"))
+        # Find the mp3 yt-dlp wrote (subprocess doesn't return info dict)
+        files = sorted(DOWNLOAD_DIR.glob("*.mp3"), key=lambda f: f.stat().st_mtime, reverse=True)
+        if not files:
+            # fallback: any audio file
+            files = sorted(
+                [f for f in DOWNLOAD_DIR.iterdir()
+                 if f.suffix.lower() in AUDIO_EXTS],
+                key=lambda f: f.stat().st_mtime, reverse=True,
+            )
         if not files:
             await status.edit_text("❌ Audio file not found."); return
         filepath = str(files[0])
+        title    = files[0].stem  # use filename as title fallback
         await status.edit_text("📤 *Uploading MP3…*", parse_mode=ParseMode.MARKDOWN)
         try:
             await send_file(
                 chat_id    = q.message.chat_id,
                 filepath   = filepath,
-                filename   = f"{info.get('title', 'audio')}.mp3",
-                caption    = f"🎵 {info.get('title', '')}",
+                filename   = f"{title}.mp3",
+                caption    = f"🎵 {title}",
                 status_msg = status,
                 is_video   = False,
             )

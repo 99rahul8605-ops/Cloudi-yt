@@ -3,10 +3,9 @@ Advanced Telegram YouTube Downloader Bot
 Memory-optimised for Render (512 MB) – handles 2 GB uploads without OOM.
 
 Features:
-- yt-dlp with PO token (bgutil-ytdlp-pot-provider) + cookie fallback
+- yt-dlp with android_vr/tv/tv_downgraded/web client chain (no PO token needed)
 - Pyrogram MTProto uploads (2 GB limit)
-- Watermark (optional, only for files ≤200 MB)
-- Streaming upload (chunked, never loads full file into RAM)
+- Direct file upload (Pyrogram streams internally, no custom reader needed)
 - Silent audio track patch (no video re-encode)
 - Large files >500 MB sent as documents (no ffmpeg processing)
 """
@@ -15,7 +14,6 @@ import os, asyncio, time, logging, re, threading, urllib.request, sys, platform,
 import json as _json
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import io as _io
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
@@ -50,7 +48,7 @@ logger = logging.getLogger(__name__)
 _pyro_bot: "PyroClient | None" = None
 
 # ---------- User settings ----------
-DEFAULT_SETTINGS = {"quality": "720p", "mode": "manual", "cleanup_minutes": 10, "watermark": ""}
+DEFAULT_SETTINGS = {"quality": "720p", "mode": "manual", "cleanup_minutes": 10}
 user_settings: dict[int, dict] = {}
 cleanup_registry: dict[str, float] = {}
 
@@ -91,20 +89,15 @@ def cookie_status() -> dict:
         return {"ok": False, "reason": "No youtube.com cookies"}
     return {"ok": True, "yt_lines": len(yt), "has_sapisid": any("SAPISID" in l for l in yt)}
 
-# ========== YT-DLP OPTIONS ==========
+# ========== YT-DLP OPTIONS (no PO token required) ==========
 def ydl_opts_base(use_cookies: bool = True) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
-        "format": (
-            "bestvideo[height<=1080][vcodec^=avc]+bestaudio[ext=m4a]"
-            "/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
-            "/bestvideo[height<=1080]+bestaudio"
-            "/best[height<=1080]"
-            "/best"
-        ),
+        "format": "bestvideo+bestaudio/best",
+        "format_sort": ["res", "br"],
         "merge_output_format": "mp4",
         "retries": 10,
         "fragment_retries": 10,
@@ -112,7 +105,9 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
         "file_access_retries": 5,
         "socket_timeout": 30,
         "extractor_args": {
-            "youtube": {"player_client": ["default"]}
+            "youtube": {
+                "player_client": ["android_vr", "tv", "tv_downgraded", "web"],
+            }
         },
     }
     if YTDL_PROXY:
@@ -153,6 +148,39 @@ def human_size(b: int) -> str:
     if b < 1024**2: return f"{b/1024:.1f} KB"
     if b < 1024**3: return f"{b/1024**2:.1f} MB"
     return f"{b/1024**3:.2f} GB"
+
+def _progress_bar(pct: int, width=16) -> str:
+    filled = round(pct * width / 100)
+    return "█" * filled + "░" * (width - filled)
+
+def _speed_str(bps: float) -> str:
+    if bps <= 0: return "?"
+    if bps >= 1024**3: return f"{bps/1024**3:.1f} GB/s"
+    if bps >= 1024**2: return f"{bps/1024**2:.1f} MB/s"
+    return f"{bps/1024:.0f} KB/s"
+
+def _eta_str(seconds: float) -> str:
+    if seconds < 0: return "?"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h:   return f"{h}h {m}m"
+    if m:   return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+def upload_progress_text(filename: str, current: int, total: int, elapsed: float) -> str:
+    pct = min(int(current * 100 / total), 100) if total else 0
+    bar = _progress_bar(pct)
+    done = human_size(current)
+    tot = human_size(total)
+    spd = _speed_str(current / elapsed if elapsed > 0 else 0)
+    eta_sec = ((total - current) / (current / elapsed)) if current > 0 and elapsed > 0 else -1
+    eta = _eta_str(eta_sec)
+    return f"📤 *Uploading* `{filename}`\n`{bar}` {pct}%\n📦 `{done}` / `{tot}`\n⚡ `{spd}`  ⏱ `{eta}`"
+
+def download_progress_text(label: str, pct: int, speed: str, eta: str, downloaded: str, total: str) -> str:
+    bar = _progress_bar(pct)
+    tot = f" / `{total}`" if total and total != "?" else ""
+    return f"⬇️ *Downloading* {label}\n`{bar}` {pct}%\n📦 `{downloaded}`{tot}\n⚡ `{speed}`  ⏱ `{eta}`"
 
 # ========== FFMPEG HELPERS (memory-safe) ==========
 def get_video_meta(filepath: str) -> dict:
@@ -218,82 +246,7 @@ def ensure_telegram_compatible(filepath: str) -> str:
 
     return filepath
 
-def add_watermark(filepath: str, watermark_text: str) -> str:
-    """Add watermark via ffmpeg drawtext – only for files ≤200 MB to avoid OOM."""
-    if not watermark_text:
-        return filepath
-    file_size = os.path.getsize(filepath)
-    if file_size > 200 * 1024 * 1024:
-        logger.warning("File >200 MB – skipping watermark to save memory")
-        return filepath
-
-    p = Path(filepath)
-    out_path = str(p.parent / (p.stem + "_wm.mp4"))
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    if not Path(font_path).exists():
-        font_path = "Arial"
-    cmd = [
-        "ffmpeg", "-y", "-threads", "1",
-        "-i", filepath,
-        "-vf", f"drawtext=fontfile='{font_path}':text='{watermark_text}':fontcolor=white@0.4:fontsize=h/12:x=(w-text_w)/2:y=(h-text_h)/2",
-        "-c:a", "copy",
-        "-preset", "ultrafast", "-crf", "23",
-        out_path
-    ]
-    result = subprocess.run(cmd, capture_output=True, timeout=300)
-    if result.returncode == 0 and Path(out_path).exists():
-        try: p.unlink()
-        except: pass
-        return out_path
-    else:
-        logger.warning("Watermark failed: %s", result.stderr[:200])
-        return filepath
-
-# ========== STREAMING UPLOAD (no RAM spike) ==========
-class _StreamingFileReader(_io.RawIOBase):
-    def __init__(self, filepath: str, filename: str, on_progress=None):
-        self._path = filepath
-        self._name = filename
-        self._fh = open(filepath, "rb")
-        self._size = os.path.getsize(filepath)
-        self._read = 0
-        self._progress = on_progress
-
-    @property
-    def name(self): return self._name
-    def readable(self): return True
-
-    def readinto(self, b: bytearray) -> int:
-        chunk = self._fh.read(len(b))
-        if not chunk:
-            return 0
-        n = len(chunk)
-        b[:n] = chunk
-        self._read += n
-        if self._progress:
-            try:
-                self._progress(self._read, self._size)
-            except Exception:
-                pass
-        return n
-
-    def close(self):
-        try: self._fh.close()
-        except: pass
-        try: Path(self._path).unlink(missing_ok=True)
-        except: pass
-        super().close()
-
-class _NamedBufferedReader(_io.BufferedReader):
-    def __init__(self, raw, buffer_size=4*1024*1024):
-        super().__init__(raw, buffer_size=buffer_size)
-    @property
-    def name(self): return self.raw.name
-
-def progress_bar(pct: int, width=16) -> str:
-    filled = round(pct * width / 100)
-    return "█" * filled + "░" * (width - filled)
-
+# ========== UPLOAD (direct file path – Pyrogram streams internally) ==========
 async def send_file(
     chat_id: int,
     filepath: str,
@@ -327,43 +280,36 @@ async def send_file(
     _last_edit = [0.0]
     _start = [time.time()]
 
-    def progress_cb(cur: int, total: int):
+    async def progress_cb(current: int, total: int):
         now = time.time()
         if now - _last_edit[0] >= 3:
             _last_edit[0] = now
-            pct = min(int(cur * 100 / total), 100) if total else 0
-            speed = (cur / (now - _start[0])) if (now - _start[0]) > 0 else 0
-            eta = ((total - cur) / speed) if speed > 0 else -1
-            eta_str = f"{int(eta//60)}m {int(eta%60)}s" if eta > 0 else "?"
-            text = (
-                f"📤 *Uploading* `{filename}`\n"
-                f"`{progress_bar(pct)}` {pct}%\n"
-                f"📦 `{human_size(cur)}` / `{human_size(total)}`\n"
-                f"⚡ `{human_size(speed)}/s`  ⏱ `{eta_str}`"
-            )
-            asyncio.run_coroutine_threadsafe(
-                status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN), loop
-            )
+            elapsed = now - _start[0]
+            text = upload_progress_text(filename, current, total, elapsed)
+            await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
 
     await status_msg.edit_text(f"📤 *Preparing upload* `{filename}` ({human_size(file_size)})…", parse_mode=ParseMode.MARKDOWN)
 
-    raw = _StreamingFileReader(filepath, filename, on_progress=progress_cb)
-    bio = _NamedBufferedReader(raw)
-
     try:
         if send_as_doc:
-            await _pyro_bot.send_document(chat_id, bio, caption=caption, file_name=filename)
+            await _pyro_bot.send_document(chat_id, filepath, caption=caption, file_name=filename, progress=progress_cb)
         elif ext in AUDIO_EXTS:
-            await _pyro_bot.send_audio(chat_id, bio, caption=caption, file_name=filename)
+            await _pyro_bot.send_audio(chat_id, filepath, caption=caption, file_name=filename, progress=progress_cb)
         else:
             meta = get_video_meta(filepath)
             await _pyro_bot.send_video(
-                chat_id=chat_id, video=bio, caption=caption, file_name=filename,
+                chat_id=chat_id, video=filepath, caption=caption, file_name=filename,
                 width=meta["width"], height=meta["height"], duration=meta["duration"],
-                supports_streaming=True, thumb=thumb_path,
+                supports_streaming=True, thumb=thumb_path, progress=progress_cb,
             )
     finally:
-        bio.close()
+        # Delete file after upload
+        try:
+            Path(filepath).unlink(missing_ok=True)
+        except:
+            pass
+        if thumb_path:
+            Path(thumb_path).unlink(missing_ok=True)
         gc.collect()
         logger.info("Upload finished, file deleted: %s", filename)
 
@@ -376,7 +322,7 @@ async def do_download_subprocess(
     loop,
     label: str = "",
     extra_args: list | None = None,
-) -> str:
+) -> None:
     opts = ydl_opts_base()
     cmd = ["yt-dlp", "--no-playlist", "-f", fmt,
            "--merge-output-format", "mp4",
@@ -386,7 +332,7 @@ async def do_download_subprocess(
         cmd += ["--cookies", opts["cookiefile"]]
     if opts.get("proxy"):
         cmd += ["--proxy", opts["proxy"]]
-    cmd += ["--extractor-args", "youtube:player_client=default"]
+    cmd += ["--extractor-args", "youtube:player_client=android_vr,tv,tv_downgraded,web"]
     if extra_args:
         cmd += extra_args
     cmd.append(url)
@@ -402,11 +348,15 @@ async def do_download_subprocess(
             if "[download]" in line and "%" in line:
                 m = re.search(r"([\d.]+)%\s+of\s+([\S]+)\s+at\s+([\S]+)\s+ETA\s+(\S+)", line)
                 if m:
-                    pct, total, speed, eta = m.group(1)+"%", m.group(2), m.group(3), m.group(4)
+                    pct_str, total, speed, eta = m.group(1), m.group(2), m.group(3), m.group(4)
+                    try:
+                        pct = int(float(pct_str))
+                    except:
+                        pct = 0
                     now = time.time()
                     if now - _last_edit[0] >= 3:
                         _last_edit[0] = now
-                        text = f"⬇️ *Downloading* {label}\n`{pct}` of `{total}` at `{speed}` ETA `{eta}`"
+                        text = download_progress_text(label, pct, speed, eta, "?", total)
                         asyncio.run_coroutine_threadsafe(
                             status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN), loop
                         )
@@ -416,12 +366,6 @@ async def do_download_subprocess(
     rc = await asyncio.get_running_loop().run_in_executor(None, _parse_and_run)
     if rc != 0:
         raise RuntimeError(f"yt-dlp exited with code {rc}")
-
-    pattern = Path(out_path).stem + ".*"
-    candidates = sorted(DOWNLOAD_DIR.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not candidates:
-        raise FileNotFoundError(f"No output file for pattern {pattern}")
-    return str(candidates[0])
 
 # ========== BACKGROUND CLEANUP ==========
 async def cleanup_worker():
@@ -486,66 +430,68 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ========== SETTINGS ==========
 def settings_keyboard(uid: int) -> InlineKeyboardMarkup:
     s = get_settings(uid)
-    wm = s.get("watermark", "")
-    wm_display = "None" if not wm else wm[:15] + ("..." if len(wm) > 15 else "")
+    mode_lbl = "Fixed ✅" if s["mode"] == "fixed" else "Manual 🎛"
+    timer_lbl = "♾ Never" if s["cleanup_minutes"] == 0 else f"{s['cleanup_minutes']} min"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Quality: {s['quality']}", callback_data="s:quality")],
-        [InlineKeyboardButton(f"Mode: {'Fixed' if s['mode']=='fixed' else 'Manual'}", callback_data="s:mode")],
-        [InlineKeyboardButton(f"Watermark: {wm_display}", callback_data="s:watermark")],
+        [InlineKeyboardButton(f"🎬 Default Quality: {s['quality'].upper()}", callback_data="s:quality")],
+        [InlineKeyboardButton(f"🔁 Download Mode: {mode_lbl}", callback_data="s:mode")],
+        [InlineKeyboardButton(f"🧹 Cleanup Timer: {timer_lbl}", callback_data="s:cleanup")],
         [InlineKeyboardButton("❌ Close", callback_data="s:close")],
     ])
 
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    await update.message.reply_text("⚙️ *Settings*", parse_mode=ParseMode.MARKDOWN, reply_markup=settings_keyboard(uid))
+    await update.message.reply_text("⚙️ *Your Settings*\nTap an option to change it:",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=settings_keyboard(uid))
 
 async def settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    await q.answer()
+    q = update.callback_query; uid = q.from_user.id; await q.answer()
     parts = q.data.split(":")
     if parts[1] == "close":
-        await q.message.delete()
-        return
-    if parts[1] == "quality":
-        await q.message.edit_text("Select quality:", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("360p", callback_data="s:set:quality:360p"),
-             InlineKeyboardButton("720p", callback_data="s:set:quality:720p"),
-             InlineKeyboardButton("1080p", callback_data="s:set:quality:1080p")],
-            [InlineKeyboardButton("Best", callback_data="s:set:quality:best")],
-        ]))
-    elif parts[1] == "mode":
-        await q.message.edit_text("Mode:", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Fixed", callback_data="s:set:mode:fixed"),
-             InlineKeyboardButton("Manual", callback_data="s:set:mode:manual")],
-        ]))
-    elif parts[1] == "watermark":
-        await q.message.edit_text(
-            "Send the watermark text you want to overlay (centered, semi-transparent).\n"
-            "Type `/cancel` to keep current.\n\n"
-            "*Note:* Watermarks only applied to videos ≤200 MB to save memory.",
+        await q.message.delete(); return
+    if parts[1] == "back":
+        await q.message.edit_text("⚙️ *Your Settings*", parse_mode=ParseMode.MARKDOWN,
+            reply_markup=settings_keyboard(uid)); return
+    if parts[1] == "quality" and len(parts) == 2:
+        await q.message.edit_text("🎬 *Select Default Video Quality:*",
             parse_mode=ParseMode.MARKDOWN,
-        )
-        ctx.user_data["waiting_watermark"] = uid
-        return
-    elif parts[1] == "set" and len(parts) == 4:
-        key, val = parts[2], parts[3]
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("360p", callback_data="s:set:quality:360p"),
+                 InlineKeyboardButton("480p", callback_data="s:set:quality:480p")],
+                [InlineKeyboardButton("720p", callback_data="s:set:quality:720p"),
+                 InlineKeyboardButton("1080p", callback_data="s:set:quality:1080p")],
+                [InlineKeyboardButton("🟣 1440p (2K)", callback_data="s:set:quality:1440p"),
+                 InlineKeyboardButton("🔵 2160p (4K)", callback_data="s:set:quality:2160p")],
+                [InlineKeyboardButton("⭐ Best Available", callback_data="s:set:quality:best")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="s:back")],
+            ])); return
+    if parts[1] == "mode" and len(parts) == 2:
+        await q.message.edit_text("🔁 *Download Mode:*\n\n• *Fixed* – always use default quality\n• *Manual* – choose quality per download",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Fixed Quality", callback_data="s:set:mode:fixed")],
+                [InlineKeyboardButton("🎛 Manual Selection", callback_data="s:set:mode:manual")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="s:back")],
+            ])); return
+    if parts[1] == "cleanup" and len(parts) == 2:
+        await q.message.edit_text("🧹 *Auto-Cleanup Timer:*\nFiles deleted after this delay.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("5 min", callback_data="s:set:cleanup:5"),
+                 InlineKeyboardButton("10 min", callback_data="s:set:cleanup:10")],
+                [InlineKeyboardButton("15 min", callback_data="s:set:cleanup:15"),
+                 InlineKeyboardButton("30 min", callback_data="s:set:cleanup:30")],
+                [InlineKeyboardButton("♾ Never", callback_data="s:set:cleanup:0")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="s:back")],
+            ])); return
+    if parts[1] == "set" and len(parts) == 4:
+        key, value = parts[2], parts[3]
         s = get_settings(uid)
-        if key == "quality": s["quality"] = val
-        elif key == "mode": s["mode"] = val
-        await q.message.edit_text("✅ Saved", reply_markup=settings_keyboard(uid))
-
-async def handle_watermark_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if ctx.user_data.get("waiting_watermark") != uid:
-        return
-    text = update.message.text.strip()
-    if text == "/cancel":
-        await update.message.reply_text("Watermark unchanged.")
-    else:
-        get_settings(uid)["watermark"] = text
-        await update.message.reply_text(f"✅ Watermark set to: `{text}`", parse_mode=ParseMode.MARKDOWN)
-    ctx.user_data.pop("waiting_watermark", None)
+        if key == "quality": s["quality"] = value
+        elif key == "mode": s["mode"] = value
+        elif key == "cleanup": s["cleanup_minutes"] = int(value)
+        await q.message.edit_text("✅ *Setting saved!*", parse_mode=ParseMode.MARKDOWN,
+            reply_markup=settings_keyboard(uid))
 
 # ========== MESSAGE & CALLBACK HANDLERS ==========
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -579,20 +525,15 @@ async def handle_youtube_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url
     )
 
 async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    uid = q.from_user.id
-    await q.answer()
+    q = update.callback_query; uid = q.from_user.id; await q.answer()
     parts = q.data.split(":")
     action = parts[1]
     if action == "cancel":
-        await q.message.edit_text("Cancelled.")
-        return
+        await q.message.edit_text("❌ Download cancelled."); return
     if action == "thumb":
-        await do_thumbnail(q, ctx, uid)
-        return
+        await do_thumbnail(q, ctx, uid); return
     if action == "audio":
-        await do_audio(q, ctx, uid)
-        return
+        await do_audio(q, ctx, uid); return
     if action == "video":
         s = get_settings(uid)
         if s["mode"] == "fixed":
@@ -601,8 +542,7 @@ async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await show_quality_menu(q, ctx)
         return
     if action == "quality" and len(parts) == 3:
-        await do_video(q, ctx, uid, parts[2])
-        return
+        await do_video(q, ctx, uid, parts[2]); return
     if action == "search" and len(parts) == 3:
         results = ctx.user_data.get("search_results", [])
         idx = int(parts[2])
@@ -611,10 +551,12 @@ async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.user_data["url"] = entry.get("webpage_url") or entry.get("url", "")
             ctx.user_data["info"] = entry
             await q.message.edit_text(
-                f"🎵 *{entry.get('title','?')}*\n\nChoose:",
+                f"🎵 *{entry.get('title', '?')}*\n\nChoose download type:",
+                parse_mode=ParseMode.MARKDOWN,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🎬 Video", callback_data="dl:video")],
-                    [InlineKeyboardButton("🎵 Audio", callback_data="dl:audio")],
+                    [InlineKeyboardButton("🎵 Audio MP3", callback_data="dl:audio")],
+                    [InlineKeyboardButton("🖼 Thumbnail", callback_data="dl:thumb")],
                     [InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")],
                 ]),
             )
@@ -623,25 +565,25 @@ async def show_quality_menu(q, ctx):
     info = ctx.user_data.get("info", {})
     formats = info.get("formats", [])
     title = info.get("title", "Video")
-    seen = set()
+    seen_heights = set()
     buttons = []
     for f in formats:
         h = f.get("height")
-        if not h or h in seen:
-            continue
-        seen.add(h)
+        if not h or h in seen_heights: continue
+        seen_heights.add(h)
         ac = (f.get("acodec") or "none") != "none"
         tag = "🔊" if ac else "🎬"
         buttons.append([InlineKeyboardButton(f"{tag} {h}p", callback_data=f"dl:quality:{h}p")])
-    buttons.append([InlineKeyboardButton("⭐ Best", callback_data="dl:quality:best")])
+    buttons.append([InlineKeyboardButton("⭐ Best Available", callback_data="dl:quality:best")])
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")])
-    await q.message.edit_text(f"🎬 *{title}*\nSelect quality:", reply_markup=InlineKeyboardMarkup(buttons))
+    await q.message.edit_text(f"🎬 *{title}*\n\nSelect quality:",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
 
 async def extract_info(url: str, download: bool = False, extra_opts: dict | None = None) -> dict:
     opts = ydl_opts_base()
     if extra_opts:
         opts.update(extra_opts)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     def _run():
         with YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=download)
@@ -655,38 +597,34 @@ async def do_video(q, ctx, uid: int, quality: str):
         return
     sem = get_download_sem()
     if sem.locked():
-        await q.message.edit_text("⏳ Another download in progress – queued...")
+        await q.message.edit_text("⏳ *Another download is in progress. You're queued — please wait…*", parse_mode=ParseMode.MARKDOWN)
     async with sem:
         info = ctx.user_data.get("info", {})
         vid_id = info.get("id", "unknown")
         title = info.get("title", vid_id)[:50]
-        watermark = get_settings(uid).get("watermark", "")
 
         if quality == "best":
-            fmt = (
-                "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]"
-                "/bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-                "/bestvideo+bestaudio/best"
-            )
+            fmt = "bestvideo+bestaudio/best"
         else:
-            target_h = {"360p": 360, "720p": 720, "1080p": 1080, "1440p": 1440, "2160p": 2160}.get(quality, 720)
-            fmt = (
-                f"bestvideo[height<={target_h}][vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]"
-                f"/bestvideo[height<={target_h}][ext=mp4]+bestaudio[ext=m4a]"
-                f"/bestvideo[height<={target_h}]+bestaudio"
-                f"/best[height<={target_h}]"
-                f"/bestvideo+bestaudio/best"
-            )
+            target_h = {"360p":360, "480p":480, "720p":720, "1080p":1080, "1440p":1440, "2160p":2160}.get(quality, 1080)
+            fmt = f"bestvideo[height<={target_h}]+bestaudio/best[height<={target_h}]/bestvideo+bestaudio/best"
 
-        status = await q.message.edit_text(f"⬇️ *Downloading {quality}…*", parse_mode=ParseMode.MARKDOWN)
+        status = await q.message.edit_text(f"⬇️ *Downloading ({quality})…*", parse_mode=ParseMode.MARKDOWN)
         out_path = str(DOWNLOAD_DIR / f"{vid_id}_{quality}.%(ext)s")
         try:
-            merged = await do_download_subprocess(url, fmt, out_path, status, asyncio.get_running_loop(), quality)
+            await do_download_subprocess(url, fmt, out_path, status, asyncio.get_running_loop(), quality)
         except Exception as e:
             await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
             return
 
-        # Thumbnail
+        # Find downloaded file
+        found = sorted(DOWNLOAD_DIR.glob(f"{vid_id}_{quality}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not found:
+            await status.edit_text("❌ No output file found after download.")
+            return
+        merged_path = str(found[0])
+
+        # Thumbnail download
         thumb_path = None
         thumbs = info.get("thumbnails") or []
         if thumbs:
@@ -703,14 +641,10 @@ async def do_video(q, ctx, uid: int, quality: str):
                         return None
                 thumb_path = await loop.run_in_executor(None, fetch)
 
-        # Apply watermark if needed
-        if watermark:
-            merged = await asyncio.get_running_loop().run_in_executor(None, add_watermark, merged, watermark)
-
         await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
         try:
             await send_file(
-                chat_id=q.message.chat_id, filepath=merged, filename=f"{title}.mp4",
+                chat_id=q.message.chat_id, filepath=merged_path, filename=f"{title}.mp4",
                 caption=f"🎬 {title} [{quality}]", status_msg=status, is_video=True, thumb_path=thumb_path,
             )
             await status.delete()
@@ -719,8 +653,7 @@ async def do_video(q, ctx, uid: int, quality: str):
         finally:
             if thumb_path:
                 Path(thumb_path).unlink(missing_ok=True)
-            Path(merged).unlink(missing_ok=True)
-            gc.collect()
+            # merged_path is deleted inside send_file
 
 # ========== AUDIO DOWNLOAD ==========
 async def do_audio(q, ctx, uid: int):
@@ -730,14 +663,14 @@ async def do_audio(q, ctx, uid: int):
         return
     sem = get_download_sem()
     if sem.locked():
-        await q.message.edit_text("⏳ Another download in progress – queued...")
+        await q.message.edit_text("⏳ *Another download is in progress. You're queued — please wait…*", parse_mode=ParseMode.MARKDOWN)
     async with sem:
         status = await q.message.edit_text("⬇️ *Extracting audio…*", parse_mode=ParseMode.MARKDOWN)
         out_path = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
         try:
-            audio_path = await do_download_subprocess(
+            await do_download_subprocess(
                 url,
-                "bestaudio[ext=m4a]/bestaudio/best",
+                "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
                 out_path,
                 status,
                 asyncio.get_running_loop(),
@@ -747,15 +680,22 @@ async def do_audio(q, ctx, uid: int):
         except Exception as e:
             await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
             return
-        title = Path(audio_path).stem
+
+        # Find mp3 file
+        files = sorted(DOWNLOAD_DIR.glob("*.mp3"), key=lambda f: f.stat().st_mtime, reverse=True)
+        if not files:
+            await status.edit_text("❌ Audio file not found.")
+            return
+        filepath = str(files[0])
+        title = files[0].stem
         await status.edit_text("📤 *Uploading MP3…*", parse_mode=ParseMode.MARKDOWN)
         try:
-            await send_file(q.message.chat_id, audio_path, f"{title}.mp3", f"🎵 {title}", status, is_video=False)
+            await send_file(q.message.chat_id, filepath, f"{title}.mp3", f"🎵 {title}", status, is_video=False)
             await status.delete()
         except Exception as e:
             await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
         finally:
-            Path(audio_path).unlink(missing_ok=True)
+            Path(filepath).unlink(missing_ok=True)
 
 # ========== THUMBNAIL ==========
 async def do_thumbnail(q, ctx, uid: int):
@@ -765,21 +705,20 @@ async def do_thumbnail(q, ctx, uid: int):
         await q.message.edit_text("❌ No thumbnail found.")
         return
     status = await q.message.edit_text("🖼 *Downloading thumbnail…*", parse_mode=ParseMode.MARKDOWN)
-    out = DOWNLOAD_DIR / f"{info.get('id','thumb')}.jpg"
-    loop = asyncio.get_running_loop()
-    def fetch():
-        try:
-            urllib.request.urlretrieve(thumb_url, out)
-            return out.exists()
-        except:
-            return False
-    if await loop.run_in_executor(None, fetch):
-        with open(out, "rb") as f:
-            await q.message.reply_document(f, filename=f"{info.get('title','thumb')}.jpg")
+    outpath = DOWNLOAD_DIR / f"{info.get('id', 'thumb')}_thumb.jpg"
+    try:
+        urllib.request.urlretrieve(thumb_url, outpath)
+    except Exception as e:
+        await status.edit_text(f"❌ Thumbnail fetch failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        return
+    try:
+        with open(outpath, "rb") as f:
+            await q.message.reply_document(f, filename=f"{info.get('title', 'thumbnail')}.jpg")
         await status.delete()
-        register_for_cleanup(str(out), get_settings(uid)["cleanup_minutes"])
-    else:
-        await status.edit_text("❌ Failed to fetch thumbnail")
+    except Exception as e:
+        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        return
+    register_for_cleanup(str(outpath), get_settings(uid)["cleanup_minutes"])
 
 # ========== SEARCH ==========
 async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
@@ -795,23 +734,28 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: s
         return
     ctx.user_data["search_results"] = entries
     buttons = []
-    for i, e in enumerate(entries[:5]):
-        title = e.get("title", "?")[:40]
-        dur = e.get("duration", 0)
-        dur_str = f"{dur//60}:{dur%60:02d}" if dur else "?"
+    for i, entry in enumerate(entries[:5]):
+        title = entry.get("title", "Unknown")[:52]
+        dur = entry.get("duration", 0)
+        dur_str = f"{dur // 60}:{dur % 60:02d}" if dur else "?"
         buttons.append([InlineKeyboardButton(f"{i+1}. {title} [{dur_str}]", callback_data=f"dl:search:{i}")])
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")])
-    await msg.edit_text("🎵 *Top results — tap to select:*", reply_markup=InlineKeyboardMarkup(buttons))
+    await msg.edit_text("🎵 *Top results — tap to select:*",
+        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
 
 # ========== ERROR HANDLER ==========
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
-    logger.exception("Unhandled error: %s", ctx.error)
+    import traceback
+    tb = "".join(traceback.format_exception(type(ctx.error), ctx.error, ctx.error.__traceback__))
+    logger.error("Unhandled exception:\n%s", tb)
+    short = str(ctx.error)[:400]
+    msg = f"⚠️ *Unexpected error:*\n`{short}`"
     try:
         if update and update.callback_query:
-            await update.callback_query.message.edit_text("⚠️ Unexpected error, please retry.")
+            await update.callback_query.message.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
         elif update and update.message:
-            await update.message.reply_text("⚠️ Unexpected error, please retry.")
-    except:
+            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
         pass
 
 # ========== PYROGRAM LIFECYCLE ==========
@@ -819,13 +763,8 @@ async def start_pyro_bot() -> None:
     global _pyro_bot
     if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
         raise RuntimeError("TELEGRAM_API_ID and TELEGRAM_API_HASH required")
-    _pyro_bot = PyroClient(
-        "yt_bot",
-        api_id=TELEGRAM_API_ID,
-        api_hash=TELEGRAM_API_HASH,
-        bot_token=BOT_TOKEN,
-        no_updates=True,
-    )
+    _pyro_bot = PyroClient("yt_bot", api_id=TELEGRAM_API_ID, api_hash=TELEGRAM_API_HASH,
+                           bot_token=BOT_TOKEN, no_updates=True)
     await _pyro_bot.start()
     me = await _pyro_bot.get_me()
     logger.info("✅ Pyrogram connected as @%s", me.username or "?")
@@ -843,7 +782,6 @@ def main():
         logger.info("✅ cookies.txt OK — %d YouTube lines", cs.get("yt_lines", 0))
     else:
         logger.warning("⚠️ cookies.txt problem: %s", cs["reason"])
-
     start_health_server()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -851,18 +789,17 @@ def main():
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("cookiecheck", cmd_cookiecheck))
     app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(r'^(?!\/)'), handle_watermark_text))
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^s:"))
     app.add_handler(CallbackQueryHandler(download_callback, pattern=r"^dl:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
     async def post_init(application: Application):
+        global _download_sem
+        _download_sem = asyncio.Semaphore(1)
         await application.bot.set_my_commands([
-            BotCommand("start", "Welcome"),
-            BotCommand("help", "Help"),
-            BotCommand("settings", "Preferences"),
-            BotCommand("cookiecheck", "Cookie status"),
+            BotCommand("start", "Welcome"), BotCommand("help", "Help"),
+            BotCommand("settings", "Preferences"), BotCommand("cookiecheck", "Cookie status"),
             BotCommand("stats", "Bot info"),
         ])
         await start_pyro_bot()

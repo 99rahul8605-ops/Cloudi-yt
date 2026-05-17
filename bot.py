@@ -182,12 +182,32 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
         "socket_timeout":      30,
     }
 
+    # ── PO Token via Deno (BotGuard challenge solver) ────────────────────
+    # yt-dlp uses Deno to solve YouTube's JS challenge and get a PO token.
+    # Without this, YouTube blocks adaptive streams (720p+) and returns
+    # only format 18 (360p muxed). Deno must be installed in the container.
+    import shutil
+    deno_path = shutil.which("deno") or "/usr/local/bin/deno"
+    if shutil.which("deno") or Path(deno_path).exists():
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["web"],
+                "po_token":      [f"web+deno:{deno_path}"],
+            }
+        }
+        logger.info("✅ Deno PO token solver enabled: %s", deno_path)
+    else:
+        logger.warning("⚠️ Deno not found — YouTube may only return 360p (format 18)")
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["ios", "android", "tv_embedded"],
+            }
+        }
+
     # ── Proxy ─────────────────────────────────────────────────────────────
     if YTDL_PROXY:
         opts["proxy"] = YTDL_PROXY
         logger.info("Using proxy: %s", YTDL_PROXY)
-    else:
-        logger.warning("⚠️ YTDL_PROXY not set — YouTube may block downloads on Render")
 
     # ── Cookies ───────────────────────────────────────────────────────────
     if use_cookies:
@@ -698,25 +718,11 @@ async def handle_quality_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, t
         h = chosen_fmt.get("height")
         quality = f"{h}p" if h else "best"
 
-    # Simulate a callback-query-like call to do_video by building a thin shim
-    class _MsgShim:
-        """Minimal shim so do_video can call status.edit_text."""
-        def __init__(self, msg):
-            self._msg = msg
-            self._bot = msg._bot if hasattr(msg, "_bot") else None
-        async def edit_text(self, *a, **kw):
-            # edit_text doesn't exist on a fresh reply — use reply_text instead
-            return await self._msg.reply_text(*a, **kw)
-
+    # Send status message — PTB Message objects already have edit_text,
+    # so pass it directly to _do_video_direct. No shim needed.
     status_msg = await update.message.reply_text(
         f"⏳ *Starting download ({quality})…*", parse_mode=ParseMode.MARKDOWN
     )
-
-    # Patch status_msg so do_video's edit_text calls work
-    original_reply = status_msg.reply_text
-    async def _edit_text(*a, **kw):
-        return await status_msg.edit_text(*a, **kw)
-    status_msg.edit_text = _edit_text   # already has edit_text, this is fine
 
     await _do_video_direct(update, ctx, uid, quality, status_msg)
 

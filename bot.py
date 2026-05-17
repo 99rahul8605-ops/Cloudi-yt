@@ -195,22 +195,16 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
         "writethumbnail":  False,
         "embedthumbnail":  False,
 
-        # Format strategy: strongly prefer H264+m4a so yt-dlp merges into
-        # a stream-copyable mp4 — ensure_telegram_compatible() then finishes
-        # in seconds with no re-encode and minimal RAM.
-        # Fallback order is explicit so we never silently drop to 360p muxed:
-        #   1. H264 video + m4a audio  (ideal: stream-copy into mp4)
-        #   2. Any video <= height + any audio  (VP9/webm → transcode needed)
-        #   3. Best muxed at height    (single-stream, no merge needed)
-        #   4. Absolute best available (no height cap, last resort)
-        "format": (
-            "bestvideo[vcodec^=avc]+bestaudio[ext=m4a]"
-            "/bestvideo[vcodec^=avc]+bestaudio"
-            "/bestvideo+bestaudio[ext=m4a]"
-            "/bestvideo+bestaudio"
-            "/best"
-        ),
-        "format_sort": ["res", "br", "vcodec:h264", "acodec:m4a"],
+        # Format strategy:
+        #   selector  — NO codec filter. "bestvideo" = best at the ranked
+        #               resolution. Codec filters like [vcodec^=avc] cause
+        #               silent resolution drops (e.g. 720p H264 instead of
+        #               1080p VP9) when H264 isn't available at the target height.
+        #   format_sort — handles codec preference AFTER resolution is locked.
+        #               yt-dlp picks 1080p H264 if available, else 1080p VP9.
+        #               Resolution always wins over codec preference.
+        "format":      "bestvideo+bestaudio/best",
+        "format_sort": ["res", "vcodec:h264", "acodec:m4a", "br"],
         "merge_output_format": "mp4",
 
         # Retries
@@ -320,9 +314,9 @@ def pick_best_formats(formats: list, quality: str) -> tuple[str, str]:
         logger.info("Selector: %s + %s", vid_sel, aud_sel)
         return vid_sel, aud_sel
 
-    # No codec/ext constraints — let yt-dlp pick best at or below target height.
-    # ensure_telegram_compatible() will convert VP9/webm to H264 if needed.
-    vid_sel = f"bestvideo[height<={target_h}]/bestvideo"
+    # Height cap only — no codec filter. format_sort (set in ydl_opts_base)
+    # handles H264 preference at the same resolution.
+    vid_sel = f"bestvideo[height<={target_h}]"
     aud_sel = "bestaudio"
 
     logger.info("Selector for %s: video=%s  audio=%s", quality, vid_sel, aud_sel)
@@ -1418,23 +1412,17 @@ async def do_video(q, ctx, uid: int, quality: str):
     vid_id      = cached_info.get("id", "unknown")
     title       = cached_info.get("title", vid_id)
 
-    # Prefer H264+m4a at the requested height — stream-copy into mp4, no
-    # re-encode, minimal RAM. Falls back through explicit levels so we never
-    # silently drop to a 360p muxed stream.
+    # No codec filter in selector — format_sort handles H264 preference.
+    # [vcodec^=avc] in selector silently drops to lower resolution when
+    # H264 isn't available at the target height (e.g. 720p H264 instead
+    # of 1080p VP9). Resolution must always win over codec preference.
     if quality == "best":
-        fmt = (
-            "bestvideo[vcodec^=avc]+bestaudio[ext=m4a]"
-            "/bestvideo[vcodec^=avc]+bestaudio"
-            "/bestvideo+bestaudio"
-            "/best"
-        )
+        fmt = "bestvideo+bestaudio/best"
     else:
         target_h = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080,
                     "1440p": 1440, "2160p": 2160}.get(quality, 1080)
         fmt = (
-            f"bestvideo[height<={target_h}][vcodec^=avc]+bestaudio[ext=m4a]"
-            f"/bestvideo[height<={target_h}][vcodec^=avc]+bestaudio"
-            f"/bestvideo[height<={target_h}]+bestaudio"
+            f"bestvideo[height<={target_h}]+bestaudio"
             f"/best[height<={target_h}]"
             f"/bestvideo+bestaudio"
             f"/best"
@@ -1473,7 +1461,7 @@ async def do_video(q, ctx, uid: int, quality: str):
         opts = {
             **base_opts,
             "format":              fmt,
-            "format_sort":         ["res", "br", "vcodec:vp9", "acodec:opus"],
+            "format_sort":         ["res", "vcodec:h264", "acodec:m4a", "br"],
             "merge_output_format": "mp4",
             "outtmpl":             out_path,
             "progress_hooks":      [hook],

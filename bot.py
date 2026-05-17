@@ -442,6 +442,10 @@ async def do_download_subprocess(
                 "--newline",          # one progress line per chunk — parseable
                 "--progress",
                 "--no-warnings",
+                # Force H264+AAC output so Telegram skips server-side re-encode.
+                # Without this yt-dlp stream-copies VP9/AV1 into mp4 which Telegram
+                # transcodes server-side (quality loss + upload wasted).
+                "--postprocessor-args", "ffmpeg:-c:v libx264 -crf 18 -preset fast -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart",
     ]
 
     # Pass cookies if available
@@ -941,13 +945,17 @@ async def ffmpeg_merge(video_path: str, audio_path: str, out_path: str) -> None:
         import tempfile
         # Delete inputs before merge so disk holds only one large file at a time.
         # FFmpeg has already opened them via -i before we start writing output.
+        # Encode to H264+AAC — Telegram skips server-side transcode for H264+AAC mp4,
+        # serving the original bitstream at full quality. VP9/AV1 stream-copy into
+        # mp4 causes Telegram server transcode (quality loss). libx264 crf 18 is
+        # visually lossless. This also means ensure_telegram_compatible() is never
+        # needed after merge, saving another full file copy before upload.
         cmd = [
             "ffmpeg", "-y",
             "-i", video_path,
             "-i", audio_path,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", "192k",
+            "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
             out_path,
         ]
@@ -1255,68 +1263,6 @@ async def stop_pyro_bot() -> None:
         logger.info("Pyrogram client stopped.")
 
 
-# ─── Streaming file reader ────────────────────────────────────────────────────
-import io as _io
-
-class _StreamingFileReader(_io.RawIOBase):
-    """
-    Reads a disk file in 4 MB chunks and deletes it when fully consumed.
-    Passed directly to Pyrogram — the file is NEVER fully loaded into RAM.
-    Pyrogram reads chunk → sends over MTProto → chunk is freed immediately.
-    .close() deletes the file the moment upload finishes or fails.
-    """
-    def __init__(self, filepath: str, filename: str, on_progress=None):
-        self._path        = filepath
-        self._name        = filename
-        self._fh          = open(filepath, "rb")
-        self._size        = os.path.getsize(filepath)
-        self._read_so_far = 0
-        self._on_progress = on_progress
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    def readable(self) -> bool:
-        return True
-
-    def readinto(self, b: bytearray) -> int:
-        chunk = self._fh.read(len(b))
-        if not chunk:
-            return 0                    # EOF → Pyrogram finishes upload
-        n = len(chunk)
-        b[:n] = chunk
-        self._read_so_far += n
-        if self._on_progress:
-            try:
-                self._on_progress(self._read_so_far, self._size)
-            except Exception:
-                pass
-        return n
-
-    def close(self):
-        try:
-            self._fh.close()
-        except Exception:
-            pass
-        try:
-            Path(self._path).unlink(missing_ok=True)
-            logger.info("Stream-deleted after upload: %s", self._name)
-        except Exception:
-            pass
-        super().close()
-
-
-class _NamedBufferedReader(_io.BufferedReader):
-    """BufferedReader whose .name is writable (io.BufferedReader.name is read-only)."""
-    def __init__(self, raw: "_StreamingFileReader", buffer_size: int = 4 * 1024 * 1024):
-        super().__init__(raw, buffer_size=buffer_size)
-
-    @property
-    def name(self) -> str:
-        return self.raw.name
-
-
 # ─── Unified upload helper ────────────────────────────────────────────────────
 async def send_file(
     chat_id:       int,
@@ -1328,59 +1274,49 @@ async def send_file(
     thumb_path:    str | None = None,
 ) -> None:
     """
-    Stream-upload a merged video or audio file via Pyrogram MTProto.
+    Upload a video/audio file via Pyrogram MTProto (2 GB limit).
 
-    Flow:
-      1. ensure_telegram_compatible() — stream-copy or H264 re-encode.
-         Source deleted inside that fn, so only ONE file exists at a time.
-      2. _StreamingFileReader wraps the final file — Pyrogram reads 4 MB
-         chunks, sends over MTProto, chunk is freed. File never fully in RAM.
-      3. _StreamingFileReader.close() deletes the file the instant upload
-         ends (success or error). No cleanup timer. No lingering.
-      4. ffprobe metadata injected → Telegram renders video correctly.
-      5. 2 GB limit via Pyrogram MTProto (no Bot API 50 MB cap).
+    RAM strategy:
+      • Pass a plain file PATH string to Pyrogram (not BytesIO/file object).
+        Some Pyrogram versions call .read() with no size on file objects,
+        loading the entire file into the bot heap. A path string avoids this.
+      • ensure_telegram_compatible() is NOT called here — ffmpeg_merge and
+        do_download_subprocess already output H264+AAC mp4 via -c:v libx264
+        when needed. An extra remux pass before upload doubles disk usage.
+      • File is deleted from disk immediately after Pyrogram finishes.
+      • gc.collect() before and after upload to keep heap lean.
     """
     if _pyro_bot is None or not _pyro_bot.is_connected:
         raise RuntimeError("Pyrogram client is not running.")
 
-    filepath = str(filepath)
-    loop     = asyncio.get_running_loop()
-    ext      = Path(filepath).suffix.lower()
-
-    # ── Step 1: ensure H264+AAC mp4 (stream-copy if already compatible) ──────
-    if is_video and ext in VIDEO_EXTS:
-        filepath = await loop.run_in_executor(None, ensure_telegram_compatible, filepath)
-        ext      = Path(filepath).suffix.lower()
-        gc.collect()   # reclaim memory freed by source file deletion inside ensure_telegram_compatible
-
+    filepath  = str(filepath)
+    ext       = Path(filepath).suffix.lower()
     file_size = os.path.getsize(filepath)
-    logger.info("Stream-uploading %s (%.1f MB) via Pyrogram MTProto",
+
+    logger.info("Uploading %s (%.1f MB) via Pyrogram MTProto (path mode)",
                 filename, file_size / 1024 / 1024)
 
-    # ── Step 2: sync progress callback (called from reader thread) ───────────
     _last_edit:  list[float] = [0.0]
     _start_time: list[float] = [time.time()]
 
-    def _sync_progress(current: int, total: int) -> None:
+    async def _progress(current: int, total: int) -> None:
         now = time.time()
         if now - _last_edit[0] < 3:
             return
         _last_edit[0] = now
         elapsed = now - _start_time[0]
         text = upload_progress_text(filename, current, total, elapsed)
-        asyncio.run_coroutine_threadsafe(
-            status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN),
-            loop,
-        )
+        try:
+            await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
 
     await status_msg.edit_text(
         f"📤 *Uploading* `{filename}` *({human_size(file_size)})*…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # ── Step 3: wrap file in streaming reader, send, auto-delete on close ────
-    raw_reader = _StreamingFileReader(filepath, filename, on_progress=_sync_progress)
-    bio        = _NamedBufferedReader(raw_reader)
+    gc.collect()   # free download/merge buffers before upload starts
 
     try:
         if is_video and ext in VIDEO_EXTS:
@@ -1389,7 +1325,7 @@ async def send_file(
                         meta["width"], meta["height"], meta["duration"], meta["has_audio"])
             await _pyro_bot.send_video(
                 chat_id            = chat_id,
-                video              = bio,
+                video              = filepath,   # plain path — Pyrogram reads in 512 KB parts
                 caption            = caption,
                 file_name          = filename,
                 width              = meta["width"],
@@ -1397,24 +1333,28 @@ async def send_file(
                 duration           = meta["duration"],
                 supports_streaming = True,
                 thumb              = thumb_path,
+                progress           = _progress,
             )
         elif ext in AUDIO_EXTS:
             await _pyro_bot.send_audio(
                 chat_id   = chat_id,
-                audio     = bio,
+                audio     = filepath,
                 caption   = caption,
                 file_name = filename,
+                progress  = _progress,
             )
         else:
             await _pyro_bot.send_document(
                 chat_id   = chat_id,
-                document  = bio,
+                document  = filepath,
                 caption   = caption,
                 file_name = filename,
+                progress  = _progress,
             )
     finally:
-        bio.close()   # deletes the file even if Pyrogram raised an exception
-        logger.info("Upload done | disk: %s", _get_tmp_usage())
+        Path(filepath).unlink(missing_ok=True)
+        logger.info("Deleted after upload: %s | disk: %s", filename, _get_tmp_usage())
+        gc.collect()
 
 
 

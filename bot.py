@@ -702,55 +702,11 @@ async def settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    # ── Quality selection by number reply (like reference bot logic) ──────
-    if ctx.user_data.get("awaiting_quality"):
-        await handle_quality_reply(update, ctx, text)
-        return
-
     if is_youtube_url(text):
         await handle_youtube_url(update, ctx, text)
     else:
         await handle_search(update, ctx, text)
 
-
-async def handle_quality_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
-    """Handle the user's numbered quality reply, matching reference bot logic."""
-    uid             = update.effective_user.id
-    quality_formats = ctx.user_data.get("quality_formats", [])
-    best_idx        = len(quality_formats) + 1   # last option = Best Available
-
-    try:
-        selection = int(text)
-    except ValueError:
-        await update.message.reply_text(
-            "⚠️ Please reply with a number from the quality list."
-        )
-        return
-
-    if selection < 1 or selection > best_idx:
-        await update.message.reply_text(
-            f"⚠️ Please enter a number between 1 and {best_idx}."
-        )
-        return
-
-    # Clear awaiting flag immediately so stray messages don't re-trigger
-    ctx.user_data["awaiting_quality"] = False
-    ctx.user_data.pop("quality_formats", None)
-
-    if selection == best_idx:
-        quality = "best"
-    else:
-        chosen_fmt = quality_formats[selection - 1]
-        h = chosen_fmt.get("height")
-        quality = f"{h}p" if h else "best"
-
-    # Send status message — PTB Message objects already have edit_text,
-    # so pass it directly to _do_video_direct. No shim needed.
-    status_msg = await update.message.reply_text(
-        f"⏳ *Starting download ({quality})…*", parse_mode=ParseMode.MARKDOWN
-    )
-
-    await _do_video_direct(update, ctx, uid, quality, status_msg)
 
 
 async def handle_youtube_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
@@ -826,53 +782,39 @@ async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def show_quality_menu(q, ctx):
     info    = ctx.user_data.get("info", {})
     formats = info.get("formats", [])
+    title   = info.get("title", "Video")
 
-    # Build a deduplicated list of ALL downloadable formats:
-    # adaptive video-only streams + muxed streams (like reference code logic
-    # but without the acodec!=none filter that hides high-res adaptive streams)
-    seen_heights = set()
+    # Build deduplicated list of available video heights
+    seen_heights    = set()
     quality_formats = []
-
     for f in formats:
         vc = (f.get("vcodec") or "none").lower()
-        ac = (f.get("acodec") or "none").lower()
-        has_v = vc != "none"
-        h = f.get("height")
-        if not has_v or not h:
-            continue
-        if h in seen_heights:
+        h  = f.get("height")
+        if vc == "none" or not h or h in seen_heights:
             continue
         seen_heights.add(h)
         quality_formats.append(f)
-
-    # Sort by height ascending
     quality_formats.sort(key=lambda f: f.get("height", 0))
 
-    # Add "Best Available" at the end
-    # Store the format list in user_data so number reply can resolve it
-    ctx.user_data["quality_formats"] = quality_formats
-    ctx.user_data["awaiting_quality"] = True
-
-    lines = []
-    for idx, f in enumerate(quality_formats):
+    buttons = []
+    for f in quality_formats:
         h        = f.get("height", "?")
         note     = f.get("format_note") or f"{h}p"
         size     = f.get("filesize") or f.get("filesize_approx")
-        size_str = f"{size // 1024 // 1024} MB" if size else "? MB"
+        size_str = f"  {size // 1024 // 1024} MB" if size else ""
         ac       = (f.get("acodec") or "none").lower()
-        tag      = "🔊" if ac != "none" else "🎬"  # muxed vs video-only
-        lines.append(f"{idx + 1}. {tag} {note} — {size_str}")
+        tag      = "🔊" if ac != "none" else "🎬"
+        buttons.append([InlineKeyboardButton(
+            f"{tag} {note}{size_str}", callback_data=f"dl:quality:{h}p"
+        )])
 
-    lines.append(f"{len(quality_formats) + 1}. ⭐ Best Available")
-
-    quality_list = "\n".join(lines)
-    title = info.get("title", "Video")
+    buttons.append([InlineKeyboardButton("⭐ Best Available", callback_data="dl:quality:best")])
+    buttons.append([InlineKeyboardButton("❌ Cancel",         callback_data="dl:cancel")])
 
     await q.message.edit_text(
-        f"🎬 *{title}*\n\n"
-        f"Choose a quality by replying with the number:\n\n"
-        f"{quality_list}",
+        f"🎬 *{title}*\n\nSelect quality:",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
@@ -1200,7 +1142,7 @@ async def send_file(
 # ─── Video ────────────────────────────────────────────────────────────────────
 async def _do_video_direct(update: Update, ctx, uid: int, quality: str, status_msg):
     """
-    Called from handle_quality_reply (number-reply flow).
+    Called when a quality button is tapped (inline keyboard flow).
     Mimics what do_video does but takes a status_msg directly instead of
     a callback query object, since we came from a text message not a button tap.
     """

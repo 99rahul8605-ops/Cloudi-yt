@@ -291,7 +291,9 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
         # Pinterest image pins / Instagram photo posts raise "No video formats found"
         # because yt-dlp can't find a video stream. Re-probe without format filter
         # to still get title + thumbnail so we can offer an image download.
-        if "no video formats" in err_lower or "no formats" in err_lower:
+        if ("no video formats" in err_lower or "no formats" in err_lower
+                or "no video in this post" in err_lower
+                or "there is no video" in err_lower):
             try:
                 info = await extract_info(url, extra_opts={"format": "best"})
             except Exception:

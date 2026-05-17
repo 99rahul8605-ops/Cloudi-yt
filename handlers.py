@@ -294,6 +294,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
     title    = info.get("title", "Unknown")
     duration = info.get("duration", 0)
     dur_str  = f"{duration // 60}m {duration % 60}s" if duration else "?"
+    emoji    = PLATFORM_EMOJI.get(platform, "🌐")
 
     ctx.user_data["url"]      = url
     ctx.user_data["platform"] = platform
@@ -317,9 +318,35 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
         "formats": slim_formats,
     }
 
-    emoji = PLATFORM_EMOJI.get(platform, "🌐")
-    has_formats = bool(slim_formats)
+    # ── Detect image-only posts (Instagram photo posts, Pinterest image pins, etc.)
+    # An image post has no video formats at all and no duration.
+    has_video_formats = any(
+        (f.get("vcodec") or "none").lower() not in ("none", "")
+        for f in slim_formats
+    )
+    # Some extractors return ext=jpg/png/webp for image posts
+    has_image_formats = any(
+        (f.get("ext") or "").lower() in ("jpg", "jpeg", "png", "webp", "gif")
+        for f in slim_formats
+    )
+    is_image_post = (not has_video_formats and not duration) or has_image_formats
 
+    if is_image_post:
+        # ── Image post: show image download button (+ thumbnail if different)
+        buttons = [
+            [InlineKeyboardButton("🖼 Download Image", callback_data="dl:image")],
+        ]
+        if info.get("thumbnail"):
+            buttons.append([InlineKeyboardButton("🔗 Thumbnail URL", callback_data="dl:thumb")])
+        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")])
+        await msg.edit_text(
+            f"{emoji} *{title}*\n\n📷 This is an *image post*.\nWhat would you like?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    # ── Video / audio post: normal flow
     buttons = [
         [InlineKeyboardButton("🎬 Video",     callback_data="dl:video")],
         [InlineKeyboardButton("🎵 Audio MP3", callback_data="dl:audio")],
@@ -348,14 +375,23 @@ async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.edit_text("❌ Download cancelled."); return
     if action == "thumb":
         await do_thumbnail(q, ctx, uid); return
+    if action == "image":
+        await do_image(q, ctx, uid); return
     if action == "audio":
         await do_audio(q, ctx, uid); return
     if action == "video":
-        s = get_settings(uid)
-        if s["mode"] == "fixed":
-            await do_video(q, ctx, uid, s["quality"])
+        platform = ctx.user_data.get("platform", "generic")
+        s        = get_settings(uid)
+        # Quality picker only makes sense for YouTube (adaptive streams with many resolutions).
+        # All other platforms: download immediately at best available quality.
+        if platform == "youtube":
+            if s["mode"] == "fixed":
+                await do_video(q, ctx, uid, s["quality"])
+            else:
+                await show_quality_menu(q, ctx)
         else:
-            await show_quality_menu(q, ctx)
+            # Non-YouTube: always best quality, no picker needed
+            await do_video(q, ctx, uid, "best")
         return
     if action == "quality" and len(parts) == 3:
         await do_video(q, ctx, uid, parts[2]); return
@@ -524,6 +560,116 @@ async def do_audio(q, ctx, uid: int):
         await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
 
     register_for_cleanup(filepath, get_settings(uid)["cleanup_minutes"])
+
+
+# ── Image post download ───────────────────────────────────────────────────────
+
+async def do_image(q, ctx, uid: int):
+    """
+    Download and send image post(s).
+    Handles single images and multi-image carousels (Instagram albums, etc.)
+    Falls back to thumbnail URL if no direct image format is found.
+    """
+    info     = ctx.user_data.get("info", {})
+    url      = ctx.user_data.get("url", "")
+    platform = ctx.user_data.get("platform", "generic")
+    emoji    = PLATFORM_EMOJI.get(platform, "🌐")
+    title    = info.get("title", "image")
+    vid_id   = info.get("id", "unknown")
+    s        = get_settings(uid)
+
+    status = await q.message.edit_text(
+        f"⬇️ *Downloading image…*", parse_mode=ParseMode.MARKDOWN)
+
+    # ── Try to download via yt-dlp (handles carousels / direct image URLs)
+    loop = asyncio.get_event_loop()
+    from utils import build_progress_hook
+    hook = build_progress_hook(loop, status, "🖼 image")
+
+    downloaded_files: list[str] = []
+    try:
+        from yt_dlp import YoutubeDL
+        from platforms import ydl_opts_for
+
+        opts = ydl_opts_for(url)
+        opts.update({
+            "format":         "best",            # grab whatever is available
+            "outtmpl":        str(DOWNLOAD_DIR / f"{vid_id}_%(autonumber)s.%(ext)s"),
+            "progress_hooks": [hook],
+        })
+
+        def _download():
+            before = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
+            with YoutubeDL(opts) as ydl:
+                ydl.extract_info(url, download=True)
+            after = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
+            return [str(f) for f in (after - before)
+                    if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif")]
+
+        downloaded_files = await loop.run_in_executor(None, _download)
+    except Exception as e:
+        logger.warning("yt-dlp image download failed: %s — trying thumbnail fallback", e)
+
+    # ── Fallback: use thumbnail URL directly
+    if not downloaded_files:
+        thumb_url = info.get("thumbnail")
+        if not thumb_url and info.get("thumbnails"):
+            thumb_url = sorted(
+                info["thumbnails"], key=lambda t: t.get("width") or 0, reverse=True
+            )[0].get("url")
+
+        if not thumb_url:
+            await status.edit_text(
+                "❌ Could not find any image to download.\n"
+                "The post may be private or require login.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        outpath = str(DOWNLOAD_DIR / f"{vid_id}_img.jpg")
+        try:
+            urllib.request.urlretrieve(thumb_url, outpath)
+            downloaded_files = [outpath]
+        except Exception as e:
+            await status.edit_text(
+                f"❌ Image download failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
+            return
+
+    # ── Send all downloaded images
+    await status.edit_text(
+        f"📤 *Sending {len(downloaded_files)} image(s)…*", parse_mode=ParseMode.MARKDOWN)
+
+    caption = f"{emoji} *{title}*"
+    sent = 0
+    for fpath in sorted(downloaded_files):
+        try:
+            with open(fpath, "rb") as f:
+                await ctx.bot.send_photo(
+                    chat_id = q.message.chat_id,
+                    photo   = f,
+                    caption = caption if sent == 0 else "",
+                )
+            sent += 1
+            register_for_cleanup(fpath, s["cleanup_minutes"])
+        except Exception:
+            # If send_photo fails (e.g. webp), try send_document
+            try:
+                with open(fpath, "rb") as f:
+                    await ctx.bot.send_document(
+                        chat_id   = q.message.chat_id,
+                        document  = f,
+                        filename  = Path(fpath).name,
+                        caption   = caption if sent == 0 else "",
+                    )
+                sent += 1
+                register_for_cleanup(fpath, s["cleanup_minutes"])
+            except Exception as e2:
+                logger.warning("Failed to send image %s: %s", fpath, e2)
+
+    if sent:
+        await status.delete()
+    else:
+        await status.edit_text("❌ Failed to send any images.", parse_mode=ParseMode.MARKDOWN)
 
 
 # ── Thumbnail ─────────────────────────────────────────────────────────────────

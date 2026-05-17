@@ -999,32 +999,35 @@ def ensure_audio_track(filepath: str) -> str:
     return filepath
 
 
-def ensure_telegram_compatible(filepath: str) -> str:
+def fix_audio_only(filepath: str) -> str:
     """
-    Re-mux into a Telegram-safe mp4 (H.264 + AAC, faststart moov atom).
-    Telegram skips server-side transcoding when these conditions are met,
-    preserving original quality.
+    Fix ONLY the audio codec if it is incompatible with Telegram (opus/vorbis).
+    Video is NEVER re-encoded — stream-copied as-is.
 
-    Memory strategy:
-      • stderr=DEVNULL — no RAM buffer grows for long encodes.
-      • Stream-copy path (H264+AAC already): instant, ~0 extra RAM/disk.
-      • Transcode path (VP9→H264): ultrafast preset + single thread caps
-        libx264 RAM to ~80 MB regardless of resolution.
-      • Source deleted AFTER successful output — never delete before encode.
+    This runs in ~10-30 seconds regardless of resolution or file size because
+    only the audio stream is processed. Upload starts immediately after.
+
+    Telegram natively plays:
+      • H264, VP9 video codecs (all resolutions including 1440p/4K)
+      • AAC, MP3 audio codecs
+    Does NOT need transcoding:
+      • H264 + AAC → upload directly, Telegram handles non-faststart mp4 fine
+      • VP9  + AAC → upload directly
+    Needs audio fix only:
+      • VP9  + opus/vorbis → copy video, transcode audio to AAC
+      • H264 + opus/vorbis → copy video, transcode audio to AAC
+    Skip entirely (return original):
+      • AV1 files → Telegram doesn't support but transcode would take hours;
+                    upload as-is, Telegram will show an error to user rather
+                    than making them wait 15 minutes
     """
     try:
         p = Path(filepath)
-
         if not p.exists():
-            logger.warning("[FFMPEG] ensure_telegram_compatible: file not found: %s", filepath)
             return filepath
 
-        # ── Probe codecs ──────────────────────────────────────────────────
-        # Use -show_streams without -select_streams (the comma syntax is
-        # version-dependent and caused empty results).
         probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_streams", filepath],
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", filepath],
             capture_output=True, text=True, timeout=15,
         )
         streams = _json.loads(probe.stdout).get("streams", [])
@@ -1032,70 +1035,54 @@ def ensure_telegram_compatible(filepath: str) -> str:
         as_     = next((s for s in streams if s.get("codec_type") == "audio"), {})
         vcodec  = vs.get("codec_name", "")
         acodec  = as_.get("codec_name", "")
-        is_mp4  = p.suffix.lower() == ".mp4"
-        need_v  = vcodec not in ("h264", "avc", "avc1")
-        need_a  = acodec not in ("aac", "mp3") or not as_
+        src_mb  = p.stat().st_size / 1024**2
 
-        src_size = p.stat().st_size
-        logger.info("[FFMPEG] probe %s — vcodec=%s acodec=%s mp4=%s need_v=%s need_a=%s size=%.1f MB",
-                    p.name, vcodec or "?", acodec or "?", is_mp4, need_v, need_a,
-                    src_size / 1024**2)
+        logger.info("[FFMPEG] %s — vcodec=%s acodec=%s size=%.1f MB",
+                    p.name, vcodec or "?", acodec or "?", src_mb)
 
-        out_path = str(p.parent / (p.stem + "_tg.mp4"))
-
-        # ── Fast path: already H264+AAC mp4, just fix moov atom ──────────
-        if is_mp4 and not need_v and not need_a:
-            rc = subprocess.call(
-                ["ffmpeg", "-y", "-i", filepath, "-c", "copy",
-                 "-movflags", "+faststart", out_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            if rc == 0 and Path(out_path).exists():
-                logger.info("[FFMPEG] stream-copy faststart OK: %s", p.name)
-                try: p.unlink()
-                except Exception: pass
-                return out_path
-            logger.warning("[FFMPEG] stream-copy failed (rc=%d), using original", rc)
+        # Already compatible — upload as-is, no processing needed
+        aac_ok = acodec in ("aac", "mp3", "")
+        if aac_ok:
+            logger.info("[FFMPEG] audio already compatible, uploading directly")
             return filepath
 
-        # ── Transcode path: VP9/AV1/webm/opus → H264+AAC mp4 ────────────
-        v_args = (
-            ["-c:v", "libx264", "-crf", "23", "-preset", "ultrafast",
-             "-pix_fmt", "yuv420p", "-threads", "1",
-             "-x264-params", "sliced-threads=1:nal-hrd=none"]
-            if need_v else ["-c:v", "copy"]
-        )
-        a_args = ["-c:a", "aac", "-b:a", "128k"] if need_a else ["-c:a", "copy"]
+        # Audio needs fixing — copy video, transcode audio only (~10-30s)
+        out_path = str(p.parent / (p.stem + "_fix.mp4"))
+        timeout  = max(120, int(src_mb * 2))  # 2 s/MB generous upper bound
 
         if not as_:
-            # No audio stream — add silent track so Telegram won't GIF-ify it
-            cmd = (
-                ["ffmpeg", "-y", "-i", filepath,
-                 "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
-                + v_args + a_args
-                + ["-map", "0:v:0", "-map", "1:a:0", "-shortest",
-                   "-movflags", "+faststart", out_path]
-            )
+            # No audio at all — add silent track (Telegram GIF-ifies audioless videos)
+            cmd = [
+                "ffmpeg", "-y", "-i", filepath,
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+                "-movflags", "+faststart", out_path,
+            ]
         else:
-            cmd = (
-                ["ffmpeg", "-y", "-i", filepath]
-                + v_args + a_args
-                + ["-movflags", "+faststart", out_path]
-            )
+            cmd = [
+                "ffmpeg", "-y", "-i", filepath,
+                "-c:v", "copy",          # never re-encode video
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", out_path,
+            ]
 
-        logger.info("[FFMPEG] transcoding %s → H264+AAC mp4", p.name)
-        rc = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logger.info("[FFMPEG] audio fix: %s → aac (video stream-copy)", acodec)
+        rc = subprocess.call(cmd, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, timeout=timeout)
 
         if rc == 0 and Path(out_path).exists():
-            logger.info("[FFMPEG] transcode OK: %s → %s", p.name, Path(out_path).name)
-            # Delete source ONLY after successful output — never before
+            logger.info("[FFMPEG] audio fix OK (%.1f MB → %.1f MB)",
+                        src_mb, Path(out_path).stat().st_size / 1024**2)
             try: p.unlink()
             except Exception: pass
             return out_path
 
-        logger.warning("[FFMPEG] transcode failed (rc=%d) — uploading original", rc)
+        logger.warning("[FFMPEG] audio fix failed (rc=%d), uploading original", rc)
+    except subprocess.TimeoutExpired:
+        logger.warning("[FFMPEG] audio fix timed out, uploading original")
     except Exception as e:
-        logger.warning("[FFMPEG] ensure_telegram_compatible error: %s", e)
+        logger.warning("[FFMPEG] audio fix error: %s", e)
     return filepath
 
 
@@ -1196,45 +1183,39 @@ async def send_file(
     logger.info("Uploading %s (%.1f MB) via Pyrogram MTProto", filename, size_mb)
 
     # ── Progress callback ─────────────────────────────────────────────────────
-    # Pyrogram calls _progress from its own internal task on the event loop.
-    # Problems with naive await inside progress:
-    #   1. Pyrogram silently swallows any exception thrown by the callback.
-    #   2. edit_text can raise RetryAfter (flood wait) — silently dropped.
-    #   3. Awaiting a PTB network call inside Pyrogram's upload task can
-    #      stall the upload itself if the event loop is saturated.
-    #
-    # Fix: schedule edit_text as a fire-and-forget task using
-    # asyncio.ensure_future(). This returns immediately to Pyrogram,
-    # never stalls the upload, and the edit runs independently.
-    # A lock prevents overlapping edits (two progress fires at once).
+    # Pyrogram (v2) calls progress directly with `await func()` on its own
+    # internal loop (confirmed in save_file.py line 194-195). This means:
+    #   • Same event loop, same thread — plain `await` works correctly.
+    #   • No need for ensure_future / run_coroutine_threadsafe.
+    #   • We must catch ALL exceptions — Pyrogram does NOT catch errors from
+    #     the progress callback; an unhandled exception cancels the upload.
+    #   • RetryAfter: honour the wait time by pushing _last_edit forward so
+    #     the next tick also skips, preventing a flood-limit storm.
     _last_edit:  list[float] = [0.0]
     _start_time: list[float] = [time.time()]
-    _edit_lock = asyncio.Lock()
-
-    async def _do_edit(text: str) -> None:
-        """Run the actual edit_text, respecting flood waits."""
-        async with _edit_lock:
-            try:
-                await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
-            except Exception as e:
-                err = str(e).lower()
-                if "retry" in err or "flood" in err:
-                    # Flood-limited — back off silently, don't crash upload
-                    pass
-                elif "message is not modified" in err:
-                    pass  # identical text, ignore
-                else:
-                    logger.debug("Upload progress edit failed: %s", e)
 
     async def _progress(current: int, total: int) -> None:
         now = time.time()
-        if now - _last_edit[0] < 4:   # 4 s minimum between edits
+        if now - _last_edit[0] < 4:          # 4 s minimum between edits
             return
         _last_edit[0] = now
         elapsed = now - _start_time[0]
         text = upload_progress_text(filename, current, total, elapsed)
-        # Fire-and-forget: don't await, don't stall Pyrogram's upload task
-        asyncio.ensure_future(_do_edit(text))
+        try:
+            await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            err = str(e).lower()
+            if "retry" in err or "flood" in err:
+                # Extract retry_after seconds if available and back off
+                import re as _re
+                m = _re.search(r"retry.*?(\d+)", err)
+                backoff = int(m.group(1)) if m else 10
+                _last_edit[0] = now + backoff   # skip next N seconds of ticks
+            elif "message is not modified" in err:
+                pass   # identical text — harmless
+            else:
+                logger.debug("Upload progress edit skipped: %s", e)
+            # Never re-raise — an exception here would cancel the upload
 
     await status_msg.edit_text(
         f"📤 *Uploading* `{filename}` *({human_size(file_size)})*…",
@@ -1251,7 +1232,9 @@ async def send_file(
         # bitstream — preserving full original quality.
         # If the video is already H.264+AAC in an mp4 with a moov atom at the
         # front, ffmpeg finishes in seconds (stream-copy, no re-encode).
-        filepath = await loop.run_in_executor(None, ensure_telegram_compatible, filepath)
+        # Fix audio codec if needed (opus→aac). Video is NEVER re-encoded.
+        # This takes <30s regardless of resolution. Upload starts right after.
+        filepath = await loop.run_in_executor(None, fix_audio_only, filepath)
 
         meta = get_video_meta(filepath)
         logger.info(

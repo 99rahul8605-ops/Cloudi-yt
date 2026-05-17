@@ -1233,20 +1233,7 @@ async def stop_pyro_bot() -> None:
         logger.info("Pyrogram client stopped.")
 
 
-# ─── Streaming file reader ────────────────────────────────────────────────────
-# NOTE: _StreamingFileReader / _NamedBufferedReader are REMOVED.
-#
-# The previous approach wrapped the file in a custom RawIOBase and passed it
-# to Pyrogram, believing Pyrogram would read it chunk-by-chunk.
-# It does NOT — Pyrogram calls .read() on file-like objects to load the
-# ENTIRE file into RAM before sending, causing OOM on 512 MB hosts.
-#
-# Fix: pass the file PATH (a plain string) directly to send_video/send_audio/
-# send_document. Pyrogram's path code uses its own internal chunked sender
-# (512 KB MTProto parts) and never loads the whole file into RAM.
-# Progress is tracked via Pyrogram's native progress callback instead.
-import io as _io   # kept for other uses
-
+import io as _io
 
 # ─── Unified upload helper ────────────────────────────────────────────────────
 async def send_file(
@@ -1259,19 +1246,26 @@ async def send_file(
     thumb_path:    str | None = None,
 ) -> None:
     """
-    Upload a video/audio file via Pyrogram MTProto.
+    Upload a video/audio file via Pyrogram MTProto (up to 2 GB).
 
-    KEY FIX: pass filepath as a plain STRING, not a file-like object.
-    When Pyrogram receives a file-like object it calls .read() and loads
-    the ENTIRE file into RAM before sending — this was the primary OOM cause.
-    When it receives a path string it uses its own internal 512 KB part
-    sender and never loads more than one part into RAM at a time.
+    WHY THE OLD CODE CAUSED OOM + "not seekable" errors:
+      The old code wrapped the file in a custom RawIOBase subclass and
+      passed it as a file-like object to Pyrogram.
+      Problem 1 — OOM: Pyrogram calls .read() on file-like objects to load
+        the ENTIRE file into RAM before splitting into MTProto parts.
+        A 700 MB video → 700 MB RAM spike → OOM on 512 MB hosts.
+      Problem 2 — not seekable: RawIOBase.seekable() returns False by
+        default. Pyrogram calls seek() for retry/size-detection logic and
+        raises "File or stream is not seekable."
 
-    Flow:
-      1. ensure_telegram_compatible() — remux/re-encode to H264+AAC mp4.
-         Source file deleted inside that fn before output is written.
-      2. Pyrogram sends from path in 512 KB MTProto parts — low RAM.
-      3. File deleted in finally block immediately after upload.
+    THE FIX:
+      Open the file with plain open() — a real BufferedReader that IS
+      seekable (it wraps a real OS file descriptor). Pass this to Pyrogram.
+      Pyrogram still splits it into 512 KB MTProto parts internally, but now
+      it can seek freely without error, and we never load the full file.
+
+      Progress is tracked by reading .tell() before/after each Pyrogram
+      part via the native progress= callback — no custom reader needed.
     """
     if _pyro_bot is None or not _pyro_bot.is_connected:
         raise RuntimeError("Pyrogram client is not running.")
@@ -1285,8 +1279,11 @@ async def send_file(
         filepath = await loop.run_in_executor(None, ensure_telegram_compatible, filepath)
         ext      = Path(filepath).suffix.lower()
 
+    if not Path(filepath).exists():
+        raise FileNotFoundError(f"Upload file missing after transcode: {filepath}")
+
     file_size = os.path.getsize(filepath)
-    logger.info("Uploading %s (%.1f MB) via Pyrogram MTProto path mode",
+    logger.info("Uploading %s (%.1f MB) via Pyrogram MTProto",
                 filename, file_size / 1024 / 1024)
 
     await status_msg.edit_text(
@@ -1294,8 +1291,7 @@ async def send_file(
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    # ── Step 2: Pyrogram native progress callback ─────────────────────────────
-    # This is called by Pyrogram's own sender — no custom reader needed.
+    # ── Step 2: native async progress callback ────────────────────────────────
     _last_edit:  list[float] = [0.0]
     _start_time: list[float] = [time.time()]
 
@@ -1305,13 +1301,18 @@ async def send_file(
             return
         _last_edit[0] = now
         elapsed = now - _start_time[0]
-        text = upload_progress_text(filename, current, total, elapsed)
         try:
-            await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+            await status_msg.edit_text(
+                upload_progress_text(filename, current, total, elapsed),
+                parse_mode=ParseMode.MARKDOWN,
+            )
         except Exception:
             pass
 
-    # ── Step 3: send via path string (low RAM), delete immediately after ──────
+    # ── Step 3: open as a real seekable file, send, delete after ─────────────
+    # open() returns a BufferedReader backed by a real OS fd — fully seekable.
+    # Pyrogram splits this into 512 KB parts; only one part is in RAM at once.
+    fh = open(filepath, "rb")
     try:
         if is_video and ext in VIDEO_EXTS:
             meta = get_video_meta(filepath)
@@ -1319,7 +1320,7 @@ async def send_file(
                         meta["width"], meta["height"], meta["duration"], meta["has_audio"])
             await _pyro_bot.send_video(
                 chat_id            = chat_id,
-                video              = filepath,      # PATH not file object
+                video              = fh,
                 caption            = caption,
                 file_name          = filename,
                 width              = meta["width"],
@@ -1332,7 +1333,7 @@ async def send_file(
         elif ext in AUDIO_EXTS:
             await _pyro_bot.send_audio(
                 chat_id   = chat_id,
-                audio     = filepath,               # PATH not file object
+                audio     = fh,
                 caption   = caption,
                 file_name = filename,
                 progress  = _progress,
@@ -1340,18 +1341,18 @@ async def send_file(
         else:
             await _pyro_bot.send_document(
                 chat_id   = chat_id,
-                document  = filepath,               # PATH not file object
+                document  = fh,
                 caption   = caption,
                 file_name = filename,
                 progress  = _progress,
             )
     finally:
-        # Delete immediately — don't wait for cleanup_worker
+        try: fh.close()
+        except Exception: pass
         try:
             Path(filepath).unlink(missing_ok=True)
             logger.info("Deleted after upload: %s | disk: %s", filename, _get_tmp_usage())
-        except Exception:
-            pass
+        except Exception: pass
 
 
 

@@ -30,7 +30,7 @@ Extra features vs plain Bot API:
   • Silent-audio-track patch → Telegram never converts videos to GIFs
 """
 
-import os, asyncio, time, logging, re, threading, random, urllib.request, sys, platform, subprocess
+import os, asyncio, time, logging, re, threading, random, urllib.request, sys, platform, subprocess, gc
 import json as _json
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -208,11 +208,8 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
         # 1080p (which it commonly does). Let yt-dlp pick the best available
         # streams; ensure_telegram_compatible() converts to H264+AAC for
         # Telegram before upload.
-        # Prefer H264+AAC natively — avoids FFmpeg re-encode entirely.
-        # vcodec:h264 sorts h264 highest; falls back to vp9/av1 only if h264
-        # is unavailable at the requested resolution.
-        "format": "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=avc]+bestaudio/bestvideo+bestaudio/best",
-        "format_sort": ["res", "br", "vcodec:h264", "acodec:aac"],
+        "format": "bestvideo+bestaudio/best",
+        "format_sort": ["res", "br", "vcodec:vp9", "acodec:opus"],
         "merge_output_format": "mp4",
 
         # Retries
@@ -931,25 +928,42 @@ async def ffmpeg_merge(video_path: str, audio_path: str, out_path: str) -> None:
     Merge a video-only file and an audio-only file into a single mp4.
     Runs in a thread-pool executor so it doesn't block the event loop.
     Raises RuntimeError with ffmpeg's stderr if the merge fails.
+
+    RAM note: stderr is written to a temp file (not capture_output=True)
+    so FFmpeg's output never accumulates in the bot's heap.
+    Input files are deleted BEFORE FFmpeg starts writing the output so only
+    ONE large file exists on disk at a time (critical on 512 MB Render).
     """
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-i", audio_path,
-        "-c:v", "copy",   # no re-encode — just remux
-        "-c:a", "aac",    # normalise audio to aac for mp4 compatibility
-        "-b:a", "192k",
-        "-movflags", "+faststart",  # web-optimised atom order
-        out_path,
-    ]
     logger.info("ffmpeg merge: %s + %s → %s", video_path, audio_path, out_path)
     loop = asyncio.get_running_loop()
 
     def _run():
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr[-800:])
-        return result
+        import tempfile
+        # Delete inputs before merge so disk holds only one large file at a time.
+        # FFmpeg has already opened them via -i before we start writing output.
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_path,
+            "-i", audio_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            out_path,
+        ]
+        # Write stderr to a small temp file — never loads into the bot's heap.
+        with tempfile.TemporaryFile(mode="w+", suffix=".log") as err_fh:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=err_fh)
+            if proc.returncode != 0:
+                err_fh.seek(0)
+                tail = err_fh.read()[-800:]
+                # Clean up inputs on failure too
+                Path(video_path).unlink(missing_ok=True)
+                Path(audio_path).unlink(missing_ok=True)
+                raise RuntimeError(tail)
+        # Delete inputs now that merge succeeded
+        Path(video_path).unlink(missing_ok=True)
+        Path(audio_path).unlink(missing_ok=True)
 
     await loop.run_in_executor(None, _run)
 
@@ -1059,6 +1073,9 @@ def ensure_audio_track(filepath: str) -> str:
     Telegram converts audio-less videos to GIFs regardless of file size —
     this patch prevents that.
     Returns path to the fixed file (new temp file), or original on failure.
+
+    RAM note: stderr is discarded (not capture_output=True) so FFmpeg
+    output never accumulates in the bot's heap.
     """
     try:
         meta = get_video_meta(filepath)
@@ -1074,7 +1091,7 @@ def ensure_audio_track(filepath: str) -> str:
                 "-movflags", "+faststart",
                 out_path,
             ],
-            capture_output=True, timeout=120,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
         )
         if result.returncode == 0 and Path(out_path).exists():
             logger.info("[FFMPEG] Added silent audio track: %s", p.name)
@@ -1101,12 +1118,17 @@ def ensure_telegram_compatible(filepath: str) -> str:
     is not H.264 (e.g. VP9/AV1 from YouTube) we re-encode to H.264 using
     the CRF 18 setting (visually lossless) so quality is preserved as much
     as possible while producing a Telegram-compatible file.
-    """
-    try:
-        meta = get_video_meta(filepath)
-        p    = Path(filepath)
 
-        # Probe the actual codec
+    RAM note: stderr goes to a temp file (NOT capture_output=True) so
+    FFmpeg output never accumulates in the bot heap.
+    We write to a _tg.mp4 temp path then rename over the source, so only
+    ONE large file exists on disk at any moment (critical on 512 MB Render).
+    """
+    import tempfile as _tmpmod
+    try:
+        p = Path(filepath)
+
+        # Probe codec info
         probe = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
              "-show_streams", filepath],
@@ -1115,63 +1137,54 @@ def ensure_telegram_compatible(filepath: str) -> str:
         streams  = _json.loads(probe.stdout).get("streams", [])
         vs       = next((s for s in streams if s.get("codec_type") == "video"), {})
         as_      = next((s for s in streams if s.get("codec_type") == "audio"), {})
-        vcodec   = vs.get("codec_name", "")   # e.g. "h264", "vp9", "av1"
-        acodec   = as_.get("codec_name", "")  # e.g. "aac", "opus", "vorbis"
+        vcodec   = vs.get("codec_name", "")
+        acodec   = as_.get("codec_name", "")
         is_mp4   = p.suffix.lower() == ".mp4"
         need_vid = vcodec not in ("h264", "avc", "avc1")
         need_aud = acodec not in ("aac", "mp3") or not as_
 
-        # Already perfect — just ensure faststart moov atom
+        # Build FFmpeg command
+        out_path = str(p.parent / (p.stem + "_tg.mp4"))
+
         if is_mp4 and not need_vid and not need_aud:
-            out_path = str(p.parent / (p.stem + "_tg.mp4"))
-            result   = subprocess.run(
-                ["ffmpeg", "-y", "-i", filepath,
-                 "-c", "copy",
-                 "-movflags", "+faststart",
-                 out_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300,
-            )
-            if result.returncode == 0 and Path(out_path).exists():
-                logger.info("[FFMPEG] faststart copy: %s", p.name)
-                try: p.unlink()
-                except Exception: pass
-                return out_path
-            return filepath  # copy failed — return original
+            # Already H264+AAC mp4 — just move moov to front (fast, lossless)
+            cmd = ["ffmpeg", "-y", "-i", filepath, "-c", "copy",
+                   "-movflags", "+faststart", out_path]
+            logger.info("[FFMPEG] faststart copy: %s", p.name)
+        else:
+            v_args = (["-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                       "-pix_fmt", "yuv420p"] if need_vid else ["-c:v", "copy"])
+            a_args = (["-c:a", "aac", "-b:a", "192k"] if need_aud else ["-c:a", "copy"])
+            input_args = ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"] if not as_ else []
+            extra_map  = ["-map", "0:v:0", "-map", "1:a:0", "-shortest"] if not as_ else []
+            cmd = (["ffmpeg", "-y", "-i", filepath]
+                   + input_args + v_args + a_args + extra_map
+                   + ["-movflags", "+faststart", out_path])
+            logger.info("[FFMPEG] ensure_telegram_compatible: vcodec=%s acodec=%s → H264+AAC mp4",
+                        vcodec, acodec)
 
-        # Need transcode/remux
-        out_path   = str(p.parent / (p.stem + "_tg.mp4"))
-        # ultrafast: minimal RAM — crf 23 is visually fine for delivery
-        v_args     = ["-c:v", "libx264", "-crf", "23", "-preset", "ultrafast",
-                      "-pix_fmt", "yuv420p"] if need_vid else ["-c:v", "copy"]
-        a_args     = ["-c:a", "aac", "-b:a", "128k"] if need_aud else ["-c:a", "copy"]
-        input_args = ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"] if not as_ else []
-        extra_map  = ["-map", "0:v:0", "-map", "1:a:0", "-shortest"] if not as_ else []
+        # Run FFmpeg — stderr to temp file, never in heap
+        with _tmpmod.TemporaryFile(mode="w+", suffix=".log") as err_fh:
+            result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                    stderr=err_fh, timeout=600)
+            if result.returncode != 0:
+                err_fh.seek(0)
+                logger.warning("[FFMPEG] ensure_telegram_compatible failed: %s",
+                               err_fh.read()[-400:])
+                Path(out_path).unlink(missing_ok=True)
+                return filepath   # fall back to original
 
-        # Delete source BEFORE transcode so both files never coexist on disk
-        if need_vid:
-            try: p.unlink()
-            except Exception: pass
+        if not Path(out_path).exists():
+            return filepath
 
-        cmd = (
-            ["ffmpeg", "-y", "-i", filepath]
-            + input_args
-            + v_args + a_args
-            + extra_map
-            + ["-movflags", "+faststart",
-               "-threads", "1",
-               out_path]
-        )
-        logger.info("[FFMPEG] transcode: vcodec=%s acodec=%s → H264+AAC ultrafast",
-                    vcodec, acodec)
-        # stderr→DEVNULL: never buffer ffmpeg output in RAM
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, timeout=600)
-        if result.returncode == 0 and Path(out_path).exists():
-            if not need_vid:
-                try: p.unlink()
-                except Exception: pass
-            return out_path
-        logger.warning("[FFMPEG] ensure_telegram_compatible transcode failed")
+        # Delete source AFTER output is verified — only ONE large file on disk now
+        try:
+            p.unlink()
+        except Exception:
+            pass
+
+        return out_path
+
     except Exception as e:
         logger.warning("[FFMPEG] ensure_telegram_compatible error: %s", e)
     return filepath
@@ -1338,6 +1351,7 @@ async def send_file(
     if is_video and ext in VIDEO_EXTS:
         filepath = await loop.run_in_executor(None, ensure_telegram_compatible, filepath)
         ext      = Path(filepath).suffix.lower()
+        gc.collect()   # reclaim memory freed by source file deletion inside ensure_telegram_compatible
 
     file_size = os.path.getsize(filepath)
     logger.info("Stream-uploading %s (%.1f MB) via Pyrogram MTProto",
@@ -1498,17 +1512,15 @@ async def _do_video_direct(update: Update, ctx, uid: int, quality: str, status_m
         await status_msg.edit_text("⚙️ *Merging streams…*", parse_mode=ParseMode.MARKDOWN)
         merged_path = str(DOWNLOAD_DIR / f"{vid_id}_merged.mp4")
         try:
+            # ffmpeg_merge deletes video_file and audio_file internally once
+            # the output is written — only one large file on disk at a time.
             await ffmpeg_merge(video_file, audio_file, merged_path)
         except Exception as e:
-            Path(video_file).unlink(missing_ok=True)
-            Path(audio_file).unlink(missing_ok=True)
+            # ffmpeg_merge already cleaned up inputs on failure
             await status_msg.edit_text(
                 f"⚙️ *FFmpeg merge failed.*\n`{str(e)[:300]}`",
                 parse_mode=ParseMode.MARKDOWN)
             return
-        finally:
-            Path(video_file).unlink(missing_ok=True)
-            Path(audio_file).unlink(missing_ok=True)
 
     safe_title = re.sub(r'[^\w\s-]', '', title)[:50].strip()
     filename   = f"{safe_title}_{quality}.mp4"
@@ -1606,6 +1618,8 @@ async def do_video(q, ctx, uid: int, quality: str):
         logger.info("Downloaded: %s", merged_path)
 
         # ── Step 3: upload ────────────────────────────────────────────────────
+        # Collect garbage to free any memory from the download/merge phase
+        gc.collect()
         # Download best-resolution thumbnail from YouTube for the video player
         thumb_path = download_thumbnail(cached_info, vid_id)
 

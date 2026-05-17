@@ -1,9 +1,9 @@
 """
-Advanced Telegram YouTube Downloader Bot – No Quality Loss
-- Downloads best available video+audio (no codec restrictions)
-- Never re-encodes video (preserves original quality)
-- Non-H264 videos sent as documents (original bitstream)
-- Silent audio track added without re-encoding video
+Advanced Telegram YouTube Downloader Bot
+- Downloads best quality (VP9/AV1 allowed)
+- Re-encodes non-H264 videos to H.264 (CRF 18, visually lossless)
+- Sends as streaming video media (not document)
+- Memory-optimised for 512 MB servers
 """
 
 import os, asyncio, time, logging, re, threading, urllib.request, sys, platform, subprocess, gc
@@ -32,6 +32,9 @@ COOKIES_FILE      = "cookies.txt"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 BOT_START_TIME    = time.time()
 YTDL_PROXY        = os.environ.get("YTDL_PROXY", "")
+
+# Memory guard: skip re-encode for files larger than this (MB)
+MAX_ENCODE_SIZE_MB = int(os.environ.get("MAX_ENCODE_SIZE_MB", "800"))
 
 # ---------- Logging ----------
 logging.basicConfig(
@@ -85,14 +88,13 @@ def cookie_status() -> dict:
         return {"ok": False, "reason": "No youtube.com cookies"}
     return {"ok": True, "yt_lines": len(yt), "has_sapisid": any("SAPISID" in l for l in yt)}
 
-# ========== YT-DLP OPTIONS (no PO token, no codec restrictions) ==========
+# ========== YT-DLP OPTIONS (no codec restrictions) ==========
 def ydl_opts_base(use_cookies: bool = True) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
-        # NO codec restrictions – get absolute best video+audio
         "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "retries": 10,
@@ -178,7 +180,7 @@ def download_progress_text(label: str, pct: int, speed: str, eta: str, downloade
     tot = f" / `{total}`" if total and total != "?" else ""
     return f"⬇️ *Downloading* {label}\n`{bar}` {pct}%\n📦 `{downloaded}`{tot}\n⚡ `{speed}`  ⏱ `{eta}`"
 
-# ========== FFMPEG HELPERS (NO RE-ENCODING) ==========
+# ========== FFMPEG HELPERS ==========
 def get_video_meta(filepath: str) -> dict:
     try:
         result = subprocess.run(
@@ -201,51 +203,78 @@ def get_video_meta(filepath: str) -> dict:
     except Exception:
         return {"width": 0, "height": 0, "duration": 0, "has_audio": False, "vcodec": "", "acodec": ""}
 
-def ensure_telegram_compatible(filepath: str) -> str:
+def reencode_to_h264(filepath: str) -> str:
     """
-    ONLY add silent audio track (if missing) and move moov atom.
-    NEVER re-encode video. If video is not H.264, it will be sent as document later.
+    Re-encode video to H.264 + AAC in MP4 with high quality (CRF 18).
+    Only runs if file size <= MAX_ENCODE_SIZE_MB and codec is not already H.264.
+    Returns path to re-encoded file (deletes original on success).
     """
-    file_size = os.path.getsize(filepath)
-    if file_size > 500 * 1024 * 1024:
-        logger.info("File >500 MB – skipping ffmpeg, will send as document")
+    meta = get_video_meta(filepath)
+    vcodec = meta.get("vcodec", "")
+    # If already H.264 and in MP4, just return original
+    if vcodec in ("h264", "avc", "avc1") and Path(filepath).suffix.lower() == ".mp4":
+        return filepath
+
+    file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
+    if file_size_mb > MAX_ENCODE_SIZE_MB:
+        logger.warning("File %.1f MB > limit (%d MB), skipping re-encode – will send as document", 
+                       file_size_mb, MAX_ENCODE_SIZE_MB)
         return filepath
 
     p = Path(filepath)
-    meta = get_video_meta(filepath)
-    out_path = str(p.parent / (p.stem + "_tg.mp4"))
+    out_path = str(p.parent / (p.stem + "_h264.mp4"))
+    logger.info("Re-encoding %s (%s) to H.264 (CRF 18) – preserving quality", p.name, vcodec)
 
-    # If no audio, add silent track (copy video, encode audio only)
-    if not meta["has_audio"]:
-        cmd = [
-            "ffmpeg", "-y", "-threads", "1",
-            "-i", filepath,
-            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-            "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest",
-            "-movflags", "+faststart",
-            out_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
-        if result.returncode == 0 and Path(out_path).exists():
-            try: p.unlink()
-            except: pass
-            return out_path
-        logger.warning("Failed to add silent audio: %s", result.stderr[:200])
+    # Re-encode video, copy audio or re-encode to AAC if needed
+    cmd = [
+        "ffmpeg", "-y", "-threads", "1",
+        "-i", filepath,
+        "-c:v", "libx264", "-crf", "18", "-preset", "fast",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "192k",
+        "-movflags", "+faststart",
+        out_path
+    ]
+    # If audio already AAC, stream copy to save time
+    if meta.get("acodec", "") in ("aac", "mp3"):
+        # Replace the audio encoder line with copy
+        cmd[12:13] = ["-c:a", "copy"]
+
+    result = subprocess.run(cmd, capture_output=True, timeout=600)
+    if result.returncode == 0 and Path(out_path).exists():
+        try: p.unlink()
+        except: pass
+        logger.info("Re-encode successful: %s", out_path)
+        return out_path
+    else:
+        logger.warning("Re-encode failed: %s", result.stderr[:200])
         return filepath
 
-    # Already has audio: ensure faststart (stream copy) – this is lossless
-    cmd = ["ffmpeg", "-y", "-threads", "1", "-i", filepath, "-c", "copy", "-movflags", "+faststart", out_path]
-    result = subprocess.run(cmd, capture_output=True, timeout=60)
+def add_silent_audio_if_needed(filepath: str) -> str:
+    """Add silent audio track if video has no audio (stream copy)."""
+    meta = get_video_meta(filepath)
+    if meta.get("has_audio", True):
+        return filepath
+    p = Path(filepath)
+    out_path = str(p.parent / (p.stem + "_audio.mp4"))
+    cmd = [
+        "ffmpeg", "-y", "-threads", "1",
+        "-i", filepath,
+        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+        "-c:v", "copy",
+        "-c:a", "aac", "-b:a", "128k",
+        "-shortest",
+        "-movflags", "+faststart",
+        out_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, timeout=120)
     if result.returncode == 0 and Path(out_path).exists():
         try: p.unlink()
         except: pass
         return out_path
-
     return filepath
 
-# ========== UPLOAD (direct file path – Pyrogram streams internally) ==========
+# ========== UPLOAD ==========
 async def send_file(
     chat_id: int,
     filepath: str,
@@ -262,31 +291,13 @@ async def send_file(
     VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv"}
     AUDIO_EXTS = {".mp3", ".m4a", ".ogg", ".flac", ".wav", ".aac"}
 
-    file_size = os.path.getsize(filepath)
-    meta = get_video_meta(filepath) if is_video else {}
-    vcodec = meta.get("vcodec", "")
-    is_h264 = vcodec in ("h264", "avc", "avc1")
-
-    # Decide to send as document:
-    # 1. File > 500 MB
-    # 2. Not a recognised video extension
-    # 3. Video codec is not H.264 (to avoid Telegram re-encoding which damages quality)
-    send_as_doc = False
-    if file_size > 500 * 1024 * 1024:
-        send_as_doc = True
-    elif is_video and ext not in VIDEO_EXTS:
-        send_as_doc = True
-    elif is_video and not is_h264:
-        logger.info("Video codec is %s – sending as document to preserve quality", vcodec)
-        send_as_doc = True
-    elif not is_video and ext not in AUDIO_EXTS:
-        send_as_doc = True
-
-    # Apply compatibility only if sending as video and not as doc
-    if is_video and not send_as_doc:
-        filepath = await loop.run_in_executor(None, ensure_telegram_compatible, filepath)
+    # Prepare video for Telegram media (silent audio, re-encode to H.264)
+    if is_video and ext in VIDEO_EXTS:
+        filepath = await loop.run_in_executor(None, add_silent_audio_if_needed, filepath)
+        filepath = await loop.run_in_executor(None, reencode_to_h264, filepath)
         ext = Path(filepath).suffix.lower()
 
+    file_size = os.path.getsize(filepath)
     _last_edit = [0.0]
     _start = [time.time()]
 
@@ -301,10 +312,8 @@ async def send_file(
     await status_msg.edit_text(f"📤 *Preparing upload* `{filename}` ({human_size(file_size)})…", parse_mode=ParseMode.MARKDOWN)
 
     try:
-        if send_as_doc:
+        if not is_video or ext not in VIDEO_EXTS:
             await _pyro_bot.send_document(chat_id, filepath, caption=caption, file_name=filename, progress=progress_cb)
-        elif ext in AUDIO_EXTS:
-            await _pyro_bot.send_audio(chat_id, filepath, caption=caption, file_name=filename, progress=progress_cb)
         else:
             meta = get_video_meta(filepath)
             await _pyro_bot.send_video(
@@ -313,7 +322,6 @@ async def send_file(
                 supports_streaming=True, thumb=thumb_path, progress=progress_cb,
             )
     finally:
-        # Delete file after upload
         try:
             Path(filepath).unlink(missing_ok=True)
         except:
@@ -323,7 +331,7 @@ async def send_file(
         gc.collect()
         logger.info("Upload finished, file deleted: %s", filename)
 
-# ========== DOWNLOAD CORE (subprocess, low memory) ==========
+# ========== DOWNLOAD CORE ==========
 async def do_download_subprocess(
     url: str,
     fmt: str,
@@ -613,12 +621,10 @@ async def do_video(q, ctx, uid: int, quality: str):
         vid_id = info.get("id", "unknown")
         title = info.get("title", vid_id)[:50]
 
-        # Build format selector – NO codec restrictions, get best available
         if quality == "best":
             fmt = "bestvideo+bestaudio/best"
         else:
             target_h = {"360p":360, "480p":480, "720p":720, "1080p":1080, "1440p":1440, "2160p":2160}.get(quality, 1080)
-            # Use height cap but no codec filtering
             fmt = f"bestvideo[height<={target_h}]+bestaudio/best[height<={target_h}]/bestvideo+bestaudio/best"
 
         status = await q.message.edit_text(f"⬇️ *Downloading ({quality})…*", parse_mode=ParseMode.MARKDOWN)
@@ -629,7 +635,6 @@ async def do_video(q, ctx, uid: int, quality: str):
             await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
             return
 
-        # Find downloaded file
         found = sorted(DOWNLOAD_DIR.glob(f"{vid_id}_{quality}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not found:
             await status.edit_text("❌ No output file found after download.")
@@ -665,7 +670,6 @@ async def do_video(q, ctx, uid: int, quality: str):
         finally:
             if thumb_path:
                 Path(thumb_path).unlink(missing_ok=True)
-            # merged_path is deleted inside send_file
 
 # ========== AUDIO DOWNLOAD ==========
 async def do_audio(q, ctx, uid: int):
@@ -693,7 +697,6 @@ async def do_audio(q, ctx, uid: int):
             await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
             return
 
-        # Find mp3 file
         files = sorted(DOWNLOAD_DIR.glob("*.mp3"), key=lambda f: f.stat().st_mtime, reverse=True)
         if not files:
             await status.edit_text("❌ Audio file not found.")

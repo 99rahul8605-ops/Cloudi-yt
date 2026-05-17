@@ -407,21 +407,22 @@ async def do_download(url: str, extra_opts: dict, progress_cb) -> dict:
     return await loop.run_in_executor(None, _run)
 
 
-def build_progress_hook(loop, status_msg, _cid, _bot):
+def build_progress_hook(loop, status_msg, _cid, _bot, label: str = ""):
     last = [0.0]
     def hook(d):
         if d["status"] != "downloading": return
         now = time.time()
         if now - last[0] < 3: return
         last[0] = now
-        pct   = d.get("_percent_str",  "?%").strip()
+        pct   = d.get("_percent_str",  "0%").strip()
         speed = d.get("_speed_str",    "?").strip()
         eta   = d.get("_eta_str",      "?").strip()
+        down  = d.get("_downloaded_bytes_str", "?").strip()
+        total = d.get("_total_bytes_str") or d.get("_total_bytes_estimate_str") or "?"
+        total = total.strip() if isinstance(total, str) else "?"
+        text  = download_progress_text(label, pct, speed, eta, down, total)
         asyncio.run_coroutine_threadsafe(
-            status_msg.edit_text(
-                f"⬇️ *Downloading…*\n`{pct}` | 🚀 `{speed}` | ⏱ ETA `{eta}`",
-                parse_mode=ParseMode.MARKDOWN,
-            ), loop)
+            status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN), loop)
     return hook
 
 
@@ -862,12 +863,55 @@ def human_size(b: int) -> str:
     return f"{b / 1024 ** 3:.2f} GB"
 
 
-def upload_bar(current: int, total: int) -> str:
-    """20-block progress bar with % and transferred/total."""
-    pct    = min(int(current * 100 / total), 100) if total else 0
-    filled = pct // 5
-    bar    = "█" * filled + "░" * (20 - filled)
-    return f"{bar} {pct}%\n📤 {human_size(current)} / {human_size(total)}"
+def _progress_bar(pct: int, width: int = 16) -> str:
+    filled = round(pct * width / 100)
+    return "█" * filled + "░" * (width - filled)
+
+def _eta_str(seconds: float) -> str:
+    if seconds < 0: return "?"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h:   return f"{h}h {m}m"
+    if m:   return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+def _speed_str(bps: float) -> str:
+    if bps <= 0: return "?"
+    if bps >= 1024**3: return f"{bps/1024**3:.1f} GB/s"
+    if bps >= 1024**2: return f"{bps/1024**2:.1f} MB/s"
+    return f"{bps/1024:.0f} KB/s"
+
+def upload_progress_text(filename: str, current: int, total: int, elapsed: float) -> str:
+    """Rich upload progress message."""
+    pct     = min(int(current * 100 / total), 100) if total else 0
+    bar     = _progress_bar(pct)
+    done    = human_size(current)
+    tot     = human_size(total)
+    spd     = _speed_str(current / elapsed if elapsed > 0 else 0)
+    eta_sec = ((total - current) / (current / elapsed)) if current > 0 and elapsed > 0 else -1
+    eta     = _eta_str(eta_sec)
+    return "\n".join([
+        f"📤 *Uploading* `{filename}`",
+        f"`{bar}` {pct}%",
+        f"📦 `{done}` / `{tot}`",
+        f"⚡ `{spd}`  ⏱ `{eta}`",
+    ])
+
+def download_progress_text(label: str, pct_str: str, speed_str: str,
+                            eta_str: str, downloaded: str, total: str) -> str:
+    """Rich download progress message."""
+    try:
+        pct = int(float(pct_str.replace("%", "").strip()))
+    except Exception:
+        pct = 0
+    bar = _progress_bar(pct)
+    tot = f" / `{total}`" if total and total != "?" else ""
+    return "\n".join([
+        f"⬇️ *Downloading* {label}",
+        f"`{bar}` {pct}%",
+        f"📦 `{downloaded}`{tot}",
+        f"⚡ `{speed_str}`  ⏱ `{eta_str}`",
+    ])
 
 
 def get_video_meta(filepath: str) -> dict:
@@ -1008,6 +1052,41 @@ def ensure_telegram_compatible(filepath: str) -> str:
     return filepath
 
 
+def download_thumbnail(info: dict, vid_id: str) -> str | None:
+    """
+    Download the best available YouTube thumbnail to a local JPEG file.
+    Returns the file path, or None on failure.
+    Tries the highest-resolution thumbnail first (maxresdefault → hqdefault).
+    """
+    # yt-dlp exposes a ranked list in info["thumbnails"] (best last)
+    thumbnails = info.get("thumbnails") or []
+    # Sort by preference (width desc), then fall back to info["thumbnail"]
+    candidates = sorted(
+        [t for t in thumbnails if t.get("url")],
+        key=lambda t: (t.get("width") or 0),
+        reverse=True,
+    )
+    urls = [t["url"] for t in candidates]
+    if not urls:
+        fallback = info.get("thumbnail")
+        if fallback:
+            urls = [fallback]
+    if not urls:
+        return None
+
+    out_path = str(DOWNLOAD_DIR / f"{vid_id}_thumb.jpg")
+    for url in urls:
+        try:
+            urllib.request.urlretrieve(url, out_path)
+            if Path(out_path).stat().st_size > 1000:   # skip tiny/broken images
+                logger.info("Thumbnail saved: %s (%d bytes)", out_path,
+                            Path(out_path).stat().st_size)
+                return out_path
+        except Exception as e:
+            logger.debug("Thumbnail attempt failed (%s): %s", url[:60], e)
+    return None
+
+
 async def start_pyro_bot() -> None:
     """Create and start the Pyrogram bot client (called from post_init)."""
     global _pyro_bot
@@ -1040,21 +1119,23 @@ async def stop_pyro_bot() -> None:
 
 # ─── Unified upload helper ────────────────────────────────────────────────────
 async def send_file(
-    chat_id:    int,
-    filepath:   str,
-    filename:   str,
-    caption:    str,
+    chat_id:       int,
+    filepath:      str,
+    filename:      str,
+    caption:       str,
     status_msg,
-    is_video:   bool = True,
+    is_video:      bool = True,
+    thumb_path:    str | None = None,
 ) -> None:
     """
     Upload a merged video (or audio) file via Pyrogram MTProto.
 
-    Features (ported from reference upload bot):
-      • Live upload progress bar — updates every 3 s
+    Features:
+      • Rich upload progress bar — updates every 3 s (speed, ETA, bytes)
       • ffprobe injects width / height / duration → Telegram shows correctly
-      • ensure_audio_track() patches audio-less videos → never rendered as GIF
-      • Audio files routed through send_audio; anything else as send_document
+      • ensure_telegram_compatible() pre-muxes to H264+AAC — Telegram skips
+        server-side transcoding, preserving original quality
+      • thumb_path: local JPEG thumbnail shown in Telegram video player
       • 2 GB limit (Pyrogram MTProto, no Bot API restriction)
     """
     if _pyro_bot is None or not _pyro_bot.is_connected:
@@ -1069,23 +1150,22 @@ async def send_file(
 
     # ── Progress callback ─────────────────────────────────────────────────────
     _last_edit: list[float] = [0.0]
+    _start_time: list[float] = [time.time()]
 
     async def _progress(current: int, total: int) -> None:
         now = time.time()
         if now - _last_edit[0] < 3:
             return
         _last_edit[0] = now
+        elapsed = now - _start_time[0]
         try:
-            line = upload_bar(current, total)
-            await status_msg.edit_text(
-                f"📤 *{filename}*\n{line}",
-                parse_mode=ParseMode.MARKDOWN,
-            )
+            text = upload_progress_text(filename, current, total, elapsed)
+            await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
         except Exception:
             pass
 
     await status_msg.edit_text(
-        f"📤 *Uploading ({human_size(file_size)})…*",
+        f"📤 *Uploading* `{filename}` *({human_size(file_size)})*…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -1116,6 +1196,7 @@ async def send_file(
             height             = meta["height"],
             duration           = meta["duration"],
             supports_streaming = True,
+            thumb              = thumb_path,
             progress           = _progress,
         )
 
@@ -1187,16 +1268,16 @@ async def _do_video_direct(update: Update, ctx, uid: int, quality: str, status_m
             now = time.time()
             if now - last[0] < 3: return
             last[0] = now
-            pct   = d.get("_percent_str", "?%").strip()
-            speed = d.get("_speed_str",   "?").strip()
-            eta   = d.get("_eta_str",     "?").strip()
-            label = "🎬 video" if suffix == "video" else "🔊 audio"
+            pct   = d.get("_percent_str",  "0%").strip()
+            speed = d.get("_speed_str",    "?").strip()
+            eta   = d.get("_eta_str",      "?").strip()
+            down  = d.get("_downloaded_bytes_str", "?").strip()
+            total = d.get("_total_bytes_str") or d.get("_total_bytes_estimate_str") or "?"
+            total = total.strip() if isinstance(total, str) else "?"
+            lbl   = "🎬 video" if suffix == "video" else "🔊 audio"
+            text  = download_progress_text(f"{lbl} *{quality}*", pct, speed, eta, down, total)
             asyncio.run_coroutine_threadsafe(
-                status_msg.edit_text(
-                    f"⬇️ *Downloading {label} stream ({quality})…*\n"
-                    f"`{pct}` at `{speed}` — ETA `{eta}`",
-                    parse_mode=ParseMode.MARKDOWN,
-                ), loop)
+                status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN), loop)
         opts["progress_hooks"] = [hook]
         with YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
@@ -1251,6 +1332,10 @@ async def _do_video_direct(update: Update, ctx, uid: int, quality: str, status_m
     caption    = f"🎬 *{title}*\n🎞 Quality: `{quality}`"
     s          = get_settings(uid)
 
+    thumb_path = download_thumbnail(cached_info, vid_id)
+    if thumb_path:
+        register_for_cleanup(thumb_path, s["cleanup_minutes"])
+
     try:
         await send_file(
             chat_id    = update.effective_chat.id,
@@ -1259,6 +1344,7 @@ async def _do_video_direct(update: Update, ctx, uid: int, quality: str, status_m
             caption    = caption,
             status_msg = status_msg,
             is_video   = True,
+            thumb_path = thumb_path,
         )
     except Exception as e:
         await status_msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
@@ -1310,15 +1396,15 @@ async def do_video(q, ctx, uid: int, quality: str):
             now = time.time()
             if now - last[0] < 3: return
             last[0] = now
-            pct   = d.get("_percent_str", "?%").strip()
-            speed = d.get("_speed_str",   "?").strip()
-            eta   = d.get("_eta_str",     "?").strip()
+            pct   = d.get("_percent_str",  "0%").strip()
+            speed = d.get("_speed_str",    "?").strip()
+            eta   = d.get("_eta_str",      "?").strip()
+            down  = d.get("_downloaded_bytes_str", "?").strip()
+            total = d.get("_total_bytes_str") or d.get("_total_bytes_estimate_str") or "?"
+            total = total.strip() if isinstance(total, str) else "?"
+            text  = download_progress_text(f"*{quality}*", pct, speed, eta, down, total)
             asyncio.run_coroutine_threadsafe(
-                status.edit_text(
-                    f"⬇️ *Downloading ({quality})…*\n"
-                    f"`{pct}` at `{speed}` — ETA `{eta}`",
-                    parse_mode=ParseMode.MARKDOWN,
-                ), loop)
+                status.edit_text(text, parse_mode=ParseMode.MARKDOWN), loop)
 
         opts = {
             **base_opts,
@@ -1361,15 +1447,21 @@ async def do_video(q, ctx, uid: int, quality: str):
         return
 
     # ── Step 3: upload ────────────────────────────────────────────────────
+    # Download best-resolution thumbnail from YouTube for the video player
+    thumb_path = download_thumbnail(cached_info, vid_id)
+    if thumb_path:
+        register_for_cleanup(thumb_path, get_settings(uid)["cleanup_minutes"])
+
     await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
     try:
         await send_file(
-            chat_id  = q.message.chat_id,
-            filepath = merged_path,
-            filename = f"{title}.mp4",
-            caption  = f"🎬 {title} [{quality}]",
+            chat_id    = q.message.chat_id,
+            filepath   = merged_path,
+            filename   = f"{title}.mp4",
+            caption    = f"🎬 {title} [{quality}]",
             status_msg = status,
-            is_video = True,
+            is_video   = True,
+            thumb_path = thumb_path,
         )
         await status.delete()
     except Exception as e:

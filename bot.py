@@ -22,7 +22,7 @@ Bot API 50 MB restriction.  Only two env vars needed (no user session):
 
 requirements.txt additions:
   pyrogram
-  tgcrypto        ← C extension for fast MTProto encryption (strongly recommended)
+  tgcrypto         ← C extension for fast MTProto encryption (strongly recommended)
 
 Extra features vs plain Bot API:
   • Live upload progress bar (updates every 3 s)
@@ -30,7 +30,7 @@ Extra features vs plain Bot API:
   • Silent-audio-track patch → Telegram never converts videos to GIFs
 """
 
-import os, asyncio, time, logging, re, threading, random, urllib.request, sys, platform, subprocess, gc
+import os, asyncio, time, logging, re, threading, random, urllib.request, sys, platform, subprocess
 import json as _json
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -275,63 +275,6 @@ def get_settings(uid: int) -> dict:
     return user_settings[uid]
 
 
-def pick_best_formats(formats: list, quality: str) -> tuple[str, str]:
-    """
-    Return yt-dlp FORMAT SELECTOR STRINGS (not raw format IDs).
-
-    Using selector strings instead of format IDs avoids the
-    "Requested format is not available" error that occurs when:
-      - Info was extracted with one client (ios/android) but download
-        uses a different client session with different format IDs.
-      - Format IDs are session-scoped and can change between requests.
-
-    Returns (video_selector, audio_selector) where each is a valid
-    yt-dlp -f string. The caller passes these directly to yt-dlp's
-    "format" option.
-    """
-    target_h = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080,
-                "1440p": 1440, "2160p": 2160, "4k": 2160}.get(quality)
-
-    # Count buckets just for logging
-    video_only = [f for f in formats
-                  if (f.get("vcodec") or "none") != "none"
-                  and (f.get("acodec") or "none") == "none"]
-    audio_only = [f for f in formats
-                  if (f.get("acodec") or "none") != "none"
-                  and (f.get("vcodec") or "none") == "none"]
-    muxed      = [f for f in formats
-                  if (f.get("vcodec") or "none") != "none"
-                  and (f.get("acodec") or "none") != "none"]
-
-    logger.info(
-        "Format buckets — video-only: %d  audio-only: %d  muxed: %d",
-        len(video_only), len(audio_only), len(muxed),
-    )
-    if not video_only and muxed:
-        logger.warning(
-            "⚠️ No adaptive streams — only %d muxed format(s). Max quality: 360p.",
-            len(muxed),
-        )
-
-    if not target_h or quality == "best":
-        vid_sel = "bestvideo"
-        aud_sel = "bestaudio"
-        logger.info("Selector: %s + %s", vid_sel, aud_sel)
-        return vid_sel, aud_sel
-
-    # No codec/ext constraints — yt-dlp subprocess uses --postprocessor-args to output H264+AAC.
-    vid_sel = f"bestvideo[height<={target_h}]/bestvideo"
-    aud_sel = "bestaudio"
-
-    logger.info("Selector for %s: video=%s  audio=%s", quality, vid_sel, aud_sel)
-    return vid_sel, aud_sel
-
-
-def quality_opts(q: str) -> dict:
-    """Fallback selector used only when we have no cached format list."""
-    return {"format": "bestvideo*+bestaudio*/best", "merge_output_format": "mp4"}
-
-
 def register_for_cleanup(path: str, minutes: int):
     cleanup_registry[path] = 0.0 if minutes == 0 else time.time() + minutes * 60
 
@@ -344,9 +287,6 @@ def friendly_error(e: Exception) -> str:
     msg = str(e).lower()
     logger.warning("Download error (raw): %s", str(e)[:300])
 
-    # ── Check most-specific patterns first ────────────────────────────────────
-    # "Requested format is not available" contains "not available", so this
-    # check MUST come before the generic "unavailable"/"not available" guard.
     if "requested format" in msg:
         return (
             "❌ *Format not available.*\n"
@@ -400,7 +340,6 @@ async def extract_info(url: str, download: bool = False,
     return await loop.run_in_executor(None, _run)
 
 
-
 async def do_download_subprocess(
     url: str,
     fmt: str,
@@ -424,10 +363,6 @@ async def do_download_subprocess(
                 "--newline",          # one progress line per chunk — parseable
                 "--progress",
                 "--no-warnings",
-                # Force H264+AAC output so Telegram skips server-side re-encode.
-                # Without this yt-dlp stream-copies VP9/AV1 into mp4 which Telegram
-                # transcodes server-side (quality loss + upload wasted).
-                "--postprocessor-args", "ffmpeg:-c:v libx264 -crf 18 -preset fast -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart",
     ]
 
     # Pass cookies if available
@@ -458,7 +393,7 @@ async def do_download_subprocess(
         _proc[0] = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,  # discard FFmpeg encode log (thousands of lines)
+            stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
         )
@@ -495,24 +430,12 @@ async def do_download_subprocess(
     if rc != 0:
         raise RuntimeError(f"yt-dlp exited with code {rc} for {url}")
 
-
-def build_progress_hook(loop, status_msg, _cid, _bot, label: str = ""):
-    last = [0.0]
-    def hook(d):
-        if d["status"] != "downloading": return
-        now = time.time()
-        if now - last[0] < 3: return
-        last[0] = now
-        pct   = d.get("_percent_str",  "0%").strip()
-        speed = d.get("_speed_str",    "?").strip()
-        eta   = d.get("_eta_str",      "?").strip()
-        down  = d.get("_downloaded_bytes_str", "?").strip()
-        total = d.get("_total_bytes_str") or d.get("_total_bytes_estimate_str") or "?"
-        total = total.strip() if isinstance(total, str) else "?"
-        text  = download_progress_text(label, pct, speed, eta, down, total)
-        asyncio.run_coroutine_threadsafe(
-            status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN), loop)
-    return hook
+    # Find the actual file written (yt-dlp may add extensions)
+    pattern = Path(out_path).stem + ".*"
+    candidates = sorted(DOWNLOAD_DIR.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError(f"No output file found for pattern {pattern}")
+    return str(candidates[0])
 
 
 # ── Background cleanup ────────────────────────────────────────────────────────
@@ -799,7 +722,6 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_search(update, ctx, text)
 
 
-
 async def handle_youtube_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
     msg = await update.message.reply_text("🔍 Fetching video info…")
     try:
@@ -914,46 +836,25 @@ async def ffmpeg_merge(video_path: str, audio_path: str, out_path: str) -> None:
     Merge a video-only file and an audio-only file into a single mp4.
     Runs in a thread-pool executor so it doesn't block the event loop.
     Raises RuntimeError with ffmpeg's stderr if the merge fails.
-
-    RAM note: stderr is written to a temp file (not capture_output=True)
-    so FFmpeg's output never accumulates in the bot's heap.
-    Input files are deleted BEFORE FFmpeg starts writing the output so only
-    ONE large file exists on disk at a time (critical on 512 MB Render).
     """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-c:v", "copy",   # no re-encode — just remux
+        "-c:a", "aac",    # normalise audio to aac for mp4 compatibility
+        "-b:a", "192k",
+        "-movflags", "+faststart",  # web-optimised atom order
+        out_path,
+    ]
     logger.info("ffmpeg merge: %s + %s → %s", video_path, audio_path, out_path)
     loop = asyncio.get_running_loop()
 
     def _run():
-        import tempfile
-        # Delete inputs before merge so disk holds only one large file at a time.
-        # FFmpeg has already opened them via -i before we start writing output.
-        # Encode to H264+AAC — Telegram skips server-side transcode for H264+AAC mp4,
-        # serving the original bitstream at full quality. VP9/AV1 stream-copy into
-        # mp4 causes Telegram server transcode (quality loss). libx264 crf 18 is
-        # visually lossless. This also means ensure_telegram_compatible() is never
-        # needed after merge, saving another full file copy before upload.
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", video_path,
-            "-i", audio_path,
-            "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart",
-            out_path,
-        ]
-        # Write stderr to a small temp file — never loads into the bot's heap.
-        with tempfile.TemporaryFile(mode="w+", suffix=".log") as err_fh:
-            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=err_fh)
-            if proc.returncode != 0:
-                err_fh.seek(0)
-                tail = err_fh.read()[-800:]
-                # Clean up inputs on failure too
-                Path(video_path).unlink(missing_ok=True)
-                Path(audio_path).unlink(missing_ok=True)
-                raise RuntimeError(tail)
-        # Delete inputs now that merge succeeded
-        Path(video_path).unlink(missing_ok=True)
-        Path(audio_path).unlink(missing_ok=True)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[-800:])
+        return result
 
     await loop.run_in_executor(None, _run)
 
@@ -1063,9 +964,6 @@ def ensure_audio_track(filepath: str) -> str:
     Telegram converts audio-less videos to GIFs regardless of file size —
     this patch prevents that.
     Returns path to the fixed file (new temp file), or original on failure.
-
-    RAM note: stderr is discarded (not capture_output=True) so FFmpeg
-    output never accumulates in the bot's heap.
     """
     try:
         meta = get_video_meta(filepath)
@@ -1081,7 +979,7 @@ def ensure_audio_track(filepath: str) -> str:
                 "-movflags", "+faststart",
                 out_path,
             ],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+            capture_output=True, timeout=120,
         )
         if result.returncode == 0 and Path(out_path).exists():
             logger.info("[FFMPEG] Added silent audio track: %s", p.name)
@@ -1093,16 +991,98 @@ def ensure_audio_track(filepath: str) -> str:
     return filepath
 
 
+def ensure_telegram_compatible(filepath: str) -> str:
+    """
+    Re-mux the video into a Telegram-safe mp4 so Telegram skips its
+    server-side transcoder and serves the original bitstream at full quality.
 
-def download_thumbnail(info: dict, vid_id: str) -> str | None:
+    Telegram will NOT re-encode a video when ALL of these are true:
+      • Container : mp4 (not mkv/webm/mov)
+      • Video codec: H.264 (avc1)
+      • Audio codec: AAC
+      • moov atom  : at the front of the file (-movflags +faststart)
+
+    Strategy — stream-copy first (instant, lossless).  If the video stream
+    is not H.264 (e.g. VP9/AV1 from YouTube) we re-encode to H.264 using
+    the CRF 18 setting (visually lossless) so quality is preserved as much
+    as possible while producing a Telegram-compatible file.
+    """
+    try:
+        meta = get_video_meta(filepath)
+        p    = Path(filepath)
+
+        # Probe the actual codec
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", filepath],
+            capture_output=True, text=True, timeout=15,
+        )
+        streams  = _json.loads(probe.stdout).get("streams", [])
+        vs       = next((s for s in streams if s.get("codec_type") == "video"), {})
+        as_      = next((s for s in streams if s.get("codec_type") == "audio"), {})
+        vcodec   = vs.get("codec_name", "")   # e.g. "h264", "vp9", "av1"
+        acodec   = as_.get("codec_name", "")  # e.g. "aac", "opus", "vorbis"
+        is_mp4   = p.suffix.lower() == ".mp4"
+        need_vid = vcodec not in ("h264", "avc", "avc1")
+        need_aud = acodec not in ("aac", "mp3") or not as_
+
+        # Already perfect — just ensure faststart moov atom
+        if is_mp4 and not need_vid and not need_aud:
+            out_path = str(p.parent / (p.stem + "_tg.mp4"))
+            result   = subprocess.run(
+                ["ffmpeg", "-y", "-i", filepath,
+                 "-c", "copy",
+                 "-movflags", "+faststart",
+                 out_path],
+                capture_output=True, timeout=300,
+            )
+            if result.returncode == 0 and Path(out_path).exists():
+                logger.info("[FFMPEG] faststart copy: %s", p.name)
+                try: p.unlink()
+                except Exception: pass
+                return out_path
+            return filepath  # copy failed — return original
+
+        # Need transcode/remux
+        out_path   = str(p.parent / (p.stem + "_tg.mp4"))
+        v_args     = ["-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                      "-pix_fmt", "yuv420p"] if need_vid else ["-c:v", "copy"]
+        a_args     = ["-c:a", "aac", "-b:a", "192k"] if need_aud else ["-c:a", "copy"]
+        # Add silent audio if no audio stream at all
+        input_args = ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"] if not as_ else []
+        extra_map  = ["-map", "0:v:0", "-map", "1:a:0", "-shortest"] if not as_ else []
+
+        cmd = (
+            ["ffmpeg", "-y", "-i", filepath]
+            + input_args
+            + v_args + a_args
+            + extra_map
+            + ["-movflags", "+faststart", out_path]
+        )
+        logger.info("[FFMPEG] ensure_telegram_compatible: vcodec=%s acodec=%s → H264+AAC mp4",
+                    vcodec, acodec)
+        # Delete source before transcode if re-encoding — avoids holding both
+        # the source and output on disk simultaneously (saves ~2× file size in RAM/disk)
+        src_to_delete = filepath if need_vid else None
+        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        if result.returncode == 0 and Path(out_path).exists():
+            try: p.unlink()
+            except Exception: pass
+            return out_path
+        logger.warning("[FFMPEG] ensure_telegram_compatible failed: %s",
+                       result.stderr[-400:] if result.stderr else "unknown")
+    except Exception as e:
+        logger.warning("[FFMPEG] ensure_telegram_compatible error: %s", e)
+    return filepath
+
+
+async def download_thumbnail(info: dict, vid_id: str) -> str | None:
     """
     Download the best available YouTube thumbnail to a local JPEG file.
     Returns the file path, or None on failure.
-    Tries the highest-resolution thumbnail first (maxresdefault → hqdefault).
+    Runs in a thread to avoid blocking the event loop.
     """
-    # yt-dlp exposes a ranked list in info["thumbnails"] (best last)
     thumbnails = info.get("thumbnails") or []
-    # Sort by preference (width desc), then fall back to info["thumbnail"]
     candidates = sorted(
         [t for t in thumbnails if t.get("url")],
         key=lambda t: (t.get("width") or 0),
@@ -1117,16 +1097,19 @@ def download_thumbnail(info: dict, vid_id: str) -> str | None:
         return None
 
     out_path = str(DOWNLOAD_DIR / f"{vid_id}_thumb.jpg")
-    for url in urls:
-        try:
-            urllib.request.urlretrieve(url, out_path)
-            if Path(out_path).stat().st_size > 1000:   # skip tiny/broken images
-                logger.info("Thumbnail saved: %s (%d bytes)", out_path,
-                            Path(out_path).stat().st_size)
-                return out_path
-        except Exception as e:
-            logger.debug("Thumbnail attempt failed (%s): %s", url[:60], e)
-    return None
+    loop = asyncio.get_running_loop()
+
+    def _fetch():
+        for url in urls:
+            try:
+                urllib.request.urlretrieve(url, out_path)
+                if Path(out_path).stat().st_size > 1000:
+                    return out_path
+            except Exception:
+                continue
+        return None
+
+    return await loop.run_in_executor(None, _fetch)
 
 
 async def start_pyro_bot() -> None:
@@ -1159,6 +1142,68 @@ async def stop_pyro_bot() -> None:
         logger.info("Pyrogram client stopped.")
 
 
+# ─── Streaming file reader ────────────────────────────────────────────────────
+import io as _io
+
+class _StreamingFileReader(_io.RawIOBase):
+    """
+    Reads a disk file in 4 MB chunks and deletes it when fully consumed.
+    Passed directly to Pyrogram — the file is NEVER fully loaded into RAM.
+    Pyrogram reads chunk → sends over MTProto → chunk is freed immediately.
+    .close() deletes the file the moment upload finishes or fails.
+    """
+    def __init__(self, filepath: str, filename: str, on_progress=None):
+        self._path        = filepath
+        self._name        = filename
+        self._fh          = open(filepath, "rb")
+        self._size        = os.path.getsize(filepath)
+        self._read_so_far = 0
+        self._on_progress = on_progress
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: bytearray) -> int:
+        chunk = self._fh.read(len(b))
+        if not chunk:
+            return 0                    # EOF → Pyrogram finishes upload
+        n = len(chunk)
+        b[:n] = chunk
+        self._read_so_far += n
+        if self._on_progress:
+            try:
+                self._on_progress(self._read_so_far, self._size)
+            except Exception:
+                pass
+        return n
+
+    def close(self):
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+        try:
+            Path(self._path).unlink(missing_ok=True)
+            logger.info("Stream-deleted after upload: %s", self._name)
+        except Exception:
+            pass
+        super().close()
+
+
+class _NamedBufferedReader(_io.BufferedReader):
+    """BufferedReader whose .name is writable (io.BufferedReader.name is read-only)."""
+    def __init__(self, raw: "_StreamingFileReader", buffer_size: int = 4 * 1024 * 1024):
+        super().__init__(raw, buffer_size=buffer_size)
+
+    @property
+    def name(self) -> str:
+        return self.raw.name
+
+
 # ─── Unified upload helper ────────────────────────────────────────────────────
 async def send_file(
     chat_id:       int,
@@ -1170,107 +1215,100 @@ async def send_file(
     thumb_path:    str | None = None,
 ) -> None:
     """
-    Upload a video/audio file via Pyrogram MTProto (2 GB limit).
+    Stream-upload a merged video or audio file via Pyrogram MTProto.
 
-    RAM strategy:
-      • Pass a plain file PATH string to Pyrogram (not BytesIO/file object).
-        Some Pyrogram versions call .read() with no size on file objects,
-        loading the entire file into the bot heap. A path string avoids this.
-      • ensure_telegram_compatible() is NOT called here — ffmpeg_merge and
-        do_download_subprocess already output H264+AAC mp4 via -c:v libx264
-        when needed. An extra remux pass before upload doubles disk usage.
-      • File is deleted from disk immediately after Pyrogram finishes.
-      • gc.collect() before and after upload to keep heap lean.
+    Flow:
+      1. ensure_telegram_compatible() — stream-copy or H264 re-encode.
+         Source deleted inside that fn, so only ONE file exists at a time.
+      2. _StreamingFileReader wraps the final file — Pyrogram reads 4 MB
+         chunks, sends over MTProto, chunk is freed. File never fully in RAM.
+      3. _StreamingFileReader.close() deletes the file the instant upload
+         ends (success or error). No cleanup timer. No lingering.
+      4. ffprobe metadata injected → Telegram renders video correctly.
+      5. 2 GB limit via Pyrogram MTProto (no Bot API 50 MB cap).
     """
     if _pyro_bot is None or not _pyro_bot.is_connected:
         raise RuntimeError("Pyrogram client is not running.")
 
-    filepath  = str(filepath)
-    ext       = Path(filepath).suffix.lower()
-    file_size = os.path.getsize(filepath)
+    filepath = str(filepath)
+    loop     = asyncio.get_running_loop()
+    ext      = Path(filepath).suffix.lower()
 
-    logger.info("Uploading %s (%.1f MB) via Pyrogram MTProto (path mode)",
+    # ── Step 1: ensure H264+AAC mp4 (stream-copy if already compatible) ──────
+    if is_video and ext in VIDEO_EXTS:
+        filepath = await loop.run_in_executor(None, ensure_telegram_compatible, filepath)
+        ext      = Path(filepath).suffix.lower()
+
+    file_size = os.path.getsize(filepath)
+    logger.info("Stream-uploading %s (%.1f MB) via Pyrogram MTProto",
                 filename, file_size / 1024 / 1024)
 
+    # ── Step 2: sync progress callback (called from reader thread) ───────────
     _last_edit:  list[float] = [0.0]
     _start_time: list[float] = [time.time()]
 
-    async def _progress(current: int, total: int) -> None:
+    def _sync_progress(current: int, total: int) -> None:
         now = time.time()
         if now - _last_edit[0] < 3:
             return
         _last_edit[0] = now
         elapsed = now - _start_time[0]
         text = upload_progress_text(filename, current, total, elapsed)
-        try:
-            await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            pass
+        asyncio.run_coroutine_threadsafe(
+            status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN),
+            loop,
+        )
 
     await status_msg.edit_text(
         f"📤 *Uploading* `{filename}` *({human_size(file_size)})*…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    gc.collect()   # free download/merge buffers before upload starts
+    # ── Step 3: wrap file in streaming reader, send, auto-delete on close ────
+    raw_reader = _StreamingFileReader(filepath, filename, on_progress=_sync_progress)
+    bio        = _NamedBufferedReader(raw_reader)
 
     try:
         if is_video and ext in VIDEO_EXTS:
             meta = get_video_meta(filepath)
             logger.info("Video meta — %dx%d  dur=%ds  has_audio=%s",
                         meta["width"], meta["height"], meta["duration"], meta["has_audio"])
-            try:
-                await _pyro_bot.send_video(
-                    chat_id            = chat_id,
-                    video              = filepath,   # plain path — Pyrogram reads in 512 KB parts
-                    caption            = caption,
-                    file_name          = filename,
-                    width              = meta["width"],
-                    height             = meta["height"],
-                    duration           = meta["duration"],
-                    supports_streaming = True,
-                    thumb              = thumb_path,
-                    progress           = _progress,
-                )
-            except Exception as vid_err:
-                # Fallback to document if send_video fails (e.g. codec Telegram rejects)
-                logger.warning("send_video failed (%s), falling back to send_document", vid_err)
-                await _pyro_bot.send_document(
-                    chat_id   = chat_id,
-                    document  = filepath,
-                    caption   = caption,
-                    file_name = filename,
-                    progress  = _progress,
-                )
+            await _pyro_bot.send_video(
+                chat_id            = chat_id,
+                video              = bio,
+                caption            = caption,
+                file_name          = filename,
+                width              = meta["width"],
+                height             = meta["height"],
+                duration           = meta["duration"],
+                supports_streaming = True,
+                thumb              = thumb_path,
+            )
         elif ext in AUDIO_EXTS:
             await _pyro_bot.send_audio(
                 chat_id   = chat_id,
-                audio     = filepath,
+                audio     = bio,
                 caption   = caption,
                 file_name = filename,
-                progress  = _progress,
             )
         else:
             await _pyro_bot.send_document(
                 chat_id   = chat_id,
-                document  = filepath,
+                document  = bio,
                 caption   = caption,
                 file_name = filename,
-                progress  = _progress,
             )
     finally:
-        Path(filepath).unlink(missing_ok=True)
-        logger.info("Deleted after upload: %s | disk: %s", filename, _get_tmp_usage())
-        gc.collect()
-
+        bio.close()   # deletes the file even if Pyrogram raised an exception
+        logger.info("Upload done | disk: %s", _get_tmp_usage())
 
 
 # ─── Video ────────────────────────────────────────────────────────────────────
-
 async def do_video(q, ctx, uid: int, quality: str):
     url = ctx.user_data.get("url")
     if not url:
-        await q.message.edit_text("❌ No URL stored. Please resend the link."); return
+        await q.message.edit_text("❌ No URL stored. Please resend the link.")
+        return
 
     # Queue if another download is already running
     sem = get_download_sem()
@@ -1281,15 +1319,11 @@ async def do_video(q, ctx, uid: int, quality: str):
         )
 
     async with sem:
-        # ── Step 1: build format selector ───────────────────────────────────
         cached_info = ctx.user_data.get("info", {})
         vid_id      = cached_info.get("id", "unknown")
         title       = cached_info.get("title", vid_id)
 
         # Simple height-capped selector with no codec/ext constraints.
-        # Codec constraints ([vcodec^=avc], [ext=mp4]) silently fall through
-        # to low-quality muxed streams when the client returns VP9/webm.
-        # yt-dlp subprocess uses --postprocessor-args to output H264+AAC.
         if quality == "best":
             fmt = "bestvideo+bestaudio/best"
         else:
@@ -1302,14 +1336,13 @@ async def do_video(q, ctx, uid: int, quality: str):
         loop      = asyncio.get_running_loop()
         out_path  = str(DOWNLOAD_DIR / f"{vid_id}_{quality}.%(ext)s")
 
-        # ── Step 2: download via yt-dlp subprocess (separate OS process = no RAM hit) ──
         status = await q.message.edit_text(
             f"⬇️ *Downloading ({quality})…*",
             parse_mode=ParseMode.MARKDOWN,
         )
 
         try:
-            await do_download_subprocess(
+            merged_path = await do_download_subprocess(
                 url        = url,
                 fmt        = fmt,
                 out_path   = out_path,
@@ -1317,40 +1350,15 @@ async def do_video(q, ctx, uid: int, quality: str):
                 loop       = loop,
                 label      = f"*{quality}*",
             )
-            logger.info("yt-dlp subprocess finished")
+            logger.info("yt-dlp subprocess finished: %s", merged_path)
         except Exception as e:
             raw = str(e)[:500]
             logger.error("Download failed: %s", raw)
-            user_msg = friendly_error(e)
-            user_msg += f"\n\n`{raw}`"
-            await status.edit_text(user_msg, parse_mode=ParseMode.MARKDOWN)
+            await status.edit_text(friendly_error(e) + f"\n\n`{raw}`", parse_mode=ParseMode.MARKDOWN)
             return
 
-        # Find the file yt-dlp wrote
-        found = sorted(DOWNLOAD_DIR.glob(f"{vid_id}_{quality}.*"))
-        if not found:
-            await status.edit_text("❌ No output file found after download.")
-            return
-        merged_path = str(found[-1])
-        logger.info("Downloaded: %s", merged_path)
-
-        # ── Step 3: upload ────────────────────────────────────────────────────
-        # Collect garbage to free any memory from the download/merge phase
-        gc.collect()
-        # Try YouTube CDN thumbnail first; fall back to ffmpeg frame extraction
-        thumb_path = download_thumbnail(cached_info, vid_id)
-        if not thumb_path and merged_path and Path(merged_path).exists():
-            _tf = merged_path + ".jpg"
-            try:
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", merged_path, "-ss", "00:00:10",
-                     "-vframes", "1", _tf],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
-                )
-                if Path(_tf).exists() and Path(_tf).stat().st_size > 0:
-                    thumb_path = _tf
-            except Exception:
-                pass
+        # Download thumbnail (non‑blocking)
+        thumb_path = await download_thumbnail(cached_info, vid_id)
 
         await status.edit_text("📤 *Uploading…*", parse_mode=ParseMode.MARKDOWN)
         try:
@@ -1367,10 +1375,7 @@ async def do_video(q, ctx, uid: int, quality: str):
         except Exception as e:
             await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
         finally:
-            # send_file deletes the video in its own finally; this guard catches
-            # the case where send_file itself raises before reaching its finally
-            # (e.g. Pyrogram not connected) — ensures no file lingers on disk.
-            Path(merged_path).unlink(missing_ok=True)
+            # Clean up thumb if it exists
             if thumb_path:
                 Path(thumb_path).unlink(missing_ok=True)
 
@@ -1379,7 +1384,8 @@ async def do_video(q, ctx, uid: int, quality: str):
 async def do_audio(q, ctx, uid: int):
     url = ctx.user_data.get("url")
     if not url:
-        await q.message.edit_text("❌ No URL stored."); return
+        await q.message.edit_text("❌ No URL stored.")
+        return
 
     sem = get_download_sem()
     if sem.locked():
@@ -1393,7 +1399,7 @@ async def do_audio(q, ctx, uid: int):
         loop = asyncio.get_running_loop()
         out_path = str(DOWNLOAD_DIR / "%(id)s.%(ext)s")
         try:
-            await do_download_subprocess(
+            audio_path = await do_download_subprocess(
                 url        = url,
                 fmt        = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
                 out_path   = out_path,
@@ -1407,26 +1413,16 @@ async def do_audio(q, ctx, uid: int):
                 ],
             )
         except Exception as e:
-            await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
+            await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+            return
 
-        # Find the mp3 yt-dlp wrote (subprocess doesn't return info dict)
-        files = sorted(DOWNLOAD_DIR.glob("*.mp3"), key=lambda f: f.stat().st_mtime, reverse=True)
-        if not files:
-            # fallback: any audio file
-            files = sorted(
-                [f for f in DOWNLOAD_DIR.iterdir()
-                 if f.suffix.lower() in AUDIO_EXTS],
-                key=lambda f: f.stat().st_mtime, reverse=True,
-            )
-        if not files:
-            await status.edit_text("❌ Audio file not found."); return
-        filepath = str(files[0])
-        title    = files[0].stem  # use filename as title fallback
+        # audio_path is the final mp3
+        title = Path(audio_path).stem
         await status.edit_text("📤 *Uploading MP3…*", parse_mode=ParseMode.MARKDOWN)
         try:
             await send_file(
                 chat_id    = q.message.chat_id,
-                filepath   = filepath,
+                filepath   = audio_path,
                 filename   = f"{title}.mp3",
                 caption    = f"🎵 {title}",
                 status_msg = status,
@@ -1434,24 +1430,34 @@ async def do_audio(q, ctx, uid: int):
             )
             await status.delete()
         except Exception as e:
-            await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-        finally:
-            # Delete immediately — audio files don't need to linger
-            Path(filepath).unlink(missing_ok=True)
+            await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        # File is already deleted inside send_file, nothing extra to do
 
 
 # ─── Thumbnail ────────────────────────────────────────────────────────────────
 async def do_thumbnail(q, ctx, uid: int):
     info      = ctx.user_data.get("info", {})
+    vid_id    = info.get("id", "thumb")
     thumb_url = info.get("thumbnail")
     if not thumb_url:
-        await q.message.edit_text("❌ No thumbnail found."); return
+        await q.message.edit_text("❌ No thumbnail found.")
+        return
     status  = await q.message.edit_text("🖼 *Downloading thumbnail…*", parse_mode=ParseMode.MARKDOWN)
-    outpath = DOWNLOAD_DIR / f"{info.get('id', 'thumb')}_thumb.jpg"
-    try:
-        urllib.request.urlretrieve(thumb_url, outpath)
-    except Exception as e:
-        await status.edit_text(f"❌ Thumbnail fetch failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
+    outpath = DOWNLOAD_DIR / f"{vid_id}_thumb.jpg"
+
+    # Download thumbnail non‑blocking
+    loop = asyncio.get_running_loop()
+    def _fetch():
+        try:
+            urllib.request.urlretrieve(thumb_url, outpath)
+            return outpath if outpath.exists() else None
+        except Exception:
+            return None
+    result = await loop.run_in_executor(None, _fetch)
+    if not result:
+        await status.edit_text("❌ Thumbnail fetch failed.")
+        return
+
     try:
         with open(outpath, "rb") as f:
             await ctx.bot.send_document(
@@ -1461,8 +1467,9 @@ async def do_thumbnail(q, ctx, uid: int):
             )
         await status.delete()
     except Exception as e:
-        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-    register_for_cleanup(str(outpath), get_settings(uid)["cleanup_minutes"])
+        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
+    finally:
+        register_for_cleanup(str(outpath), get_settings(uid)["cleanup_minutes"])
 
 
 # ─── Search ───────────────────────────────────────────────────────────────────
@@ -1472,11 +1479,13 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: s
         results_info = await extract_info(f"ytsearch5:{query}", download=False,
             extra_opts={"extract_flat": True})
     except Exception as e:
-        await msg.edit_text(f"❌ Search failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
+        await msg.edit_text(f"❌ Search failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        return
 
     entries = results_info.get("entries", [])
     if not entries:
-        await msg.edit_text("😕 No results found."); return
+        await msg.edit_text("😕 No results found.")
+        return
 
     ctx.user_data["search_results"] = entries
     buttons = []
@@ -1525,9 +1534,6 @@ def main():
         logger.warning("   Bot will try client fallback chain (android_vr/tv/tv_downgraded/web)")
 
     # ── Launch Pyrogram MTProto upload client ────────────────────────────
-    # Pyrogram is started inside post_init (event loop already running).
-    # If TELEGRAM_API_ID / TELEGRAM_API_HASH are missing, post_init raises
-    # and the bot exits with a clear error message.
     logger.info("Pyrogram MTProto upload engine will start in post_init.")
 
     threading.Thread(target=start_health_server, daemon=True).start()

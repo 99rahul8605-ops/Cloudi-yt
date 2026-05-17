@@ -182,27 +182,22 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
         "socket_timeout":      30,
     }
 
-    # ── PO Token via Deno (BotGuard challenge solver) ────────────────────
-    # yt-dlp uses Deno to solve YouTube's JS challenge and get a PO token.
-    # Without this, YouTube blocks adaptive streams (720p+) and returns
-    # only format 18 (360p muxed). Deno must be installed in the container.
-    import shutil
-    deno_path = shutil.which("deno") or "/usr/local/bin/deno"
-    if shutil.which("deno") or Path(deno_path).exists():
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["web"],
-                "po_token":      [f"web+deno:{deno_path}"],
-            }
+    # ── PO Token via bgutil HTTP server ──────────────────────────────────
+    # bgutil-ytdlp-pot-provider runs a Deno HTTP server on port 4416.
+    # It automatically generates PO Tokens for YouTube's SABR bypass.
+    # Without this, YouTube forces SABR streaming and returns only
+    # format 18 (360p). bgutil is the official yt-dlp recommended solution.
+    #
+    # The plugin (bgutil-ytdlp-pot-provider pip package) auto-connects to
+    # http://127.0.0.1:4416 — no extractor_args needed, it hooks in
+    # automatically via yt-dlp's PO Token Provider Framework.
+    # We still set player_client to "default" to use all available clients.
+    opts["extractor_args"] = {
+        "youtube": {
+            "player_client": ["default"],
         }
-        logger.info("✅ Deno PO token solver enabled: %s", deno_path)
-    else:
-        logger.warning("⚠️ Deno not found — YouTube may only return 360p (format 18)")
-        opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["ios", "android", "tv_embedded"],
-            }
-        }
+    }
+    logger.info("yt-dlp PO token: bgutil-ytdlp-pot-provider plugin active (port 4416)")
 
     # ── Proxy ─────────────────────────────────────────────────────────────
     if YTDL_PROXY:

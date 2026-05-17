@@ -189,9 +189,17 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
         "noplaylist":  True,
         "outtmpl":     str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
 
-        # Proven format string — bestvideo+bestaudio merged via ffmpeg.
+        # Prefer H.264/mp4 video + m4a audio — copied into mp4 container by
+        # ffmpeg without re-encoding ("-c:v copy"), preserving original quality.
+        # VP9/webm would require a lossy transcode to mp4 which degrades quality.
         # Fallback chain ensures something always downloads.
-        "format":              "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "format": (
+            "bestvideo[height<=1080][vcodec^=avc]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo[height<=1080]+bestaudio"
+            "/best[height<=1080]"
+            "/best"
+        ),
         "merge_output_format": "mp4",
 
         # Retries
@@ -285,19 +293,19 @@ def pick_best_formats(formats: list, quality: str) -> tuple[str, str]:
         )
 
     if not target_h or quality == "best":
-        # Best available: yt-dlp picks the highest quality adaptive pair
-        vid_sel = "bestvideo[ext=mp4]/bestvideo"
+        # Best available: prefer H.264/mp4 so ffmpeg copies without re-encoding
+        vid_sel = "bestvideo[vcodec^=avc][ext=mp4]/bestvideo[ext=mp4]/bestvideo"
         aud_sel = "bestaudio[ext=m4a]/bestaudio"
         logger.info("Selector: %s + %s", vid_sel, aud_sel)
         return vid_sel, aud_sel
 
-    # Height-based selector: at or below target, best available below that
-    # The [height<=N] filter is evaluated fresh at download time against the
-    # actual available formats — no stale format ID problem.
+    # Height-based selector: prefer H.264/mp4 at or below target height.
+    # vcodec^=avc matches avc1/h264 — no re-encode needed during ffmpeg merge.
     vid_sel = (
-        f"bestvideo[height<={target_h}][ext=mp4]"
+        f"bestvideo[height<={target_h}][vcodec^=avc][ext=mp4]"
+        f"/bestvideo[height<={target_h}][ext=mp4]"
         f"/bestvideo[height<={target_h}]"
-        f"/bestvideo[ext=mp4]"
+        f"/bestvideo[vcodec^=avc][ext=mp4]"
         f"/bestvideo"
     )
     aud_sel = "bestaudio[ext=m4a]/bestaudio"
@@ -975,6 +983,88 @@ def ensure_audio_track(filepath: str) -> str:
     return filepath
 
 
+def ensure_telegram_compatible(filepath: str) -> str:
+    """
+    Re-mux the video into a Telegram-safe mp4 so Telegram skips its
+    server-side transcoder and serves the original bitstream at full quality.
+
+    Telegram will NOT re-encode a video when ALL of these are true:
+      • Container : mp4 (not mkv/webm/mov)
+      • Video codec: H.264 (avc1)
+      • Audio codec: AAC
+      • moov atom  : at the front of the file (-movflags +faststart)
+
+    Strategy — stream-copy first (instant, lossless).  If the video stream
+    is not H.264 (e.g. VP9/AV1 from YouTube) we re-encode to H.264 using
+    the CRF 18 setting (visually lossless) so quality is preserved as much
+    as possible while producing a Telegram-compatible file.
+    """
+    try:
+        meta = get_video_meta(filepath)
+        p    = Path(filepath)
+
+        # Probe the actual codec
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", filepath],
+            capture_output=True, text=True, timeout=15,
+        )
+        streams  = _json.loads(probe.stdout).get("streams", [])
+        vs       = next((s for s in streams if s.get("codec_type") == "video"), {})
+        as_      = next((s for s in streams if s.get("codec_type") == "audio"), {})
+        vcodec   = vs.get("codec_name", "")   # e.g. "h264", "vp9", "av1"
+        acodec   = as_.get("codec_name", "")  # e.g. "aac", "opus", "vorbis"
+        is_mp4   = p.suffix.lower() == ".mp4"
+        need_vid = vcodec not in ("h264", "avc", "avc1")
+        need_aud = acodec not in ("aac", "mp3") or not as_
+
+        # Already perfect — just ensure faststart moov atom
+        if is_mp4 and not need_vid and not need_aud:
+            out_path = str(p.parent / (p.stem + "_tg.mp4"))
+            result   = subprocess.run(
+                ["ffmpeg", "-y", "-i", filepath,
+                 "-c", "copy",
+                 "-movflags", "+faststart",
+                 out_path],
+                capture_output=True, timeout=300,
+            )
+            if result.returncode == 0 and Path(out_path).exists():
+                logger.info("[FFMPEG] faststart copy: %s", p.name)
+                try: p.unlink()
+                except Exception: pass
+                return out_path
+            return filepath  # copy failed — return original
+
+        # Need transcode/remux
+        out_path   = str(p.parent / (p.stem + "_tg.mp4"))
+        v_args     = ["-c:v", "libx264", "-crf", "18", "-preset", "fast",
+                      "-pix_fmt", "yuv420p"] if need_vid else ["-c:v", "copy"]
+        a_args     = ["-c:a", "aac", "-b:a", "192k"] if need_aud else ["-c:a", "copy"]
+        # Add silent audio if no audio stream at all
+        input_args = ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"] if not as_ else []
+        extra_map  = ["-map", "0:v:0", "-map", "1:a:0", "-shortest"] if not as_ else []
+
+        cmd = (
+            ["ffmpeg", "-y", "-i", filepath]
+            + input_args
+            + v_args + a_args
+            + extra_map
+            + ["-movflags", "+faststart", out_path]
+        )
+        logger.info("[FFMPEG] ensure_telegram_compatible: vcodec=%s acodec=%s → H264+AAC mp4",
+                    vcodec, acodec)
+        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        if result.returncode == 0 and Path(out_path).exists():
+            try: p.unlink()
+            except Exception: pass
+            return out_path
+        logger.warning("[FFMPEG] ensure_telegram_compatible failed: %s",
+                       result.stderr[-400:] if result.stderr else "unknown")
+    except Exception as e:
+        logger.warning("[FFMPEG] ensure_telegram_compatible error: %s", e)
+    return filepath
+
+
 async def start_pyro_bot() -> None:
     """Create and start the Pyrogram bot client (called from post_init)."""
     global _pyro_bot
@@ -1060,9 +1150,13 @@ async def send_file(
     if is_video and ext in VIDEO_EXTS:
         loop = asyncio.get_event_loop()
 
-        # Patch: add silent audio track if the merged file has no audio stream
-        # (prevents Telegram converting the video to a GIF).
-        filepath = await loop.run_in_executor(None, ensure_audio_track, filepath)
+        # Pre-mux to a Telegram-safe mp4 (H.264 video + AAC audio, faststart).
+        # When the container/codec already matches Telegram's expectations,
+        # Telegram skips its server-side transcoder and serves the original
+        # bitstream — preserving full original quality.
+        # If the video is already H.264+AAC in an mp4 with a moov atom at the
+        # front, ffmpeg finishes in seconds (stream-copy, no re-encode).
+        filepath = await loop.run_in_executor(None, ensure_telegram_compatible, filepath)
 
         meta = get_video_meta(filepath)
         logger.info(
@@ -1242,15 +1336,21 @@ async def do_video(q, ctx, uid: int, quality: str):
     vid_id      = cached_info.get("id", "unknown")
     title       = cached_info.get("title", vid_id)
 
-    # Use proven format string (reference bot approach):
-    # bestvideo+bestaudio merged by ffmpeg — single yt-dlp call, no stale IDs.
+    # Use H.264/mp4 video + m4a audio so ffmpeg can copy streams without
+    # re-encoding (no quality loss). VP9/webm fallback only if unavailable.
     if quality == "best":
-        fmt = "bestvideo+bestaudio/best"
+        fmt = (
+            "bestvideo[vcodec^=avc]+bestaudio[ext=m4a]"
+            "/bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+            "/bestvideo+bestaudio/best"
+        )
     else:
         target_h = {"360p": 360, "480p": 480, "720p": 720, "1080p": 1080,
                     "1440p": 1440, "2160p": 2160}.get(quality, 1080)
         fmt = (
-            f"bestvideo[height<={target_h}]+bestaudio"
+            f"bestvideo[height<={target_h}][vcodec^=avc]+bestaudio[ext=m4a]"
+            f"/bestvideo[height<={target_h}][ext=mp4]+bestaudio[ext=m4a]"
+            f"/bestvideo[height<={target_h}]+bestaudio"
             f"/best[height<={target_h}]"
             f"/bestvideo+bestaudio"
             f"/best"

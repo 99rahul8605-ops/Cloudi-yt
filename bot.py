@@ -1,13 +1,9 @@
 """
-Advanced Telegram YouTube Downloader Bot
-Memory-optimised for Render (512 MB) – handles 2 GB uploads without OOM.
-
-Features:
-- yt-dlp with android_vr/tv/tv_downgraded/web client chain (no PO token needed)
-- Pyrogram MTProto uploads (2 GB limit)
-- Direct file upload (Pyrogram streams internally, no custom reader needed)
-- Silent audio track patch (no video re-encode)
-- Large files >500 MB sent as documents (no ffmpeg processing)
+Advanced Telegram YouTube Downloader Bot – No Quality Loss
+- Downloads best available video+audio (no codec restrictions)
+- Never re-encodes video (preserves original quality)
+- Non-H264 videos sent as documents (original bitstream)
+- Silent audio track added without re-encoding video
 """
 
 import os, asyncio, time, logging, re, threading, urllib.request, sys, platform, subprocess, gc
@@ -89,15 +85,15 @@ def cookie_status() -> dict:
         return {"ok": False, "reason": "No youtube.com cookies"}
     return {"ok": True, "yt_lines": len(yt), "has_sapisid": any("SAPISID" in l for l in yt)}
 
-# ========== YT-DLP OPTIONS (no PO token required) ==========
+# ========== YT-DLP OPTIONS (no PO token, no codec restrictions) ==========
 def ydl_opts_base(use_cookies: bool = True) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
+        # NO codec restrictions – get absolute best video+audio
         "format": "bestvideo+bestaudio/best",
-        "format_sort": ["res", "br"],
         "merge_output_format": "mp4",
         "retries": 10,
         "fragment_retries": 10,
@@ -182,7 +178,7 @@ def download_progress_text(label: str, pct: int, speed: str, eta: str, downloade
     tot = f" / `{total}`" if total and total != "?" else ""
     return f"⬇️ *Downloading* {label}\n`{bar}` {pct}%\n📦 `{downloaded}`{tot}\n⚡ `{speed}`  ⏱ `{eta}`"
 
-# ========== FFMPEG HELPERS (memory-safe) ==========
+# ========== FFMPEG HELPERS (NO RE-ENCODING) ==========
 def get_video_meta(filepath: str) -> dict:
     try:
         result = subprocess.run(
@@ -206,7 +202,10 @@ def get_video_meta(filepath: str) -> dict:
         return {"width": 0, "height": 0, "duration": 0, "has_audio": False, "vcodec": "", "acodec": ""}
 
 def ensure_telegram_compatible(filepath: str) -> str:
-    """Lightweight ffmpeg operations: stream copy, add silent audio (no video re-encode)."""
+    """
+    ONLY add silent audio track (if missing) and move moov atom.
+    NEVER re-encode video. If video is not H.264, it will be sent as document later.
+    """
     file_size = os.path.getsize(filepath)
     if file_size > 500 * 1024 * 1024:
         logger.info("File >500 MB – skipping ffmpeg, will send as document")
@@ -236,7 +235,7 @@ def ensure_telegram_compatible(filepath: str) -> str:
         logger.warning("Failed to add silent audio: %s", result.stderr[:200])
         return filepath
 
-    # Already has audio: ensure faststart (stream copy)
+    # Already has audio: ensure faststart (stream copy) – this is lossless
     cmd = ["ffmpeg", "-y", "-threads", "1", "-i", filepath, "-c", "copy", "-movflags", "+faststart", out_path]
     result = subprocess.run(cmd, capture_output=True, timeout=60)
     if result.returncode == 0 and Path(out_path).exists():
@@ -264,15 +263,26 @@ async def send_file(
     AUDIO_EXTS = {".mp3", ".m4a", ".ogg", ".flac", ".wav", ".aac"}
 
     file_size = os.path.getsize(filepath)
+    meta = get_video_meta(filepath) if is_video else {}
+    vcodec = meta.get("vcodec", "")
+    is_h264 = vcodec in ("h264", "avc", "avc1")
+
+    # Decide to send as document:
+    # 1. File > 500 MB
+    # 2. Not a recognised video extension
+    # 3. Video codec is not H.264 (to avoid Telegram re-encoding which damages quality)
     send_as_doc = False
     if file_size > 500 * 1024 * 1024:
         send_as_doc = True
     elif is_video and ext not in VIDEO_EXTS:
         send_as_doc = True
+    elif is_video and not is_h264:
+        logger.info("Video codec is %s – sending as document to preserve quality", vcodec)
+        send_as_doc = True
     elif not is_video and ext not in AUDIO_EXTS:
         send_as_doc = True
 
-    # Apply compatibility only if sending as video
+    # Apply compatibility only if sending as video and not as doc
     if is_video and not send_as_doc:
         filepath = await loop.run_in_executor(None, ensure_telegram_compatible, filepath)
         ext = Path(filepath).suffix.lower()
@@ -603,10 +613,12 @@ async def do_video(q, ctx, uid: int, quality: str):
         vid_id = info.get("id", "unknown")
         title = info.get("title", vid_id)[:50]
 
+        # Build format selector – NO codec restrictions, get best available
         if quality == "best":
             fmt = "bestvideo+bestaudio/best"
         else:
             target_h = {"360p":360, "480p":480, "720p":720, "1080p":1080, "1440p":1440, "2160p":2160}.get(quality, 1080)
+            # Use height cap but no codec filtering
             fmt = f"bestvideo[height<={target_h}]+bestaudio/best[height<={target_h}]/bestvideo+bestaudio/best"
 
         status = await q.message.edit_text(f"⬇️ *Downloading ({quality})…*", parse_mode=ParseMode.MARKDOWN)

@@ -1196,20 +1196,45 @@ async def send_file(
     logger.info("Uploading %s (%.1f MB) via Pyrogram MTProto", filename, size_mb)
 
     # ── Progress callback ─────────────────────────────────────────────────────
-    _last_edit: list[float] = [0.0]
+    # Pyrogram calls _progress from its own internal task on the event loop.
+    # Problems with naive await inside progress:
+    #   1. Pyrogram silently swallows any exception thrown by the callback.
+    #   2. edit_text can raise RetryAfter (flood wait) — silently dropped.
+    #   3. Awaiting a PTB network call inside Pyrogram's upload task can
+    #      stall the upload itself if the event loop is saturated.
+    #
+    # Fix: schedule edit_text as a fire-and-forget task using
+    # asyncio.ensure_future(). This returns immediately to Pyrogram,
+    # never stalls the upload, and the edit runs independently.
+    # A lock prevents overlapping edits (two progress fires at once).
+    _last_edit:  list[float] = [0.0]
     _start_time: list[float] = [time.time()]
+    _edit_lock = asyncio.Lock()
+
+    async def _do_edit(text: str) -> None:
+        """Run the actual edit_text, respecting flood waits."""
+        async with _edit_lock:
+            try:
+                await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                err = str(e).lower()
+                if "retry" in err or "flood" in err:
+                    # Flood-limited — back off silently, don't crash upload
+                    pass
+                elif "message is not modified" in err:
+                    pass  # identical text, ignore
+                else:
+                    logger.debug("Upload progress edit failed: %s", e)
 
     async def _progress(current: int, total: int) -> None:
         now = time.time()
-        if now - _last_edit[0] < 3:
+        if now - _last_edit[0] < 4:   # 4 s minimum between edits
             return
         _last_edit[0] = now
         elapsed = now - _start_time[0]
-        try:
-            text = upload_progress_text(filename, current, total, elapsed)
-            await status_msg.edit_text(text, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            pass
+        text = upload_progress_text(filename, current, total, elapsed)
+        # Fire-and-forget: don't await, don't stall Pyrogram's upload task
+        asyncio.ensure_future(_do_edit(text))
 
     await status_msg.edit_text(
         f"📤 *Uploading* `{filename}` *({human_size(file_size)})*…",

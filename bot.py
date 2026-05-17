@@ -30,7 +30,7 @@ Extra features vs plain Bot API:
   • Silent-audio-track patch → Telegram never converts videos to GIFs
 """
 
-import os, asyncio, time, logging, re, threading, random, urllib.request, sys, platform, subprocess
+import os, asyncio, time, logging, re, threading, random, urllib.request, sys, platform, subprocess, gc
 import json as _json
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -184,10 +184,16 @@ def ydl_opts_base(use_cookies: bool = True) -> dict:
     Set YTDL_PROXY=http://host:port in Render environment variables.
     """
     opts: dict = {
-        "quiet":       True,
-        "no_warnings": True,
-        "noplaylist":  True,
-        "outtmpl":     str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
+        "quiet":           True,
+        "no_warnings":     True,
+        "noplaylist":      True,
+        "outtmpl":         str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
+        # Prevent yt-dlp writing .info.json / description files to disk
+        "writeinfojson":   False,
+        "writedescription":False,
+        # Don't embed metadata or thumbnails into the file — saves RAM + disk
+        "writethumbnail":  False,
+        "embedthumbnail":  False,
 
         # Format strategy: strongly prefer H264+m4a so yt-dlp merges into
         # a stream-copyable mp4 — ensure_telegram_compatible() then finishes
@@ -732,7 +738,28 @@ async def handle_youtube_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url
     duration = info.get("duration", 0)
     dur_str  = f"{duration // 60}m {duration % 60}s" if duration else "?"
     ctx.user_data["url"]  = url
-    ctx.user_data["info"] = info
+
+    # Store a slim copy — only the fields we actually use downstream.
+    # The full info dict can be 500KB–2MB (100+ formats, thumbnails, etc.)
+    # and stays in RAM for the entire session per user, causing OOM on Render.
+    slim_formats = [
+        {k: f.get(k) for k in
+         ("format_id", "ext", "height", "width", "vcodec", "acodec",
+          "filesize", "filesize_approx", "format_note", "tbr", "fps")}
+        for f in (info.get("formats") or [])
+    ]
+    ctx.user_data["info"] = {
+        "id":         info.get("id", ""),
+        "title":      title,
+        "duration":   duration,
+        "thumbnail":  info.get("thumbnail"),
+        "thumbnails": [
+            {"url": t.get("url"), "width": t.get("width")}
+            for t in (info.get("thumbnails") or [])
+            if t.get("url")
+        ],
+        "formats":    slim_formats,
+    }
 
     await msg.edit_text(
         f"📹 *{title}*\n⏱ `{dur_str}`\n\nWhat would you like?",
@@ -1474,10 +1501,14 @@ async def do_video(q, ctx, uid: int, quality: str):
         raw = str(e)[:500]
         logger.error("Download failed: %s", raw)
         user_msg = friendly_error(e)
-        # Always append raw error so user can see what actually happened
         user_msg += f"\n\n`{raw}`"
         await status.edit_text(user_msg, parse_mode=ParseMode.MARKDOWN)
         return
+    finally:
+        # Force GC after download — yt-dlp holds format dicts, HTTP
+        # connections, and parser objects until collected. On Render free tier
+        # the GC cycle is lazy and memory doesn't release without this.
+        gc.collect()
 
     # ── Step 3: upload ────────────────────────────────────────────────────
     # Download best-resolution thumbnail from YouTube for the video player
@@ -1500,6 +1531,10 @@ async def do_video(q, ctx, uid: int, quality: str):
     except Exception as e:
         await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
         return
+    finally:
+        # Release format list — no longer needed after upload
+        ctx.user_data.pop("info", None)
+        gc.collect()
 
     register_for_cleanup(merged_path, get_settings(uid)["cleanup_minutes"])
 

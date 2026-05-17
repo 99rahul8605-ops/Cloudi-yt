@@ -862,7 +862,11 @@ async def ffmpeg_merge(video_path: str, audio_path: str, out_path: str) -> None:
         "-c:v", "copy",   # no re-encode — just remux
         "-c:a", "aac",    # normalise audio to aac for mp4 compatibility
         "-b:a", "192k",
-        "-movflags", "+faststart",  # web-optimised atom order
+        # NOTE: -movflags +faststart is intentionally omitted.
+        # That flag rewrites the entire file to move the moov atom to the
+        # front, which takes minutes on large files (1+ GB). Telegram upload
+        # does not require faststart — the file is streamed from disk, not
+        # served via HTTP progressive download.
         out_path,
     ]
     logger.info("ffmpeg merge: %s + %s → %s", video_path, audio_path, out_path)
@@ -1004,22 +1008,25 @@ def fix_audio_only(filepath: str) -> str:
     Fix ONLY the audio codec if it is incompatible with Telegram (opus/vorbis).
     Video is NEVER re-encoded — stream-copied as-is.
 
-    This runs in ~10-30 seconds regardless of resolution or file size because
-    only the audio stream is processed. Upload starts immediately after.
+    Key design decisions to keep this FAST:
+      • No -movflags +faststart — that flag forces ffmpeg to rewrite the entire
+        file after muxing (moving moov atom) which blocks for minutes on large
+        files. Telegram handles non-faststart mp4 perfectly fine for uploads.
+      • Audio-only transcode takes ~5-15s regardless of video resolution/size.
+      • Already-compatible files (aac/mp3) are returned immediately with no ffmpeg.
 
     Telegram natively plays:
       • H264, VP9 video codecs (all resolutions including 1440p/4K)
       • AAC, MP3 audio codecs
     Does NOT need transcoding:
-      • H264 + AAC → upload directly, Telegram handles non-faststart mp4 fine
+      • H264 + AAC → upload directly
       • VP9  + AAC → upload directly
-    Needs audio fix only:
+    Needs audio fix only (fast, ~5-15s):
       • VP9  + opus/vorbis → copy video, transcode audio to AAC
       • H264 + opus/vorbis → copy video, transcode audio to AAC
     Skip entirely (return original):
       • AV1 files → Telegram doesn't support but transcode would take hours;
-                    upload as-is, Telegram will show an error to user rather
-                    than making them wait 15 minutes
+                    upload as-is so user gets a quick error rather than waiting
     """
     try:
         p = Path(filepath)
@@ -1046,7 +1053,10 @@ def fix_audio_only(filepath: str) -> str:
             logger.info("[FFMPEG] audio already compatible, uploading directly")
             return filepath
 
-        # Audio needs fixing — copy video, transcode audio only (~10-30s)
+        # Audio needs fixing — copy video stream, transcode audio only.
+        # NOTE: No -movflags +faststart here — it forces a full file rewrite
+        # (moov atom relocation) which takes minutes on large files. Omitting it
+        # means ffmpeg finishes in seconds since it only processes the audio track.
         out_path = str(p.parent / (p.stem + "_fix.mp4"))
         timeout  = max(120, int(src_mb * 2))  # 2 s/MB generous upper bound
 
@@ -1057,17 +1067,17 @@ def fix_audio_only(filepath: str) -> str:
                 "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
                 "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
                 "-map", "0:v:0", "-map", "1:a:0", "-shortest",
-                "-movflags", "+faststart", out_path,
+                out_path,  # no +faststart — avoids full-file moov rewrite
             ]
         else:
             cmd = [
                 "ffmpeg", "-y", "-i", filepath,
                 "-c:v", "copy",          # never re-encode video
                 "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart", out_path,
+                out_path,  # no +faststart — avoids full-file moov rewrite
             ]
 
-        logger.info("[FFMPEG] audio fix: %s → aac (video stream-copy)", acodec)
+        logger.info("[FFMPEG] audio fix: %s → aac (video stream-copy, no faststart)", acodec)
         rc = subprocess.call(cmd, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, timeout=timeout)
 
@@ -1196,7 +1206,7 @@ async def send_file(
 
     async def _progress(current: int, total: int) -> None:
         now = time.time()
-        if now - _last_edit[0] < 4:          # 4 s minimum between edits
+        if now - _last_edit[0] < 3:          # 3 s minimum between edits (matches download progress)
             return
         _last_edit[0] = now
         elapsed = now - _start_time[0]
@@ -1217,24 +1227,48 @@ async def send_file(
                 logger.debug("Upload progress edit skipped: %s", e)
             # Never re-raise — an exception here would cancel the upload
 
-    await status_msg.edit_text(
-        f"📤 *Uploading* `{filename}` *({human_size(file_size)})*…",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
     # ── Video upload ──────────────────────────────────────────────────────────
     if is_video and ext in VIDEO_EXTS:
         loop = asyncio.get_event_loop()
 
-        # Pre-mux to a Telegram-safe mp4 (H.264 video + AAC audio, faststart).
-        # When the container/codec already matches Telegram's expectations,
-        # Telegram skips its server-side transcoder and serves the original
-        # bitstream — preserving full original quality.
-        # If the video is already H.264+AAC in an mp4 with a moov atom at the
-        # front, ffmpeg finishes in seconds (stream-copy, no re-encode).
+        # Quick ffprobe to decide if audio transcoding is needed BEFORE
+        # showing "Uploading" — so user sees accurate status during the fix.
+        def _needs_audio_fix() -> bool:
+            try:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-print_format", "json",
+                     "-show_streams", filepath],
+                    capture_output=True, text=True, timeout=15,
+                )
+                streams = _json.loads(probe.stdout).get("streams", [])
+                as_ = next((s for s in streams if s.get("codec_type") == "audio"), {})
+                return as_.get("codec_name", "") not in ("aac", "mp3", "")
+            except Exception:
+                return False
+
+        needs_fix = await loop.run_in_executor(None, _needs_audio_fix)
+        if needs_fix:
+            await status_msg.edit_text(
+                "⚙️ *Converting audio track…* (video untouched, ~10s)",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await status_msg.edit_text(
+                f"📤 *Uploading* `{filename}` *({human_size(file_size)})*…",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
         # Fix audio codec if needed (opus→aac). Video is NEVER re-encoded.
-        # This takes <30s regardless of resolution. Upload starts right after.
+        # No -movflags +faststart here — that forces ffmpeg to rewrite the
+        # entire file after muxing (moov atom relocation) which takes minutes
+        # on large files. Omitting it keeps audio-only fix to ~5-15s.
         filepath = await loop.run_in_executor(None, fix_audio_only, filepath)
+
+        if needs_fix:
+            await status_msg.edit_text(
+                f"📤 *Uploading* `{filename}` *({human_size(os.path.getsize(filepath))})*…",
+                parse_mode=ParseMode.MARKDOWN,
+            )
 
         meta = get_video_meta(filepath)
         logger.info(

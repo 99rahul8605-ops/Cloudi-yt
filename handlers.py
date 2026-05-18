@@ -287,38 +287,14 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
     try:
         info = await extract_info(url)
     except (DownloadError, ExtractorError) as e:
-        err_lower = str(e).lower()
-        # Pinterest image pins / Instagram photo posts raise "No video formats found"
-        # because yt-dlp can't find a video stream. Re-probe without format filter
-        # to still get title + thumbnail so we can offer an image download.
-        if ("no video formats" in err_lower or "no formats" in err_lower
-                or "no video in this post" in err_lower
-                or "there is no video" in err_lower):
-            # Re-probe with skip_download so yt-dlp only fetches page metadata
-            # and thumbnail URL — it won't hit the "no video formats" check again.
-            try:
-                info = await extract_info(url, extra_opts={
-                    "skip_download": True,
-                    "format":        None,
-                })
-            except Exception:
-                info = None
-            if not info:
-                await msg.edit_text(
-                    "📷 *Image post detected.*\n\n"
-                    "Could not extract image data automatically.\n"
-                    "Please right-click → Save image, or open in browser.",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-                return
-            # Force image-post path by clearing video formats
-            info["formats"] = []
-            info.setdefault("duration", 0)
-        else:
-            await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
-            return
+        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+        return
     except Exception as e:
         await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if not info:
+        await msg.edit_text("❌ Could not fetch info for this URL.", parse_mode=ParseMode.MARKDOWN)
         return
 
     title    = info.get("title", "Unknown")

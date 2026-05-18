@@ -1,17 +1,13 @@
 """
 handlers.py — All Telegram command, message, and callback query handlers.
 
-Supported commands:
-  /start   /help   /settings   /cookiecheck   /stats
+URL flow (fully automatic — no menus):
+  • Image post  → detect → download image → send
+  • Video post  → detect → download best quality → send
+  YouTube uses 1080p, all other platforms use best available.
 
-Message handler:
-  • YouTube / Instagram / Facebook / Pinterest / TikTok / Twitter / Reddit URL → download flow
-  • Any other text → YouTube search (top 5 results)
-
-Download flow (inline keyboard):
-  Video → quality picker → download + upload
-  Audio → MP3 extract + upload
-  Thumbnail → fetch + send
+YouTube search (text input):
+  → show top 5 results → user taps one → auto-download immediately
 """
 
 import asyncio
@@ -24,9 +20,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 from yt_dlp.utils import DownloadError, ExtractorError
@@ -34,21 +28,18 @@ from yt_dlp.utils import DownloadError, ExtractorError
 import config
 from config import (
     DOWNLOAD_DIR, get_settings, register_for_cleanup,
-    user_settings, cleanup_registry, BOT_START_TIME, _pyro_bot,
+    user_settings, cleanup_registry, BOT_START_TIME,
     TELEGRAM_API_ID, TELEGRAM_API_HASH,
 )
 from cookies import (
     youtube_cookie_status, facebook_cookie_status, instagram_cookie_status,
-    COOKIES_FILE, FB_COOKIES_FILE, IG_COOKIES_FILE,
 )
-from platforms import detect_platform, platform_label, is_supported_url, PLATFORM_EMOJI
-from downloader import (
-    extract_info, do_download, pick_best_formats, download_video,
-)
+from platforms import detect_platform, is_supported_url, PLATFORM_EMOJI
+from downloader import extract_info, download_video
 from uploader import send_file, download_thumbnail
 from utils import (
-    friendly_error, human_size, format_uptime, download_dir_info,
-    get_ffmpeg_version, get_ytdlp_version, download_progress_text,
+    friendly_error, format_uptime, download_dir_info,
+    get_ffmpeg_version, get_ytdlp_version,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,41 +52,26 @@ logger = logging.getLogger(__name__)
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Welcome to Media Downloader Bot!*\n\n"
-        "Send me a link from any of these platforms:\n\n"
-        "▶️ *YouTube* — videos, shorts, playlists\n"
-        "📸 *Instagram* — reels, posts, stories\n"
-        "👥 *Facebook* — videos, reels, watch\n"
-        "📌 *Pinterest* — video pins\n"
-        "🎵 *TikTok* — public videos\n"
-        "🐦 *Twitter / X* — videos, GIFs\n"
-        "🟠 *Reddit* — video posts\n"
-        "🌐 *Other sites* — Vimeo, Dailymotion, etc.\n\n"
+        "Just send a link — I'll download it automatically!\n\n"
+        "▶️ YouTube  📸 Instagram  👥 Facebook\n"
+        "📌 Pinterest  🎵 TikTok  🐦 Twitter/X  🟠 Reddit\n"
+        "🌐 Vimeo, Dailymotion, and 1000+ more\n\n"
         "Or send a *song/video name* to search YouTube.\n\n"
-        "⚙️ /settings – Preferences\n"
-        "🍪 /cookiecheck – Cookie status\n"
-        "📊 /stats – Bot info\n"
-        "❓ /help – Help",
+        "⚙️ /settings  🍪 /cookiecheck  📊 /stats",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "❓ *Help & Usage*\n\n"
-        "*Downloading a video:*\n"
-        "1. Paste a URL from YouTube, Instagram, TikTok, etc.\n"
-        "2. Choose Video, Audio MP3, or Thumbnail\n"
-        "3. Select quality (Video only)\n\n"
-        "*YouTube Search:*\n"
-        "Send any text (not a URL) to search YouTube.\n\n"
-        "*Cookie setup (for private/age-restricted content):*\n"
-        "• YouTube: set `YOUTUBE_COOKIES` env var\n"
-        "• Instagram/Facebook: set `IG_COOKIES` or `FB_COOKIES` env var\n"
-        "• Run /cookiecheck to verify\n\n"
-        "*Supported sites:*\n"
-        "YouTube, Instagram, Facebook, Pinterest, TikTok, Twitter/X, "
-        "Reddit, Vimeo, Dailymotion, and 1000+ more via yt-dlp.\n\n"
-        "⚙️ /settings — Change quality, mode, cleanup timer",
+        "❓ *Help*\n\n"
+        "Paste any URL → download starts automatically.\n"
+        "• YouTube: 1080p\n"
+        "• All other platforms: best available quality\n\n"
+        "Send any *text* (not a URL) to search YouTube.\n\n"
+        "For private/age-restricted content, set cookie env vars:\n"
+        "`YOUTUBE_COOKIES`, `IG_COOKIES`, `FB_COOKIES`\n"
+        "Run /cookiecheck to verify.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -105,149 +81,72 @@ async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fb = facebook_cookie_status()
     ig = instagram_cookie_status()
 
-    def _status_line(cs: dict, label: str) -> str:
-        if cs["ok"]:
-            return f"✅ {label}: `{cs.get('yt_lines', cs.get('total', '?'))}` cookie lines"
-        return f"❌ {label}: {cs['reason']}"
+    def _line(cs, label):
+        return (f"✅ {label}: `{cs.get('yt_lines', cs.get('total','?'))}` lines"
+                if cs["ok"] else f"❌ {label}: {cs['reason']}")
 
     msg = (
         "🍪 *Cookie Status*\n\n"
-        f"{_status_line(yt, 'YouTube')}\n"
-        f"{_status_line(ig, 'Instagram')}\n"
-        f"{_status_line(fb, 'Facebook')}\n\n"
+        f"{_line(yt,'YouTube')}\n{_line(ig,'Instagram')}\n{_line(fb,'Facebook')}\n\n"
     )
-
     if not yt["ok"]:
-        msg += (
-            "*Fix YouTube cookies:*\n"
-            "1. Export cookies from `youtube.com` (logged in)\n"
-            "2. Use *'Get cookies.txt LOCALLY'* extension\n"
-            "3. Set `YOUTUBE_COOKIES` env var to file contents\n"
-            "⚠️ Do NOT export in incognito mode\n\n"
-        )
+        msg += ("*Fix YouTube:* Export from `youtube.com` → set `YOUTUBE_COOKIES` env var\n\n")
     if not ig["ok"] and not fb["ok"]:
-        msg += (
-            "*Fix Instagram/Facebook cookies:*\n"
-            "1. Export cookies from `instagram.com` or `facebook.com`\n"
-            "2. Set `IG_COOKIES` or `FB_COOKIES` env var\n"
-            "Note: public content works without cookies\n"
-        )
-
+        msg += "*Fix IG/FB:* Export → set `IG_COOKIES` or `FB_COOKIES` env var"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ytdlp_ver          = get_ytdlp_version()
-    ffmpeg_ver         = get_ffmpeg_version()
-    python_ver         = sys.version.split()[0]
-    os_info            = f"{_platform.system()} {_platform.release()}"
-    uptime_str         = format_uptime(time.time() - BOT_START_TIME)
     file_count, dir_bytes = download_dir_info()
-    dir_mb             = dir_bytes / (1024 * 1024)
-    active_users       = len(user_settings)
-    queued_files       = len(cleanup_registry)
-
-    yt_cs  = youtube_cookie_status()
-    fb_cs  = facebook_cookie_status()
-    ig_cs  = instagram_cookie_status()
-
-    pyro = config._pyro_bot
-    if pyro and pyro.is_connected:
-        upload_str = "🚀 2 GB ✅ (Pyrogram MTProto)"
-    elif TELEGRAM_API_ID and TELEGRAM_API_HASH:
-        upload_str = "⚠️ Credentials set but Pyrogram not connected"
-    else:
-        upload_str = "❌ TELEGRAM_API_ID / TELEGRAM_API_HASH not set"
-
+    pyro       = config._pyro_bot
+    upload_str = ("🚀 2 GB ✅ (Pyrogram MTProto)"
+                  if (pyro and pyro.is_connected) else "❌ Pyrogram not connected")
     msg = (
-        "📊 *Bot Statistics*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🔧 *Dependencies*\n"
-        f"  • yt-dlp:  `{ytdlp_ver}`\n"
-        f"  • FFmpeg:  `{ffmpeg_ver}`\n"
-        f"  • Python:  `{python_ver}`\n"
-        f"  • OS:      `{os_info}`\n\n"
-        "⏱ *Runtime*\n"
-        f"  • Uptime:  `{uptime_str}`\n\n"
-        "👥 *Usage*\n"
-        f"  • Active user profiles:  `{active_users}`\n"
-        f"  • Files pending cleanup: `{queued_files}`\n\n"
-        "💾 *Download Folder*\n"
-        f"  • Files: `{file_count}`  Size: `{dir_mb:.2f} MB`\n\n"
-        f"📤 *Upload engine:* {upload_str}\n\n"
-        "🍪 *Cookies*\n"
-        f"  • YouTube:   {'✅' if yt_cs['ok'] else '❌'}\n"
-        f"  • Instagram: {'✅' if ig_cs['ok'] else '❌'}\n"
-        f"  • Facebook:  {'✅' if fb_cs['ok'] else '❌'}\n"
+        "📊 *Bot Statistics*\n\n"
+        f"• yt-dlp:  `{get_ytdlp_version()}`\n"
+        f"• FFmpeg:  `{get_ffmpeg_version()}`\n"
+        f"• Python:  `{sys.version.split()[0]}`\n"
+        f"• Uptime:  `{format_uptime(time.time() - BOT_START_TIME)}`\n"
+        f"• Downloads: `{file_count}` files / `{dir_bytes/1024**2:.1f} MB`\n"
+        f"• Upload: {upload_str}\n"
+        f"• YouTube cookies: {'✅' if youtube_cookie_status()['ok'] else '❌'}\n"
+        f"• Instagram cookies: {'✅' if instagram_cookie_status()['ok'] else '❌'}\n"
+        f"• Facebook cookies: {'✅' if facebook_cookie_status()['ok'] else '❌'}\n"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  SETTINGS
+#  SETTINGS  (cleanup timer only)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _settings_keyboard(uid: int) -> InlineKeyboardMarkup:
-    s = get_settings(uid)
-    mode_lbl  = "Fixed ✅" if s["mode"] == "fixed" else "Manual 🎛"
-    timer_lbl = "♾ Never"  if s["cleanup_minutes"] == 0 else f"{s['cleanup_minutes']} min"
+    s         = get_settings(uid)
+    timer_lbl = "♾ Never" if s["cleanup_minutes"] == 0 else f"{s['cleanup_minutes']} min"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🎬 Default Quality: {s['quality'].upper()}", callback_data="s:quality")],
-        [InlineKeyboardButton(f"🔁 Download Mode: {mode_lbl}",               callback_data="s:mode")],
-        [InlineKeyboardButton(f"🧹 Cleanup Timer: {timer_lbl}",              callback_data="s:cleanup")],
-        [InlineKeyboardButton("❌ Close",                                     callback_data="s:close")],
+        [InlineKeyboardButton(f"🧹 Auto-Cleanup: {timer_lbl}", callback_data="s:cleanup")],
+        [InlineKeyboardButton("❌ Close",                       callback_data="s:close")],
     ])
 
 
 async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
     await update.message.reply_text(
-        "⚙️ *Your Settings*\nTap an option to change it:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=_settings_keyboard(uid),
+        "⚙️ *Settings*", parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_settings_keyboard(update.effective_user.id),
     )
 
 
 async def settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; uid = q.from_user.id; await q.answer()
     parts = q.data.split(":")
-
     if parts[1] == "close":
         await q.message.delete(); return
     if parts[1] == "back":
-        await q.message.edit_text("⚙️ *Your Settings*", parse_mode=ParseMode.MARKDOWN,
+        await q.message.edit_text("⚙️ *Settings*", parse_mode=ParseMode.MARKDOWN,
             reply_markup=_settings_keyboard(uid)); return
-
-    if parts[1] == "quality" and len(parts) == 2:
-        await q.message.edit_text("🎬 *Select Default Video Quality:*",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("360p",  callback_data="s:set:quality:360p"),
-                 InlineKeyboardButton("480p",  callback_data="s:set:quality:480p")],
-                [InlineKeyboardButton("720p",  callback_data="s:set:quality:720p"),
-                 InlineKeyboardButton("1080p", callback_data="s:set:quality:1080p")],
-                [InlineKeyboardButton("🟣 1440p (2K)", callback_data="s:set:quality:1440p"),
-                 InlineKeyboardButton("🔵 2160p (4K)", callback_data="s:set:quality:2160p")],
-                [InlineKeyboardButton("⭐ Best Available", callback_data="s:set:quality:best")],
-                [InlineKeyboardButton("⬅️ Back",           callback_data="s:back")],
-            ])); return
-
-    if parts[1] == "mode" and len(parts) == 2:
-        await q.message.edit_text(
-            "🔁 *Download Mode:*\n\n"
-            "• *Fixed* – always use default quality\n"
-            "• *Manual* – choose quality per download",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Fixed Quality",    callback_data="s:set:mode:fixed")],
-                [InlineKeyboardButton("🎛 Manual Selection", callback_data="s:set:mode:manual")],
-                [InlineKeyboardButton("⬅️ Back",             callback_data="s:back")],
-            ])); return
-
     if parts[1] == "cleanup" and len(parts) == 2:
         await q.message.edit_text(
-            "🧹 *Auto-Cleanup Timer:*\nFiles deleted after this delay.",
-            parse_mode=ParseMode.MARKDOWN,
+            "🧹 *Auto-Cleanup Timer:*", parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("5 min",   callback_data="s:set:cleanup:5"),
                  InlineKeyboardButton("10 min",  callback_data="s:set:cleanup:10")],
@@ -256,19 +155,16 @@ async def settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("♾ Never", callback_data="s:set:cleanup:0")],
                 [InlineKeyboardButton("⬅️ Back",  callback_data="s:back")],
             ])); return
-
     if parts[1] == "set" and len(parts) == 4:
-        key, value = parts[2], parts[3]
         s = get_settings(uid)
-        if key == "quality":   s["quality"] = value
-        elif key == "mode":    s["mode"] = value
-        elif key == "cleanup": s["cleanup_minutes"] = int(value)
-        await q.message.edit_text("✅ *Setting saved!*", parse_mode=ParseMode.MARKDOWN,
+        if parts[2] == "cleanup":
+            s["cleanup_minutes"] = int(parts[3])
+        await q.message.edit_text("✅ *Saved!*", parse_mode=ParseMode.MARKDOWN,
             reply_markup=_settings_keyboard(uid))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  MESSAGE HANDLER — URL or search query
+#  MESSAGE HANDLER
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -279,31 +175,32 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await handle_search(update, ctx, text)
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  URL HANDLER — fully automatic, no menus
+# ═════════════════════════════════════════════════════════════════════════════
+
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
+    """Detect content type and download immediately — no prompts."""
     platform = detect_platform(url)
-    label    = platform_label(url)
-    msg = await update.message.reply_text(f"{label} — 🔍 Fetching info…")
+    emoji    = PLATFORM_EMOJI.get(platform, "🌐")
+    msg      = await update.message.reply_text(
+        f"{emoji} *Fetching info…*", parse_mode=ParseMode.MARKDOWN)
 
     try:
         info = await extract_info(url)
     except (DownloadError, ExtractorError) as e:
-        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
-        return
+        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
     except Exception as e:
-        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
-        return
+        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
 
     if not info:
-        await msg.edit_text("❌ Could not fetch info for this URL.", parse_mode=ParseMode.MARKDOWN)
+        await msg.edit_text("❌ Could not fetch info.", parse_mode=ParseMode.MARKDOWN)
         return
 
+    uid      = update.effective_user.id
     title    = info.get("title", "Unknown")
     duration = info.get("duration", 0)
-    dur_str  = f"{duration // 60}m {duration % 60}s" if duration else "?"
-    emoji    = PLATFORM_EMOJI.get(platform, "🌐")
-
-    ctx.user_data["url"]      = url
-    ctx.user_data["platform"] = platform
+    vid_id   = info.get("id", url.rstrip("/").split("/")[-1])
 
     slim_formats = [
         {k: f.get(k) for k in
@@ -311,295 +208,53 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
           "filesize", "filesize_approx", "format_note", "tbr", "fps")}
         for f in (info.get("formats") or [])
     ]
-    ctx.user_data["info"] = {
-        "id":         info.get("id", ""),
-        "title":      title,
-        "duration":   duration,
+    cached_info = {
+        "id": vid_id, "title": title, "duration": duration,
         "thumbnail":  info.get("thumbnail"),
-        "thumbnails": [
-            {"url": t.get("url"), "width": t.get("width")}
-            for t in (info.get("thumbnails") or [])
-            if t.get("url")
-        ],
+        "thumbnails": [{"url": t.get("url"), "width": t.get("width")}
+                       for t in (info.get("thumbnails") or []) if t.get("url")],
         "formats": slim_formats,
     }
 
-    # ── Detect image-only posts (Instagram photo posts, Pinterest image pins, etc.)
-    # An image post has no video formats at all and no duration.
-    has_video_formats = any(
+    has_video = any(
         (f.get("vcodec") or "none").lower() not in ("none", "")
         for f in slim_formats
     )
-    # Some extractors return ext=jpg/png/webp for image posts
-    has_image_formats = any(
+    has_img_ext = any(
         (f.get("ext") or "").lower() in ("jpg", "jpeg", "png", "webp", "gif")
         for f in slim_formats
     )
-    is_image_post = (not has_video_formats and not duration) or has_image_formats
+    is_image = (not has_video and not duration) or has_img_ext
 
-    if is_image_post:
-        # ── Image post: show image download button (+ thumbnail if different)
-        buttons = [
-            [InlineKeyboardButton("🖼 Download Image", callback_data="dl:image")],
-        ]
-        if info.get("thumbnail"):
-            buttons.append([InlineKeyboardButton("🔗 Thumbnail URL", callback_data="dl:thumb")])
-        buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")])
-        await msg.edit_text(
-            f"{emoji} *{title}*\n\n📷 This is an *image post*.\nWhat would you like?",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-        return
-
-    # ── Video / audio post: normal flow
-    buttons = [
-        [InlineKeyboardButton("🎬 Video",     callback_data="dl:video")],
-        [InlineKeyboardButton("🎵 Audio MP3", callback_data="dl:audio")],
-    ]
-    if info.get("thumbnail"):
-        buttons.append([InlineKeyboardButton("🖼 Thumbnail", callback_data="dl:thumb")])
-    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")])
-
-    await msg.edit_text(
-        f"{emoji} *{title}*\n⏱ `{dur_str}`\n\nWhat would you like?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    if is_image:
+        await _download_image(msg, ctx, url, platform, cached_info, uid)
+    else:
+        quality = "1080p" if platform == "youtube" else "best"
+        await _download_video(msg, url, platform, cached_info, uid, quality)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  DOWNLOAD CALLBACKS
-# ═════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+#  Auto image download
+# ─────────────────────────────────────────────────────────────────────────────
 
-async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; uid = q.from_user.id; await q.answer()
-    parts  = q.data.split(":")
-    action = parts[1]
+async def _download_image(msg, ctx, url, platform, info, uid):
+    emoji  = PLATFORM_EMOJI.get(platform, "🌐")
+    title  = info.get("title", "Image post")
+    vid_id = info.get("id", "img")
+    s      = get_settings(uid)
 
-    if action == "cancel":
-        await q.message.edit_text("❌ Download cancelled."); return
-    if action == "thumb":
-        await do_thumbnail(q, ctx, uid); return
-    if action == "image":
-        await do_image(q, ctx, uid); return
-    if action == "audio":
-        await do_audio(q, ctx, uid); return
-    if action == "video":
-        platform = ctx.user_data.get("platform", "generic")
-        s        = get_settings(uid)
-        # Quality picker only makes sense for YouTube (adaptive streams with many resolutions).
-        # All other platforms: download immediately at best available quality.
-        if platform == "youtube":
-            if s["mode"] == "fixed":
-                await do_video(q, ctx, uid, s["quality"])
-            else:
-                await show_quality_menu(q, ctx)
-        else:
-            # Non-YouTube: always best quality, no picker needed
-            await do_video(q, ctx, uid, "best")
-        return
-    if action == "quality" and len(parts) == 3:
-        await do_video(q, ctx, uid, parts[2]); return
-    if action == "search" and len(parts) == 3:
-        results = ctx.user_data.get("search_results", [])
-        idx = int(parts[2])
-        if idx < len(results):
-            entry = results[idx]
-            ctx.user_data["url"]      = entry.get("webpage_url") or entry.get("url", "")
-            ctx.user_data["platform"] = "youtube"
-            ctx.user_data["info"]     = entry
-            await q.message.edit_text(
-                f"🎵 *{entry.get('title', '?')}*\n\nChoose download type:",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎬 Video",     callback_data="dl:video")],
-                    [InlineKeyboardButton("🎵 Audio MP3", callback_data="dl:audio")],
-                    [InlineKeyboardButton("❌ Cancel",    callback_data="dl:cancel")],
-                ]),
-            )
+    await msg.edit_text("⬇️ *Downloading image…*", parse_mode=ParseMode.MARKDOWN)
 
+    downloaded_files: list[str] = []
 
-async def show_quality_menu(q, ctx):
-    info    = ctx.user_data.get("info", {})
-    formats = info.get("formats", [])
-    title   = info.get("title", "Video")
-
-    seen_heights    = set()
-    quality_formats = []
-    for f in formats:
-        vc = (f.get("vcodec") or "none").lower()
-        h  = f.get("height")
-        if vc == "none" or not h or h in seen_heights:
-            continue
-        seen_heights.add(h)
-        quality_formats.append(f)
-    quality_formats.sort(key=lambda f: f.get("height", 0))
-
-    buttons = []
-    for f in quality_formats:
-        h        = f.get("height", "?")
-        note     = f.get("format_note") or f"{h}p"
-        size     = f.get("filesize") or f.get("filesize_approx")
-        size_str = f"  {size // 1024 // 1024} MB" if size else ""
-        ac       = (f.get("acodec") or "none").lower()
-        tag      = "🔊" if ac != "none" else "🎬"
-        buttons.append([InlineKeyboardButton(
-            f"{tag} {note}{size_str}", callback_data=f"dl:quality:{h}p")])
-
-    buttons.append([InlineKeyboardButton("⭐ Best Available", callback_data="dl:quality:best")])
-    buttons.append([InlineKeyboardButton("❌ Cancel",         callback_data="dl:cancel")])
-
-    await q.message.edit_text(
-        f"🎬 *{title}*\n\nSelect quality:",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
-
-
-# ── Video ─────────────────────────────────────────────────────────────────────
-
-async def do_video(q, ctx, uid: int, quality: str):
-    url = ctx.user_data.get("url")
-    if not url:
-        await q.message.edit_text("❌ No URL stored. Please resend the link."); return
-
-    cached_info = ctx.user_data.get("info", {})
-    vid_id      = cached_info.get("id", "unknown")
-    title       = cached_info.get("title", vid_id)
-    platform    = ctx.user_data.get("platform", detect_platform(url))
-    emoji       = PLATFORM_EMOJI.get(platform, "🌐")
-
-    status = await q.message.edit_text(
-        f"⬇️ *Downloading {emoji} ({quality})…*",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    try:
-        merged_path = await download_video(url, quality, status, vid_id, cached_info)
-        logger.info("Downloaded: %s", merged_path)
-    except Exception as e:
-        raw = str(e)[:500]
-        logger.error("Download failed: %s", raw)
-        await status.edit_text(
-            friendly_error(e) + f"\n\n`{raw}`",
-            parse_mode=ParseMode.MARKDOWN)
-        return
-    finally:
-        gc.collect()
-
-    thumb_path = download_thumbnail(cached_info, vid_id)
-    s = get_settings(uid)
-    if thumb_path:
-        register_for_cleanup(thumb_path, s["cleanup_minutes"])
-
-    safe_title = re.sub(r'[^\w\s-]', '', title)[:50].strip()
-    filename   = f"{safe_title}_{quality}.mp4"
-    caption    = f"{emoji} *{title}*\n🎞 Quality: `{quality}`"
-
-    try:
-        await send_file(
-            chat_id    = q.message.chat_id,
-            filepath   = merged_path,
-            filename   = filename,
-            caption    = caption,
-            status_msg = status,
-            is_video   = True,
-            thumb_path = thumb_path,
-        )
-        await status.delete()
-    except Exception as e:
-        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
-        return
-    finally:
-        ctx.user_data.pop("info", None)
-        gc.collect()
-
-    register_for_cleanup(merged_path, s["cleanup_minutes"])
-
-
-# ── Audio ─────────────────────────────────────────────────────────────────────
-
-async def do_audio(q, ctx, uid: int):
-    url = ctx.user_data.get("url")
-    if not url:
-        await q.message.edit_text("❌ No URL stored."); return
-
-    platform = ctx.user_data.get("platform", detect_platform(url))
-    emoji    = PLATFORM_EMOJI.get(platform, "🌐")
-    status   = await q.message.edit_text(
-        f"⬇️ *Extracting audio {emoji}…*", parse_mode=ParseMode.MARKDOWN)
-
-    loop = asyncio.get_event_loop()
-    from utils import build_progress_hook
-    hook = build_progress_hook(loop, status, "🎵 audio")
-    try:
-        info = await do_download(url, {
-            "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
-            "postprocessors": [{"key": "FFmpegExtractAudio",
-                                "preferredcodec": "mp3",
-                                "preferredquality": "192"}],
-        }, hook)
-    except (DownloadError, ExtractorError) as e:
-        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
-    except Exception as e:
-        await status.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN); return
-
-    vid_id = info.get("id", "")
-    files  = list(DOWNLOAD_DIR.glob(f"{vid_id}.mp3")) or list(DOWNLOAD_DIR.glob(f"{vid_id}.*"))
-    if not files:
-        await status.edit_text("❌ Audio file not found."); return
-
-    filepath = str(files[0])
-    title    = info.get("title", "audio")
-    try:
-        await send_file(
-            chat_id    = q.message.chat_id,
-            filepath   = filepath,
-            filename   = f"{title}.mp3",
-            caption    = f"🎵 {title}",
-            status_msg = status,
-            is_video   = False,
-        )
-        await status.delete()
-    except Exception as e:
-        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-
-    register_for_cleanup(filepath, get_settings(uid)["cleanup_minutes"])
-
-
-# ── Image post download ───────────────────────────────────────────────────────
-
-async def do_image(q, ctx, uid: int):
-    """
-    Download and send image post(s).
-    For Pinterest pins and Instagram photo posts, the full-size image is
-    served via the thumbnail URL — we use that directly without calling
-    yt-dlp again (which would just raise 'No video formats found' again).
-    Also handles multi-image carousels via yt-dlp for platforms that support it.
-    """
-    info     = ctx.user_data.get("info", {})
-    url      = ctx.user_data.get("url", "")
-    platform = ctx.user_data.get("platform", "generic")
-    emoji    = PLATFORM_EMOJI.get(platform, "🌐")
-    title    = info.get("title", "image")
-    vid_id   = info.get("id", "unknown")
-    s        = get_settings(uid)
-
-    status = await q.message.edit_text(
-        "⬇️ *Downloading image…*", parse_mode=ParseMode.MARKDOWN)
-
-    # ── Step 1: Try thumbnail URL first (works for Pinterest, most IG photos)
-    # Pick the highest-resolution thumbnail available.
-    thumb_url = None
+    # Step 1: thumbnail URL (fastest — no extra network call)
+    thumb_url  = None
     thumbnails = info.get("thumbnails") or []
     if thumbnails:
-        best = sorted(thumbnails, key=lambda t: t.get("width") or 0, reverse=True)
+        best      = sorted(thumbnails, key=lambda t: t.get("width") or 0, reverse=True)
         thumb_url = best[0].get("url")
     if not thumb_url:
         thumb_url = info.get("thumbnail")
-
-    downloaded_files: list[str] = []
 
     if thumb_url:
         outpath = str(DOWNLOAD_DIR / f"{vid_id}_img.jpg")
@@ -607,58 +262,23 @@ async def do_image(q, ctx, uid: int):
             urllib.request.urlretrieve(thumb_url, outpath)
             if Path(outpath).stat().st_size > 2000:
                 downloaded_files = [outpath]
-                logger.info("Image downloaded via thumbnail URL: %s", outpath)
+                logger.info("Image via thumbnail URL: %s", outpath)
         except Exception as e:
-            logger.warning("Thumbnail URL fetch failed: %s", e)
+            logger.warning("Thumbnail URL failed: %s", e)
 
-    # ── Step 2: Try yt-dlp with writethumbnail (works for IG carousels/photos)
-    # This lets yt-dlp download the image(s) without needing video formats.
+    # Step 2: writethumbnail via yt-dlp (IG photos that have no pre-known URL)
     if not downloaded_files:
         loop = asyncio.get_event_loop()
         try:
             from yt_dlp import YoutubeDL
             from platforms import ydl_opts_for
-
             opts = ydl_opts_for(url)
             opts.update({
-                "skip_download":   True,        # don't try to download video
-                "writethumbnail":  True,         # download thumbnail/image instead
-                "outtmpl":         str(DOWNLOAD_DIR / f"{vid_id}_%(autonumber)s.%(ext)s"),
-            })
-
-            def _get_thumb():
-                before = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
-                try:
-                    with YoutubeDL(opts) as ydl:
-                        ydl.extract_info(url, download=True)
-                except Exception:
-                    pass   # ignore errors — check what files appeared
-                after = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
-                return [
-                    str(f) for f in (after - before)
-                    if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif")
-                ]
-
-            downloaded_files = await loop.run_in_executor(None, _get_thumb)
-            if downloaded_files:
-                logger.info("Image(s) downloaded via writethumbnail: %s", downloaded_files)
-        except Exception as e:
-            logger.warning("writethumbnail fallback failed: %s", e)
-
-    # ── Step 3: yt-dlp full download as last resort (handles carousels)
-    if not downloaded_files:
-        loop = asyncio.get_event_loop()
-        try:
-            from yt_dlp import YoutubeDL
-            from platforms import ydl_opts_for
-
-            opts = ydl_opts_for(url)
-            opts.update({
-                "format":  "best",
+                "skip_download":  True,
+                "writethumbnail": True,
                 "outtmpl": str(DOWNLOAD_DIR / f"{vid_id}_%(autonumber)s.%(ext)s"),
             })
-
-            def _download():
+            def _get_thumb():
                 before = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
                 try:
                     with YoutubeDL(opts) as ydl:
@@ -666,102 +286,103 @@ async def do_image(q, ctx, uid: int):
                 except Exception:
                     pass
                 after = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
-                return [
-                    str(f) for f in (after - before)
-                    if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif")
-                ]
-
-            downloaded_files = await loop.run_in_executor(None, _download)
+                return [str(f) for f in (after - before)
+                        if f.suffix.lower() in (".jpg",".jpeg",".png",".webp",".gif")]
+            downloaded_files = await loop.run_in_executor(None, _get_thumb)
+            if downloaded_files:
+                logger.info("Image via writethumbnail: %s", downloaded_files)
         except Exception as e:
-            logger.warning("yt-dlp full download also failed: %s", e)
+            logger.warning("writethumbnail failed: %s", e)
 
     if not downloaded_files:
-        await status.edit_text(
-            "❌ Could not download image.\n"
-            "The post may be private, removed, or require login.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await msg.edit_text(
+            "❌ Could not download image.\nThe post may be private or require login.",
+            parse_mode=ParseMode.MARKDOWN)
         return
 
-    # ── Send all images
-    await status.edit_text(
-        f"📤 *Sending {len(downloaded_files)} image(s)…*",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await msg.edit_text(
+        f"📤 *Sending {len(downloaded_files)} image(s)…*", parse_mode=ParseMode.MARKDOWN)
+
     caption = f"{emoji} *{title}*"
-    sent = 0
+    sent    = 0
     for fpath in sorted(downloaded_files):
         try:
             with open(fpath, "rb") as f:
-                await ctx.bot.send_photo(
-                    chat_id = q.message.chat_id,
-                    photo   = f,
-                    caption = caption if sent == 0 else "",
-                )
+                await ctx.bot.send_photo(chat_id=msg.chat_id, photo=f,
+                                         caption=caption if sent == 0 else "")
             sent += 1
-            register_for_cleanup(fpath, s["cleanup_minutes"])
         except Exception:
-            # send_photo fails for webp/large — fall back to document
             try:
                 with open(fpath, "rb") as f:
-                    await ctx.bot.send_document(
-                        chat_id  = q.message.chat_id,
-                        document = f,
-                        filename = Path(fpath).name,
-                        caption  = caption if sent == 0 else "",
-                    )
+                    await ctx.bot.send_document(chat_id=msg.chat_id, document=f,
+                                                filename=Path(fpath).name,
+                                                caption=caption if sent == 0 else "")
                 sent += 1
-                register_for_cleanup(fpath, s["cleanup_minutes"])
             except Exception as e2:
                 logger.warning("Failed to send image %s: %s", fpath, e2)
+        register_for_cleanup(fpath, s["cleanup_minutes"])
 
     if sent:
-        await status.delete()
+        await msg.delete()
     else:
-        await status.edit_text(
-            "❌ Failed to send image.", parse_mode=ParseMode.MARKDOWN)
+        await msg.edit_text("❌ Failed to send image.", parse_mode=ParseMode.MARKDOWN)
 
 
-# ── Thumbnail ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Auto video download
+# ─────────────────────────────────────────────────────────────────────────────
 
-async def do_thumbnail(q, ctx, uid: int):
-    info      = ctx.user_data.get("info", {})
-    thumb_url = info.get("thumbnail")
-    if not thumb_url:
-        await q.message.edit_text("❌ No thumbnail found."); return
+async def _download_video(msg, url, platform, cached_info, uid, quality):
+    emoji  = PLATFORM_EMOJI.get(platform, "🌐")
+    title  = cached_info.get("title", "video")
+    vid_id = cached_info.get("id", "unknown")
+    s      = get_settings(uid)
 
-    status  = await q.message.edit_text("🖼 *Downloading thumbnail…*", parse_mode=ParseMode.MARKDOWN)
-    outpath = DOWNLOAD_DIR / f"{info.get('id', 'thumb')}_thumb.jpg"
+    await msg.edit_text(
+        f"⬇️ *Downloading* {emoji} `{title}`…", parse_mode=ParseMode.MARKDOWN)
+
     try:
-        urllib.request.urlretrieve(thumb_url, outpath)
+        merged_path = await download_video(url, quality, msg, vid_id, cached_info)
     except Exception as e:
-        await status.edit_text(f"❌ Thumbnail fetch failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
-    try:
-        with open(outpath, "rb") as f:
-            await ctx.bot.send_document(
-                chat_id  = q.message.chat_id,
-                document = f,
-                filename = f"{info.get('title', 'thumbnail')}.jpg",
-                caption  = f"🖼 {info.get('title', '')}",
-            )
-        await status.delete()
-    except Exception as e:
-        await status.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN); return
+        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+        gc.collect(); return
 
-    register_for_cleanup(str(outpath), get_settings(uid)["cleanup_minutes"])
+    gc.collect()
+    thumb_path = download_thumbnail(cached_info, vid_id)
+    if thumb_path:
+        register_for_cleanup(thumb_path, s["cleanup_minutes"])
+
+    safe_title = re.sub(r'[^\w\s-]', '', title)[:50].strip()
+    caption    = f"{emoji} *{title}*"
+
+    try:
+        await send_file(
+            chat_id    = msg.chat_id,
+            filepath   = merged_path,
+            filename   = f"{safe_title}.mp4",
+            caption    = caption,
+            status_msg = msg,
+            is_video   = True,
+            thumb_path = thumb_path,
+        )
+        await msg.delete()
+    except Exception as e:
+        await msg.edit_text(f"❌ Upload failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    register_for_cleanup(merged_path, s["cleanup_minutes"])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  YOUTUBE SEARCH
+#  YOUTUBE SEARCH — shows results list, auto-downloads on tap
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: str):
     msg = await update.message.reply_text(
-        f"🔎 Searching YouTube: *{query}*…", parse_mode=ParseMode.MARKDOWN)
+        f"🔎 *Searching:* `{query}`…", parse_mode=ParseMode.MARKDOWN)
     try:
         results_info = await extract_info(
-            f"ytsearch5:{query}",
-            download=False,
+            f"ytsearch5:{query}", download=False,
             extra_opts={"extract_flat": True},
         )
     except Exception as e:
@@ -774,18 +395,50 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: s
     ctx.user_data["search_results"] = entries
     buttons = []
     for i, entry in enumerate(entries[:5]):
-        title   = entry.get("title", "Unknown")[:52]
-        dur     = entry.get("duration", 0)
-        dur_str = f"{dur // 60}:{dur % 60:02d}" if dur else "?"
-        buttons.append([InlineKeyboardButton(
-            f"{i+1}. {title} [{dur_str}]", callback_data=f"dl:search:{i}")])
+        t   = entry.get("title", "Unknown")[:52]
+        dur = entry.get("duration", 0)
+        ds  = f"{dur//60}:{dur%60:02d}" if dur else "?"
+        buttons.append([InlineKeyboardButton(f"{i+1}. {t} [{ds}]",
+                                             callback_data=f"dl:search:{i}")])
     buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="dl:cancel")])
-
     await msg.edit_text(
-        "🎵 *Top results — tap to select:*",
-        parse_mode=ParseMode.MARKDOWN,
+        "🎵 *Tap to download:*", parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CALLBACKS  (search selection + settings)
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q      = update.callback_query
+    uid    = q.from_user.id
+    await q.answer()
+    parts  = q.data.split(":")
+    action = parts[1]
+
+    if action == "cancel":
+        await q.message.edit_text("❌ Cancelled."); return
+
+    if action == "search" and len(parts) == 3:
+        results = ctx.user_data.get("search_results", [])
+        idx     = int(parts[2])
+        if idx >= len(results):
+            await q.message.edit_text("❌ Result no longer available."); return
+
+        entry  = results[idx]
+        url    = entry.get("webpage_url") or entry.get("url", "")
+        vid_id = entry.get("id", "unknown")
+        cached_info = {
+            "id": vid_id,
+            "title":      entry.get("title", "video"),
+            "duration":   entry.get("duration", 0),
+            "thumbnail":  entry.get("thumbnail"),
+            "thumbnails": [],
+            "formats":    [],
+        }
+        await _download_video(q.message, url, "youtube", cached_info, uid, "1080p")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -794,15 +447,16 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: s
 
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     import traceback
-    tb = "".join(traceback.format_exception(type(ctx.error), ctx.error,
-                                             ctx.error.__traceback__))
+    tb = "".join(traceback.format_exception(
+        type(ctx.error), ctx.error, ctx.error.__traceback__))
     logger.error("Unhandled exception:\n%s", tb)
     short = str(ctx.error)[:400]
-    msg   = f"⚠️ *Unexpected error:*\n`{short}`"
     try:
         if isinstance(update, Update) and update.callback_query:
-            await update.callback_query.message.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+            await update.callback_query.message.edit_text(
+                f"⚠️ *Error:*\n`{short}`", parse_mode=ParseMode.MARKDOWN)
         elif isinstance(update, Update) and update.message:
-            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(
+                f"⚠️ *Error:*\n`{short}`", parse_mode=ParseMode.MARKDOWN)
     except Exception:
         pass

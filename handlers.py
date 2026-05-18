@@ -605,32 +605,66 @@ async def do_image(q, ctx, uid: int):
         outpath = str(DOWNLOAD_DIR / f"{vid_id}_img.jpg")
         try:
             urllib.request.urlretrieve(thumb_url, outpath)
-            if Path(outpath).stat().st_size > 2000:   # sanity: >2 KB means real image
+            if Path(outpath).stat().st_size > 2000:
                 downloaded_files = [outpath]
                 logger.info("Image downloaded via thumbnail URL: %s", outpath)
         except Exception as e:
             logger.warning("Thumbnail URL fetch failed: %s", e)
 
-    # ── Step 2: If thumbnail fetch didn't work, try yt-dlp (handles carousels)
+    # ── Step 2: Try yt-dlp with writethumbnail (works for IG carousels/photos)
+    # This lets yt-dlp download the image(s) without needing video formats.
     if not downloaded_files:
         loop = asyncio.get_event_loop()
-        from utils import build_progress_hook
-        hook = build_progress_hook(loop, status, "🖼 image")
         try:
             from yt_dlp import YoutubeDL
             from platforms import ydl_opts_for
 
             opts = ydl_opts_for(url)
             opts.update({
-                "format":         "best",
-                "outtmpl":        str(DOWNLOAD_DIR / f"{vid_id}_%(autonumber)s.%(ext)s"),
-                "progress_hooks": [hook],
+                "skip_download":   True,        # don't try to download video
+                "writethumbnail":  True,         # download thumbnail/image instead
+                "outtmpl":         str(DOWNLOAD_DIR / f"{vid_id}_%(autonumber)s.%(ext)s"),
+            })
+
+            def _get_thumb():
+                before = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
+                try:
+                    with YoutubeDL(opts) as ydl:
+                        ydl.extract_info(url, download=True)
+                except Exception:
+                    pass   # ignore errors — check what files appeared
+                after = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
+                return [
+                    str(f) for f in (after - before)
+                    if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif")
+                ]
+
+            downloaded_files = await loop.run_in_executor(None, _get_thumb)
+            if downloaded_files:
+                logger.info("Image(s) downloaded via writethumbnail: %s", downloaded_files)
+        except Exception as e:
+            logger.warning("writethumbnail fallback failed: %s", e)
+
+    # ── Step 3: yt-dlp full download as last resort (handles carousels)
+    if not downloaded_files:
+        loop = asyncio.get_event_loop()
+        try:
+            from yt_dlp import YoutubeDL
+            from platforms import ydl_opts_for
+
+            opts = ydl_opts_for(url)
+            opts.update({
+                "format":  "best",
+                "outtmpl": str(DOWNLOAD_DIR / f"{vid_id}_%(autonumber)s.%(ext)s"),
             })
 
             def _download():
                 before = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
-                with YoutubeDL(opts) as ydl:
-                    ydl.extract_info(url, download=True)
+                try:
+                    with YoutubeDL(opts) as ydl:
+                        ydl.extract_info(url, download=True)
+                except Exception:
+                    pass
                 after = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
                 return [
                     str(f) for f in (after - before)
@@ -639,7 +673,7 @@ async def do_image(q, ctx, uid: int):
 
             downloaded_files = await loop.run_in_executor(None, _download)
         except Exception as e:
-            logger.warning("yt-dlp image download also failed: %s", e)
+            logger.warning("yt-dlp full download also failed: %s", e)
 
     if not downloaded_files:
         await status.edit_text(

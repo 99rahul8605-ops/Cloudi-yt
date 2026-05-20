@@ -387,16 +387,11 @@ async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await do_audio(q, ctx, uid); return
     if action == "video":
         platform = ctx.user_data.get("platform", "generic")
-        s        = get_settings(uid)
-        # Quality picker only makes sense for YouTube (adaptive streams with many resolutions).
-        # All other platforms: download immediately at best available quality.
+        # YouTube: always show quality picker so user can choose resolution.
+        # All other platforms: skip picker and download at best available quality immediately.
         if platform == "youtube":
-            if s["mode"] == "fixed":
-                await do_video(q, ctx, uid, s["quality"])
-            else:
-                await show_quality_menu(q, ctx)
+            await show_quality_menu(q, ctx)
         else:
-            # Non-YouTube: always best quality, no picker needed
             await do_video(q, ctx, uid, "best")
         return
     if action == "quality" and len(parts) == 3:

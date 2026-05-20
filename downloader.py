@@ -30,14 +30,24 @@ async def extract_info(url: str, download: bool = False,
         opts.update(extra_opts)
     loop = asyncio.get_event_loop()
     def _run():
-        # For platforms that commonly return image-only posts, use
-        # ignore_no_formats_error=True — the official yt-dlp API flag that
-        # prevents yt-dlp from printing "ERROR: No video formats found!" to
-        # stderr and instead returns the info dict with empty formats.
-        _image_platforms = ("instagram.com", "pinterest.com", "pin.it")
-        _is_image_platform = any(p in url for p in _image_platforms)
+        # For Instagram/Pinterest, suppress yt-dlp's stderr noise entirely.
+        # These platforms produce various expected errors (image posts, private
+        # accounts, followers-only content) that we handle gracefully — we don't
+        # want yt-dlp's raw ERROR lines polluting the logs.
+        _suppress_platforms = ("instagram.com", "pinterest.com", "pin.it")
+        _is_image_platform = any(p in url for p in _suppress_platforms)
         if _is_image_platform:
             opts["ignore_no_formats_error"] = True
+            opts["quiet"] = True
+            opts["no_warnings"] = False  # keep warnings for our logger
+            # Redirect yt-dlp's logger to suppress ERROR lines from reaching stderr
+            import logging as _logging
+            class _SilentLogger:
+                def debug(self, msg): pass
+                def info(self, msg): pass
+                def warning(self, msg): logger.warning("yt-dlp: %s", msg)
+                def error(self, msg): logger.debug("yt-dlp error (suppressed): %s", msg)
+            opts["logger"] = _SilentLogger()
 
         _partial: list[dict] = []
 

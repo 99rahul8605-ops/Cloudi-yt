@@ -28,12 +28,18 @@ async def extract_info(url: str, download: bool = False,
     opts = ydl_opts_for(url)
     if extra_opts:
         opts.update(extra_opts)
+    # Suppress noisy stderr for platforms that commonly have image-only posts.
+    # yt-dlp prints "No video formats found!" to stderr before raising — we handle
+    # that error gracefully already, so the noise is misleading in logs.
+    _image_platforms = ("instagram.com", "pinterest.com", "pin.it")
+    if any(p in url for p in _image_platforms):
+        opts.setdefault("quiet", True)
+        opts.setdefault("no_warnings", True)
     loop = asyncio.get_event_loop()
     def _run():
         # Capture partial info even when yt-dlp raises (e.g. Pinterest image pins
         # raise "No video formats found" but have already populated thumbnail URL).
         _partial: list[dict] = []
-        original_extract = None
 
         class _CapturingYDL(YoutubeDL):
             def process_ie_result(self, ie_result, *args, **kwargs):

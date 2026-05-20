@@ -338,7 +338,18 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
     is_image_post = (not has_video_formats and not duration) or has_image_formats
 
     if is_image_post:
-        # ── Image post: show image download button (+ thumbnail if different)
+        # Non-YouTube image post: auto-download immediately, no menu.
+        if platform != "youtube":
+            await msg.edit_text(
+                f"{emoji} *{title}*\n\n📷 Image post — downloading…",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            class _FakeQ:
+                message = msg
+                async def answer(self): pass
+            await do_image(_FakeQ(), ctx, update.effective_user.id)
+            return
+        # YouTube fallback: show image download button
         buttons = [
             [InlineKeyboardButton("🖼 Download Image", callback_data="dl:image")],
         ]

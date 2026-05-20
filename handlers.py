@@ -626,7 +626,11 @@ async def do_image(q, ctx, uid: int):
     if thumb_url:
         outpath = str(DOWNLOAD_DIR / f"{vid_id}_img.jpg")
         try:
-            req = urllib.request.Request(thumb_url, headers={
+            # Use requests with a session so we can attach Instagram cookies if available
+            import requests as _requests
+            from pathlib import Path as _Path
+            session = _requests.Session()
+            session.headers.update({
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -635,17 +639,68 @@ async def do_image(q, ctx, uid: int):
                 "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
                 "Referer": "https://www.instagram.com/",
             })
-            with urllib.request.urlopen(req, timeout=30) as resp, open(outpath, "wb") as f:
-                f.write(resp.read())
-            if Path(outpath).stat().st_size > 2000:   # sanity: >2 KB means real image
+            # Attach Instagram cookies from file if present
+            ig_cookie_file = _Path("ig_cookies.txt")
+            if ig_cookie_file.exists():
+                import http.cookiejar as _cookiejar
+                cj = _cookiejar.MozillaCookieJar(str(ig_cookie_file))
+                try:
+                    cj.load(ignore_discard=True, ignore_expires=True)
+                    session.cookies.update({c.name: c.value for c in cj})
+                except Exception as ce:
+                    logger.debug("Could not load IG cookies for image fetch: %s", ce)
+            resp = session.get(thumb_url, timeout=30, stream=True)
+            resp.raise_for_status()
+            with open(outpath, "wb") as f:
+                for chunk in resp.iter_content(8192):
+                    f.write(chunk)
+            if Path(outpath).stat().st_size > 2000:
                 downloaded_files = [outpath]
                 logger.info("Image downloaded via thumbnail URL: %s", outpath)
         except Exception as e:
             logger.warning("Thumbnail URL fetch failed: %s", e)
 
-    # ── Step 2: If thumbnail fetch didn't work, try yt-dlp (handles carousels)
-    # Skip yt-dlp for platforms known to only have image posts (avoids noisy errors).
+    # ── Step 2: If thumbnail fetch didn't work, try yt-dlp with write-thumbnail
+    # This works for public Instagram posts and carousels.
     _image_only_platforms = {"instagram", "pinterest"}
+    if not downloaded_files and platform in _image_only_platforms:
+        loop2 = asyncio.get_event_loop()
+        try:
+            from yt_dlp import YoutubeDL
+            from platforms import ydl_opts_for
+
+            class _SilentLogger:
+                def debug(self, msg): pass
+                def info(self, msg): pass
+                def warning(self, msg): logger.debug("yt-dlp: %s", msg)
+                def error(self, msg): logger.debug("yt-dlp: %s", msg)
+
+            wt_opts = ydl_opts_for(url)
+            wt_opts.update({
+                "skip_download":         True,
+                "writethumbnail":        True,
+                "ignore_no_formats_error": True,
+                "outtmpl":               str(DOWNLOAD_DIR / f"{vid_id}_thumb.%(ext)s"),
+                "logger":                _SilentLogger(),
+            })
+
+            def _write_thumb():
+                before = set(DOWNLOAD_DIR.glob(f"{vid_id}_thumb.*"))
+                with YoutubeDL(wt_opts) as ydl:
+                    ydl.extract_info(url, download=True)
+                after = set(DOWNLOAD_DIR.glob(f"{vid_id}_thumb.*"))
+                new_files = after - before
+                return [str(f) for f in new_files
+                        if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")]
+
+            thumb_files = await loop2.run_in_executor(None, _write_thumb)
+            if thumb_files:
+                downloaded_files = thumb_files
+                logger.info("Image downloaded via writethumbnail: %s", thumb_files)
+        except Exception as e:
+            logger.warning("writethumbnail fallback failed: %s", e)
+
+    # ── Step 3: yt-dlp direct download for non-image-only platforms (carousels)
     if not downloaded_files and platform not in _image_only_platforms:
         loop = asyncio.get_event_loop()
         from utils import build_progress_hook

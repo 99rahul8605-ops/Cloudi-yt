@@ -36,52 +36,57 @@ async def extract_info(url: str, download: bool = False,
         # want yt-dlp's raw ERROR lines polluting the logs.
         _suppress_platforms = ("instagram.com", "pinterest.com", "pin.it")
         _is_image_platform = any(p in url for p in _suppress_platforms)
+
+        # Silent logger: routes all yt-dlp output through Python logging,
+        # preventing raw ERROR/WARNING lines from appearing on stderr.
+        class _SilentLogger:
+            def debug(self, msg):
+                if msg.startswith("[debug]"): return
+                logger.debug("yt-dlp: %s", msg)
+            def info(self, msg):   logger.debug("yt-dlp: %s", msg)
+            def warning(self, msg): logger.warning("yt-dlp: %s", msg)
+            def error(self, msg):   logger.debug("yt-dlp error (suppressed): %s", msg)
+
         if _is_image_platform:
-            opts["ignore_no_formats_error"] = True
-            opts["quiet"] = True
-            opts["no_warnings"] = False  # keep warnings for our logger
-            # Redirect yt-dlp's logger to suppress ERROR lines from reaching stderr
-            import logging as _logging
-            class _SilentLogger:
-                def debug(self, msg): pass
-                def info(self, msg): pass
-                def warning(self, msg): logger.warning("yt-dlp: %s", msg)
-                def error(self, msg): logger.debug("yt-dlp error (suppressed): %s", msg)
             opts["logger"] = _SilentLogger()
 
-        _partial: list[dict] = []
-
-        class _CapturingYDL(YoutubeDL):
-            def process_ie_result(self, ie_result, *args, **kwargs):
-                _partial.append(dict(ie_result))
-                return super().process_ie_result(ie_result, *args, **kwargs)
-
         try:
-            with _CapturingYDL(opts) as ydl:
+            with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=download)
             if info:
                 fmts = info.get("formats") or []
-                if not fmts and _is_image_platform:
-                    # ignore_no_formats_error returned info with no formats — image post
-                    info.setdefault("duration", 0)
-                    logger.info("Image post detected (no formats) for %s", url[:60])
-                elif fmts:
+                if fmts:
                     exts    = sorted({f.get("ext") for f in fmts if f.get("ext")})
                     heights = sorted({f.get("height") for f in fmts
                                       if isinstance(f.get("height"), int) and f["height"] > 0})
                     logger.info("Formats available — exts: %s | heights: %s", exts, heights)
+                else:
+                    logger.info("No formats returned for %s", url[:60])
             return info
         except (DownloadError, ExtractorError) as e:
             err_lower = str(e).lower()
-            if ("no video formats" in err_lower or "no formats" in err_lower
-                    or "no video in this post" in err_lower
-                    or "there is no video" in err_lower):
-                if _partial:
-                    partial = _partial[-1]
-                    partial["formats"] = []
-                    partial.setdefault("duration", 0)
-                    logger.info("Returning partial info (image post) for %s", url[:60])
-                    return partial
+            # Instagram/Pinterest image posts raise "No video formats found" —
+            # do a second extraction with ignore_no_formats_error to get the
+            # thumbnail/metadata without yt-dlp raising.
+            if _is_image_platform and (
+                "no video formats" in err_lower or "no formats" in err_lower
+                or "no video in this post" in err_lower
+                or "there is no video" in err_lower
+            ):
+                logger.info("Image post detected, retrying with ignore_no_formats_error for %s", url[:60])
+                img_opts = dict(opts)
+                img_opts["ignore_no_formats_error"] = True
+                img_opts["logger"] = _SilentLogger()
+                try:
+                    with YoutubeDL(img_opts) as ydl2:
+                        info2 = ydl2.extract_info(url, download=False)
+                    if info2:
+                        info2["formats"] = info2.get("formats") or []
+                        info2.setdefault("duration", 0)
+                        logger.info("Got image post info for %s", url[:60])
+                        return info2
+                except Exception as e2:
+                    logger.debug("ignore_no_formats_error retry also failed: %s", e2)
             raise
 
     return await loop.run_in_executor(None, _run)

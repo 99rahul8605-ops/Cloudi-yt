@@ -297,6 +297,19 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
         await msg.edit_text("❌ Could not fetch info for this URL.", parse_mode=ParseMode.MARKDOWN)
         return
 
+    # Instagram image posts come back as a playlist — flatten first entry for display
+    # but keep all entries so do_image can download all carousel images.
+    entries = info.get("entries") or []
+    if entries and not info.get("formats") and not info.get("url"):
+        # It's a playlist/carousel — use first entry for metadata
+        first = entries[0] if entries else {}
+        if not info.get("thumbnail") and first.get("thumbnail"):
+            info["thumbnail"] = first.get("thumbnail")
+        if not info.get("thumbnails") and first.get("thumbnails"):
+            info["thumbnails"] = first.get("thumbnails")
+        logger.info("Playlist post: %d entries, first thumbnail=%s",
+                    len(entries), bool(info.get("thumbnail")))
+
     title    = info.get("title", "Unknown")
     duration = info.get("duration", 0)
     dur_str  = f"{duration // 60}m {duration % 60}s" if duration else "?"
@@ -665,10 +678,10 @@ async def do_image(q, ctx, uid: int):
             logger.warning("Thumbnail URL fetch failed: %s", e)
 
     logger.info("do_image: after step1 downloaded_files=%s", downloaded_files)
-    # ── Step 2: If thumbnail fetch didn't work, try yt-dlp with write-thumbnail
-    # This works for public Instagram posts and carousels.
-    _image_only_platforms = {"instagram", "pinterest"}
-    if not downloaded_files and platform in _image_only_platforms:
+    # ── Step 2: Instagram image post — use yt-dlp with format=jpg/png
+    # Instagram image posts come back as a playlist of entries; each entry has
+    # a direct image URL. We download with format selector targeting images.
+    if not downloaded_files and platform == "instagram":
         loop2 = asyncio.get_event_loop()
         try:
             from yt_dlp import YoutubeDL
@@ -680,33 +693,38 @@ async def do_image(q, ctx, uid: int):
                 def warning(self, msg): logger.debug("yt-dlp: %s", msg)
                 def error(self, msg): logger.debug("yt-dlp: %s", msg)
 
-            wt_opts = ydl_opts_for(url)
-            wt_opts.update({
-                "skip_download":         True,
-                "writethumbnail":        True,
+            ig_opts = ydl_opts_for(url)
+            ig_opts.update({
+                "format":                  "bestvideo[ext=jpg]/bestvideo[ext=png]/bestvideo[ext=webp]/best[ext=jpg]/best[ext=png]/best[ext=webp]/best",
                 "ignore_no_formats_error": True,
-                "outtmpl":               str(DOWNLOAD_DIR / f"{vid_id}_thumb.%(ext)s"),
-                "logger":                _SilentLogger(),
+                "outtmpl":                 str(DOWNLOAD_DIR / f"{vid_id}_%(autonumber)03d.%(ext)s"),
+                "logger":                  _SilentLogger(),
+                "noplaylist":              False,  # allow playlist so carousel works
             })
 
-            def _write_thumb():
-                before = set(DOWNLOAD_DIR.glob(f"{vid_id}_thumb.*"))
-                with YoutubeDL(wt_opts) as ydl:
+            def _dl_ig_image():
+                before = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
+                with YoutubeDL(ig_opts) as ydl:
                     ydl.extract_info(url, download=True)
-                after = set(DOWNLOAD_DIR.glob(f"{vid_id}_thumb.*"))
-                new_files = after - before
-                return [str(f) for f in new_files
-                        if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")]
+                after = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
+                return sorted([
+                    str(f) for f in (after - before)
+                    if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif")
+                ])
 
-            thumb_files = await loop2.run_in_executor(None, _write_thumb)
-            if thumb_files:
-                downloaded_files = thumb_files
-                logger.info("Image downloaded via writethumbnail: %s", thumb_files)
+            ig_files = await loop2.run_in_executor(None, _dl_ig_image)
+            if ig_files:
+                downloaded_files = ig_files
+                logger.info("Instagram image(s) downloaded via yt-dlp: %s", ig_files)
+            else:
+                logger.warning("yt-dlp returned no image files for Instagram post")
         except Exception as e:
-            logger.warning("writethumbnail fallback failed: %s", e)
+            logger.warning("Instagram yt-dlp image download failed: %s", e)
 
     logger.info("do_image: after step2 downloaded_files=%s", downloaded_files)
-    # ── Step 3: yt-dlp direct download for non-image-only platforms (carousels)
+
+    # ── Step 3: Pinterest / other platforms — yt-dlp direct
+    _image_only_platforms = {"instagram", "pinterest"}
     if not downloaded_files and platform not in _image_only_platforms:
         loop = asyncio.get_event_loop()
         from utils import build_progress_hook

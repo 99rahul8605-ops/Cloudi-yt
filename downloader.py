@@ -28,42 +28,38 @@ async def extract_info(url: str, download: bool = False,
     opts = ydl_opts_for(url)
     if extra_opts:
         opts.update(extra_opts)
-    # Suppress noisy stderr for platforms that commonly have image-only posts.
-    # yt-dlp prints "No video formats found!" to stderr before raising — we handle
-    # that error gracefully already, so the noise is misleading in logs.
-    _image_platforms = ("instagram.com", "pinterest.com", "pin.it")
-    if any(p in url for p in _image_platforms):
-        opts.setdefault("quiet", True)
-        opts.setdefault("no_warnings", True)
     loop = asyncio.get_event_loop()
     def _run():
-        import io, sys as _sys
-        # yt-dlp writes "No video formats found!" directly to stderr before raising.
-        # For Instagram/Pinterest image posts we handle this gracefully, so suppress
-        # the noise by redirecting stderr for these platforms only.
-        _suppress = any(p in url for p in ("instagram.com", "pinterest.com", "pin.it"))
+        # For platforms that commonly return image-only posts, use
+        # ignore_no_formats_error=True — the official yt-dlp API flag that
+        # prevents yt-dlp from printing "ERROR: No video formats found!" to
+        # stderr and instead returns the info dict with empty formats.
+        _image_platforms = ("instagram.com", "pinterest.com", "pin.it")
+        _is_image_platform = any(p in url for p in _image_platforms)
+        if _is_image_platform:
+            opts["ignore_no_formats_error"] = True
 
-        # Capture partial info even when yt-dlp raises (e.g. Pinterest image pins
-        # raise "No video formats found" but have already populated thumbnail URL).
         _partial: list[dict] = []
 
         class _CapturingYDL(YoutubeDL):
             def process_ie_result(self, ie_result, *args, **kwargs):
-                _partial.append(dict(ie_result))   # snapshot before raising
+                _partial.append(dict(ie_result))
                 return super().process_ie_result(ie_result, *args, **kwargs)
 
-        _stderr_backup = _sys.stderr
-        if _suppress:
-            _sys.stderr = io.StringIO()
         try:
             with _CapturingYDL(opts) as ydl:
                 info = ydl.extract_info(url, download=download)
-            fmts = info.get("formats", []) if info else []
-            if fmts:
-                exts    = sorted({f.get("ext") for f in fmts if f.get("ext")})
-                heights = sorted({f.get("height") for f in fmts
-                                  if isinstance(f.get("height"), int) and f["height"] > 0})
-                logger.info("Formats available — exts: %s | heights: %s", exts, heights)
+            if info:
+                fmts = info.get("formats") or []
+                if not fmts and _is_image_platform:
+                    # ignore_no_formats_error returned info with no formats — image post
+                    info.setdefault("duration", 0)
+                    logger.info("Image post detected (no formats) for %s", url[:60])
+                elif fmts:
+                    exts    = sorted({f.get("ext") for f in fmts if f.get("ext")})
+                    heights = sorted({f.get("height") for f in fmts
+                                      if isinstance(f.get("height"), int) and f["height"] > 0})
+                    logger.info("Formats available — exts: %s | heights: %s", exts, heights)
             return info
         except (DownloadError, ExtractorError) as e:
             err_lower = str(e).lower()
@@ -77,9 +73,6 @@ async def extract_info(url: str, download: bool = False,
                     logger.info("Returning partial info (image post) for %s", url[:60])
                     return partial
             raise
-        finally:
-            if _suppress:
-                _sys.stderr = _stderr_backup
 
     return await loop.run_in_executor(None, _run)
 

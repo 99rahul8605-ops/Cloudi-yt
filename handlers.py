@@ -352,7 +352,23 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
         )
         return
 
-    # ── Video / audio post: normal flow
+    # ── Video / audio post
+    # Non-YouTube: skip the menu and auto-download video at best quality immediately.
+    # YouTube: show the full Video / Audio / Thumbnail menu so user can pick quality.
+    if platform != "youtube":
+        await msg.edit_text(
+            f"{emoji} *{title}*\n⏱ `{dur_str}`\n\n⬇️ Downloading at best quality…",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        # Reuse do_video but we need a fake CallbackQuery-like object.
+        # Simplest: store state and trigger download directly.
+        class _FakeQ:
+            message = msg
+            async def answer(self): pass
+        await do_video(_FakeQ(), ctx, update.effective_user.id, "best")
+        return
+
+    # YouTube: show full menu
     buttons = [
         [InlineKeyboardButton("🎬 Video",     callback_data="dl:video")],
         [InlineKeyboardButton("🎵 Audio MP3", callback_data="dl:audio")],

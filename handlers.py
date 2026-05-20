@@ -615,11 +615,15 @@ async def do_image(q, ctx, uid: int):
     # Pick the highest-resolution thumbnail available.
     thumb_url = None
     thumbnails = info.get("thumbnails") or []
+    logger.info("do_image: platform=%s vid_id=%s thumbnails=%d thumbnail=%s",
+                platform, vid_id, len(thumbnails), bool(info.get("thumbnail")))
     if thumbnails:
         best = sorted(thumbnails, key=lambda t: t.get("width") or 0, reverse=True)
         thumb_url = best[0].get("url")
+        logger.info("do_image: best thumbnail url=%s", (thumb_url or "")[:80])
     if not thumb_url:
         thumb_url = info.get("thumbnail")
+        logger.info("do_image: fallback thumbnail url=%s", (thumb_url or "")[:80])
 
     downloaded_files: list[str] = []
 
@@ -660,6 +664,7 @@ async def do_image(q, ctx, uid: int):
         except Exception as e:
             logger.warning("Thumbnail URL fetch failed: %s", e)
 
+    logger.info("do_image: after step1 downloaded_files=%s", downloaded_files)
     # ── Step 2: If thumbnail fetch didn't work, try yt-dlp with write-thumbnail
     # This works for public Instagram posts and carousels.
     _image_only_platforms = {"instagram", "pinterest"}
@@ -700,6 +705,7 @@ async def do_image(q, ctx, uid: int):
         except Exception as e:
             logger.warning("writethumbnail fallback failed: %s", e)
 
+    logger.info("do_image: after step2 downloaded_files=%s", downloaded_files)
     # ── Step 3: yt-dlp direct download for non-image-only platforms (carousels)
     if not downloaded_files and platform not in _image_only_platforms:
         loop = asyncio.get_event_loop()

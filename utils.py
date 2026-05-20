@@ -118,6 +118,14 @@ def friendly_error(e: Exception) -> str:
         return "❌ *Format not available.*\nTry a different quality or use ⭐ Best Available."
     if "no video formats" in msg or "no formats" in msg:
         return "❌ *No downloadable formats found.* The content may be private or region-locked."
+    if "only available for registered users who follow" in msg or "follow this account" in msg:
+        return (
+            "🔒 *Followers-only content.*\n\n"
+            "This post is restricted to followers of that account.\n"
+            "The bot\'s Instagram account must follow them to download it."
+        )
+    if "private" in msg or "only available" in msg:
+        return "🔒 This content is *private* or restricted."
     if "login" in msg or "sign in" in msg or "not a bot" in msg or "confirm" in msg:
         return (
             "🔒 *Login required or bot-detection triggered.*\n\n"
@@ -125,8 +133,6 @@ def friendly_error(e: Exception) -> str:
             "For Instagram/Facebook: provide cookies via FB_COOKIES env var\n"
             "For other sites: content may require authentication"
         )
-    if "private" in msg:
-        return "🔒 This content is *private*."
     if "copyright" in msg or "blocked" in msg:
         return "⛔ Blocked due to *copyright restrictions*."
     if "age" in msg:

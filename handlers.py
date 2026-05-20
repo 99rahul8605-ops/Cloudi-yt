@@ -626,7 +626,17 @@ async def do_image(q, ctx, uid: int):
     if thumb_url:
         outpath = str(DOWNLOAD_DIR / f"{vid_id}_img.jpg")
         try:
-            urllib.request.urlretrieve(thumb_url, outpath)
+            req = urllib.request.Request(thumb_url, headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                "Referer": "https://www.instagram.com/",
+            })
+            with urllib.request.urlopen(req, timeout=30) as resp, open(outpath, "wb") as f:
+                f.write(resp.read())
             if Path(outpath).stat().st_size > 2000:   # sanity: >2 KB means real image
                 downloaded_files = [outpath]
                 logger.info("Image downloaded via thumbnail URL: %s", outpath)
@@ -634,7 +644,9 @@ async def do_image(q, ctx, uid: int):
             logger.warning("Thumbnail URL fetch failed: %s", e)
 
     # ── Step 2: If thumbnail fetch didn't work, try yt-dlp (handles carousels)
-    if not downloaded_files:
+    # Skip yt-dlp for platforms known to only have image posts (avoids noisy errors).
+    _image_only_platforms = {"instagram", "pinterest"}
+    if not downloaded_files and platform not in _image_only_platforms:
         loop = asyncio.get_event_loop()
         from utils import build_progress_hook
         hook = build_progress_hook(loop, status, "🖼 image")
@@ -647,6 +659,8 @@ async def do_image(q, ctx, uid: int):
                 "format":         "best",
                 "outtmpl":        str(DOWNLOAD_DIR / f"{vid_id}_%(autonumber)s.%(ext)s"),
                 "progress_hooks": [hook],
+                "quiet":          True,
+                "no_warnings":    True,
             })
 
             def _download():

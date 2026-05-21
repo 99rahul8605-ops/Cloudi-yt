@@ -295,6 +295,19 @@ async def send_file(
             progress           = _progress,
         )
 
+    # ── Photo upload ─────────────────────────────────────────────────────────
+    elif ext in {".jpg", ".jpeg", ".png", ".webp"}:
+        await status_msg.edit_text(
+            f"📤 *Uploading* `{filename}` *({human_size(file_size)})*…",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await config._pyro_bot.send_photo(
+            chat_id  = chat_id,
+            photo    = filepath,
+            caption  = caption,
+            progress = _progress,
+        )
+
     # ── Audio upload ──────────────────────────────────────────────────────────
     elif ext in AUDIO_EXTS:
         await status_msg.edit_text(

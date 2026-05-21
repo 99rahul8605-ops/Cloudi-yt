@@ -8,6 +8,8 @@ Run with:
 
 import asyncio
 import logging
+import signal
+import sys
 
 from telegram import BotCommand, Update
 from telegram.ext import (
@@ -81,9 +83,19 @@ def main():
     app.post_shutdown = post_shutdown
 
     logger.info("Bot started — polling")
+
+    # Render sends SIGTERM before killing the container.
+    # Handle it so we stop polling cleanly and avoid 409 Conflict on redeploy.
+    def _handle_sigterm(*_):
+        logger.info("SIGTERM received — shutting down cleanly…")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
+        stop_signals=(signal.SIGINT, signal.SIGTERM),
     )
 
 

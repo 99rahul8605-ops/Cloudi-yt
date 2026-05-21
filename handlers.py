@@ -370,31 +370,14 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     caption     = (post.caption or "")[:80].replace("*","").replace("`","").strip()
     title       = caption or f"Instagram post {shortcode}"
 
-    # ── Step 2: Route based on content type
-    if is_video and not is_carousel:
-        # Reel / video post → yt-dlp handles this perfectly
-        await msg.edit_text(
-            f"📸 *{title}*\n\n⬇️ Downloading video…",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        ctx.user_data["url"]      = url
-        ctx.user_data["platform"] = "instagram"
-        ctx.user_data["info"]     = {"id": shortcode, "title": title,
-                                     "duration": 0, "thumbnail": None,
-                                     "thumbnails": [], "formats": []}
-        class _FakeQ:
-            message = msg
-            async def answer(self): pass
-        await do_video(_FakeQ(), ctx, uid, "best")
-        return
-
-    # ── Step 3: Image post / carousel → instaloader download
+    # ── Step 2: Download everything via instaloader (videos, reels, images, carousels)
+    # yt-dlp is NOT used for Instagram — Instagram blocks its GraphQL endpoint (403).
     await msg.edit_text(
-        f"📸 *{title}*\n\n⬇️ Downloading image(s)…",
+        f"📸 *{title}*\n\n⬇️ Downloading…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    def _download_images():
+    def _download_all():
         import shutil
         L2 = _make_insta_loader()
         post2 = instaloader.Post.from_shortcode(L2.context, shortcode)
@@ -422,11 +405,11 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         except Exception:
             pass
 
-        logger.info("instaloader: total media files: %d", len(media))
+        logger.info("instaloader: total %d file(s)", len(media))
         return media
 
     try:
-        files = await loop.run_in_executor(None, _download_images)
+        files = await loop.run_in_executor(None, _download_all)
     except Exception as e:
         logger.error("instaloader download error: %s", e)
         await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)

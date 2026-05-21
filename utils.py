@@ -118,6 +118,12 @@ def friendly_error(e: Exception) -> str:
         return "❌ *Format not available.*\nTry a different quality or use ⭐ Best Available."
     if "no video formats" in msg or "no formats" in msg:
         return "❌ *No downloadable formats found.* The content may be private or region-locked."
+    if "fetching post metadata failed" in msg or "403" in msg or "graphql" in msg:
+        return (
+            "❌ *Instagram blocked the request.*\n\n"
+            "This usually means the cookies are expired or invalid.\n"
+            "Please update your Instagram cookies and try again."
+        )
     if "only available for registered users who follow" in msg or "follow this account" in msg:
         return (
             "🔒 *Followers-only content.*\n\n"

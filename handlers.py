@@ -280,16 +280,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  INSTAGRAM — instaloader-based handler
+#  INSTAGRAM — hybrid handler
+#  • Reels / Videos  → yt-dlp (fast, reliable)
+#  • Photos / Carousel → instaloader (handles image posts correctly)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _insta_shortcode(url: str) -> str | None:
-    """Extract Instagram shortcode from any post/reel/story URL."""
     m = re.search(r"/(?:p|reel|tv|stories/[^/]+)/([A-Za-z0-9_-]+)", url)
     return m.group(1) if m else None
 
 
-def _make_insta_loader() -> "instaloader.Instaloader":
+def _make_insta_loader():
     import instaloader
     ig_cookie_file = Path("ig_cookies.txt")
     L = instaloader.Instaloader(
@@ -299,7 +300,7 @@ def _make_insta_loader() -> "instaloader.Instaloader":
         download_comments=False,
         save_metadata=False,
         post_metadata_txt_pattern="",
-        filename_pattern="{shortcode}_{mediaid}",
+        filename_pattern="{shortcode}",
         dirname_pattern=str(DOWNLOAD_DIR),
         quiet=True,
     )
@@ -308,11 +309,10 @@ def _make_insta_loader() -> "instaloader.Instaloader":
             import http.cookiejar as _cj
             cj = _cj.MozillaCookieJar(str(ig_cookie_file))
             cj.load(ignore_discard=True, ignore_expires=True)
-            # Extract sessionid and csrftoken for instaloader
             cookies = {c.name: c.value for c in cj}
             if "sessionid" in cookies:
                 L.context._session.cookies.update(cookies)
-                logger.info("instaloader: loaded IG cookies")
+                logger.info("instaloader: IG cookies loaded")
         except Exception as e:
             logger.warning("instaloader: could not load cookies: %s", e)
     return L
@@ -320,7 +320,7 @@ def _make_insta_loader() -> "instaloader.Instaloader":
 
 async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                        url: str, msg):
-    """Handle all Instagram URLs using instaloader."""
+    """Handle all Instagram URLs — yt-dlp for video/reels, instaloader for images."""
     import instaloader
     loop = asyncio.get_event_loop()
     uid  = update.effective_user.id
@@ -330,84 +330,94 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await msg.edit_text("❌ Could not parse Instagram URL.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    await msg.edit_text("📸 *Instagram* — fetching post…", parse_mode=ParseMode.MARKDOWN)
+    await msg.edit_text("📸 *Instagram* — fetching info…", parse_mode=ParseMode.MARKDOWN)
 
-    def _fetch_post():
+    # ── Step 1: Fetch post metadata via instaloader
+    def _fetch():
         L = _make_insta_loader()
         post = instaloader.Post.from_shortcode(L.context, shortcode)
-        return L, post
+        return post
 
     try:
-        L, post = await loop.run_in_executor(None, _fetch_post)
+        post = await loop.run_in_executor(None, _fetch)
     except instaloader.exceptions.LoginRequiredException:
         await msg.edit_text(
-            "🔒 *Login required.*\nThis post is private or followers-only.\n"
-            "Ensure valid Instagram cookies are configured.",
+            "🔒 *Followers-only or private post.*\nThe bot's Instagram account must follow this user.",
             parse_mode=ParseMode.MARKDOWN,
         )
-        return
-    except instaloader.exceptions.BadResponseException as e:
-        await msg.edit_text(f"❌ Instagram error: `{e}`", parse_mode=ParseMode.MARKDOWN)
         return
     except Exception as e:
         await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Determine post type
-    is_video   = post.is_video
+    is_video    = post.is_video
     is_carousel = post.typename == "GraphSidecar"
-    caption    = (post.caption or "")[:80].replace("*", "").replace("`", "").strip()
-    title      = caption if caption else f"Instagram post {shortcode}"
+    caption     = (post.caption or "")[:80].replace("*","").replace("`","").strip()
+    title       = caption or f"Instagram post {shortcode}"
 
+    # ── Step 2: Route based on content type
+    if is_video and not is_carousel:
+        # Reel / video post → yt-dlp handles this perfectly
+        await msg.edit_text(
+            f"📸 *{title}*\n\n⬇️ Downloading video…",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        ctx.user_data["url"]      = url
+        ctx.user_data["platform"] = "instagram"
+        ctx.user_data["info"]     = {"id": shortcode, "title": title,
+                                     "duration": 0, "thumbnail": None,
+                                     "thumbnails": [], "formats": []}
+        class _FakeQ:
+            message = msg
+            async def answer(self): pass
+        await do_video(_FakeQ(), ctx, uid, "best")
+        return
+
+    # ── Step 3: Image post / carousel → instaloader download
     await msg.edit_text(
-        f"📸 *{title}*\n\n⬇️ Downloading…",
+        f"📸 *{title}*\n\n⬇️ Downloading image(s)…",
         parse_mode=ParseMode.MARKDOWN,
     )
 
-    def _download_post():
+    def _download_images():
         import shutil
         L2 = _make_insta_loader()
         post2 = instaloader.Post.from_shortcode(L2.context, shortcode)
 
-        # dirname_pattern must NOT contain {target}/{profile} tokens — set it to
-        # the exact output directory so instaloader puts files directly there.
-        # filename_pattern uses {shortcode} and {mediaid} for unique naming.
-        out_dir = DOWNLOAD_DIR / f"insta_{shortcode}"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        # Record files before download so we know exactly what was added
+        before = set(DOWNLOAD_DIR.glob("*"))
 
-        L2.dirname_pattern  = str(out_dir)
-        L2.filename_pattern = "{shortcode}_{mediaid}"
+        # dirname_pattern = exact path, no tokens → files go directly to DOWNLOAD_DIR
+        # filename_pattern = {shortcode} so carousel files get _1, _2 suffixes auto
+        L2.dirname_pattern  = str(DOWNLOAD_DIR)
+        L2.filename_pattern = "{shortcode}"
+        L2.download_post(post2, target=shortcode)
 
-        # target="" so {target} token (if any) expands to empty string
-        L2.download_post(post2, target="")
-
-        logger.info("instaloader: scanning %s", out_dir)
-        media = []
-        for f in sorted(out_dir.rglob("*")):
-            logger.info("instaloader: found file %s", f)
-            if f.is_file() and f.suffix.lower() in (
-                    ".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"):
-                dest = DOWNLOAD_DIR / f"{shortcode}_{f.name}"
-                shutil.move(str(f), str(dest))
-                media.append(str(dest))
-                logger.info("instaloader: kept %s", dest.name)
-
-        shutil.rmtree(str(out_dir), ignore_errors=True)
+        after = set(DOWNLOAD_DIR.glob("*"))
+        new_files = after - before
+        media = sorted([
+            str(f) for f in new_files
+            if f.is_file() and f.suffix.lower() in
+               (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov")
+        ])
+        logger.info("instaloader: %d new file(s): %s", len(media), media)
         return media
 
     try:
-        files = await loop.run_in_executor(None, _download_post)
+        files = await loop.run_in_executor(None, _download_images)
     except Exception as e:
+        logger.error("instaloader download error: %s", e)
         await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
         return
 
     if not files:
-        await msg.edit_text("❌ No media files downloaded.", parse_mode=ParseMode.MARKDOWN)
+        await msg.edit_text(
+            "❌ No images downloaded.\nThe post may be private or removed.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
-    logger.info("instaloader: downloaded %d file(s): %s", len(files), files)
-
-    # Upload all files
+    # ── Step 4: Upload all files
     for i, fpath in enumerate(files, 1):
         try:
             await msg.edit_text(
@@ -417,7 +427,7 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             await send_file(uid, fpath, msg, ctx)
             register_for_cleanup(fpath)
         except Exception as e:
-            logger.warning("instaloader upload error for %s: %s", fpath, e)
+            logger.warning("Upload error for %s: %s", fpath, e)
 
     await msg.edit_text("✅ *Done!*", parse_mode=ParseMode.MARKDOWN)
 

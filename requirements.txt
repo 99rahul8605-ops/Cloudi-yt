@@ -2,3 +2,4 @@ python-telegram-bot>=21.11.1
 yt-dlp[default]
 pyrogram
 tgcrypto
+instaloader

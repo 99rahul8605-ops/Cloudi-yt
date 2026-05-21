@@ -285,9 +285,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 #  • Photos / Carousel → instaloader (handles image posts correctly)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _insta_shortcode(url: str) -> str | None:
-    m = re.search(r"/(?:p|reel|tv|stories/[^/]+)/([A-Za-z0-9_-]+)", url)
-    return m.group(1) if m else None
+def _insta_shortcode(url: str) -> tuple[str, str] | tuple[None, None]:
+    """Return (shortcode, type) where type is 'post', 'reel', or 'story'."""
+    # Story URLs: /stories/username/media_id/
+    m = re.search(r"/stories/([^/]+)/(\d+)", url)
+    if m:
+        return m.group(2), "story"
+    # Post/reel/tv URLs: /p/shortcode/ or /reel/shortcode/
+    m = re.search(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
+    if m:
+        return m.group(1), "post"
+    return None, None
 
 
 def _make_insta_loader():
@@ -325,10 +333,17 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     loop = asyncio.get_event_loop()
     uid  = update.effective_user.id
 
-    shortcode = _insta_shortcode(url)
+    shortcode, post_type = _insta_shortcode(url)
     if not shortcode:
         await msg.edit_text("❌ Could not parse Instagram URL.", parse_mode=ParseMode.MARKDOWN)
         return
+
+    # Stories need login and different API — inform user
+    if post_type == "story":
+        await msg.edit_text(
+            "📖 *Story detected.*\nStory downloads require the bot account to be logged in and follow the user. Trying…",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
     await msg.edit_text("📸 *Instagram* — fetching info…", parse_mode=ParseMode.MARKDOWN)
 
@@ -384,8 +399,6 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         L2 = _make_insta_loader()
         post2 = instaloader.Post.from_shortcode(L2.context, shortcode)
 
-        # instaloader creates DOWNLOAD_DIR/{target}/ subfolder.
-        # Use shortcode as target so folder is predictable.
         target_dir = DOWNLOAD_DIR / shortcode
         target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -393,7 +406,6 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         L2.filename_pattern = "{shortcode}"
         L2.download_post(post2, target=shortcode)
 
-        # Scan target_dir recursively for all media files
         media = []
         for f in sorted(target_dir.rglob("*")):
             logger.info("instaloader: found %s (size=%d)", f.name,
@@ -405,7 +417,6 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                 media.append(str(dest))
                 logger.info("instaloader: moved to %s", dest.name)
 
-        # Clean up empty target_dir
         try:
             shutil.rmtree(str(target_dir), ignore_errors=True)
         except Exception:
@@ -456,7 +467,7 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                 status_msg = msg,
                 is_video   = is_vid,
             )
-            register_for_cleanup(fpath)
+            register_for_cleanup(fpath, get_settings(uid)["cleanup_minutes"])
             uploaded += 1
             logger.info("Uploaded successfully: %s", fpath)
         except Exception as e:

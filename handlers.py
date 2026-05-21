@@ -365,29 +365,34 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     )
 
     def _download_post():
-        import tempfile, shutil
+        import shutil
         L2 = _make_insta_loader()
         post2 = instaloader.Post.from_shortcode(L2.context, shortcode)
 
-        # instaloader creates files in a subfolder named after the profile owner.
-        # Use a dedicated temp subdir so we can find files reliably, then move them.
-        tmp = Path(tempfile.mkdtemp(prefix="insta_", dir=DOWNLOAD_DIR))
-        try:
-            L2.dirname_pattern  = str(tmp)
-            L2.filename_pattern = "{shortcode}_{mediaid}"
-            L2.download_post(post2, target=tmp)
+        # dirname_pattern must NOT contain {target}/{profile} tokens — set it to
+        # the exact output directory so instaloader puts files directly there.
+        # filename_pattern uses {shortcode} and {mediaid} for unique naming.
+        out_dir = DOWNLOAD_DIR / f"insta_{shortcode}"
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-            media = []
-            for f in sorted(tmp.rglob("*")):
-                if f.is_file() and f.suffix.lower() in (
-                        ".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"):
-                    dest = DOWNLOAD_DIR / f"{shortcode}_{f.name}"
-                    shutil.move(str(f), str(dest))
-                    media.append(str(dest))
-                    logger.info("instaloader: moved %s -> %s", f.name, dest.name)
-        finally:
-            shutil.rmtree(str(tmp), ignore_errors=True)
+        L2.dirname_pattern  = str(out_dir)
+        L2.filename_pattern = "{shortcode}_{mediaid}"
 
+        # target="" so {target} token (if any) expands to empty string
+        L2.download_post(post2, target="")
+
+        logger.info("instaloader: scanning %s", out_dir)
+        media = []
+        for f in sorted(out_dir.rglob("*")):
+            logger.info("instaloader: found file %s", f)
+            if f.is_file() and f.suffix.lower() in (
+                    ".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"):
+                dest = DOWNLOAD_DIR / f"{shortcode}_{f.name}"
+                shutil.move(str(f), str(dest))
+                media.append(str(dest))
+                logger.info("instaloader: kept %s", dest.name)
+
+        shutil.rmtree(str(out_dir), ignore_errors=True)
         return media
 
     try:
@@ -1018,6 +1023,20 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: s
 
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     import traceback
+    from telegram.error import Conflict, NetworkError
+
+    # 409 Conflict = two bot instances running simultaneously (Render redeploy overlap).
+    # Log as warning only — not an actionable error.
+    if isinstance(ctx.error, Conflict):
+        logger.warning("409 Conflict — another bot instance is running (redeploy overlap). "
+                       "Will resolve automatically in a few seconds.")
+        return
+
+    # Transient network errors — log quietly, don't spam user
+    if isinstance(ctx.error, NetworkError):
+        logger.warning("Network error (transient): %s", ctx.error)
+        return
+
     tb = "".join(traceback.format_exception(type(ctx.error), ctx.error,
                                              ctx.error.__traceback__))
     logger.error("Unhandled exception:\n%s", tb)

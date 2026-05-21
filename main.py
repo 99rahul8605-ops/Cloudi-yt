@@ -10,6 +10,7 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 
 from telegram import BotCommand, Update
 from telegram.ext import (
@@ -31,6 +32,13 @@ logger = logging.getLogger(__name__)
 
 
 def main():
+    # ── Startup delay (Render redeploy: wait for old instance to die) ────────
+    # Render sends SIGTERM to old container but there's an overlap window.
+    # A short sleep ensures the old instance has released the Telegram polling
+    # connection before we start, preventing 409 Conflict errors.
+    logger.info("Waiting 5s for any previous instance to shut down…")
+    time.sleep(5)
+
     # ── Cookie initialisation ────────────────────────────────────────────────
     init_cookies_from_env()
 

@@ -296,6 +296,7 @@ async def send_file(
         )
 
     # ── Photo upload ─────────────────────────────────────────────────────────
+    # Pyrogram uses MTProto (not Bot API) so send_photo sends full HD resolution.
     elif ext in {".jpg", ".jpeg", ".png", ".webp"}:
         await status_msg.edit_text(
             f"📤 *Uploading* `{filename}` *({human_size(file_size)})*…",

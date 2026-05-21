@@ -365,16 +365,29 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     )
 
     def _download_post():
+        import tempfile, shutil
         L2 = _make_insta_loader()
         post2 = instaloader.Post.from_shortcode(L2.context, shortcode)
-        # Download into DOWNLOAD_DIR
-        L2.dirname_pattern = str(DOWNLOAD_DIR)
-        L2.filename_pattern = shortcode + "_{mediaid}"
-        L2.download_post(post2, target=DOWNLOAD_DIR)
-        # Collect downloaded files
-        files = sorted(DOWNLOAD_DIR.glob(f"{shortcode}_*"))
-        media = [str(f) for f in files
-                 if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov")]
+
+        # instaloader creates files in a subfolder named after the profile owner.
+        # Use a dedicated temp subdir so we can find files reliably, then move them.
+        tmp = Path(tempfile.mkdtemp(prefix="insta_", dir=DOWNLOAD_DIR))
+        try:
+            L2.dirname_pattern  = str(tmp)
+            L2.filename_pattern = "{shortcode}_{mediaid}"
+            L2.download_post(post2, target=tmp)
+
+            media = []
+            for f in sorted(tmp.rglob("*")):
+                if f.is_file() and f.suffix.lower() in (
+                        ".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"):
+                    dest = DOWNLOAD_DIR / f"{shortcode}_{f.name}"
+                    shutil.move(str(f), str(dest))
+                    media.append(str(dest))
+                    logger.info("instaloader: moved %s -> %s", f.name, dest.name)
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
         return media
 
     try:

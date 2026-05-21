@@ -384,23 +384,34 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         L2 = _make_insta_loader()
         post2 = instaloader.Post.from_shortcode(L2.context, shortcode)
 
-        # Record files before download so we know exactly what was added
-        before = set(DOWNLOAD_DIR.glob("*"))
+        # instaloader creates DOWNLOAD_DIR/{target}/ subfolder.
+        # Use shortcode as target so folder is predictable.
+        target_dir = DOWNLOAD_DIR / shortcode
+        target_dir.mkdir(parents=True, exist_ok=True)
 
-        # dirname_pattern = exact path, no tokens → files go directly to DOWNLOAD_DIR
-        # filename_pattern = {shortcode} so carousel files get _1, _2 suffixes auto
-        L2.dirname_pattern  = str(DOWNLOAD_DIR)
+        L2.dirname_pattern  = str(DOWNLOAD_DIR / "{target}")
         L2.filename_pattern = "{shortcode}"
         L2.download_post(post2, target=shortcode)
 
-        after = set(DOWNLOAD_DIR.glob("*"))
-        new_files = after - before
-        media = sorted([
-            str(f) for f in new_files
-            if f.is_file() and f.suffix.lower() in
-               (".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov")
-        ])
-        logger.info("instaloader: %d new file(s): %s", len(media), media)
+        # Scan target_dir recursively for all media files
+        media = []
+        for f in sorted(target_dir.rglob("*")):
+            logger.info("instaloader: found %s (size=%d)", f.name,
+                        f.stat().st_size if f.is_file() else -1)
+            if f.is_file() and f.suffix.lower() in (
+                    ".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"):
+                dest = DOWNLOAD_DIR / f"{shortcode}_{f.name}"
+                shutil.move(str(f), str(dest))
+                media.append(str(dest))
+                logger.info("instaloader: moved to %s", dest.name)
+
+        # Clean up empty target_dir
+        try:
+            shutil.rmtree(str(target_dir), ignore_errors=True)
+        except Exception:
+            pass
+
+        logger.info("instaloader: total media files: %d", len(media))
         return media
 
     try:
@@ -418,16 +429,45 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         return
 
     # ── Step 4: Upload all files
+    uploaded = 0
     for i, fpath in enumerate(files, 1):
+        p = Path(fpath)
+        if not p.exists():
+            logger.error("File does not exist before upload: %s", fpath)
+            continue
+        size = p.stat().st_size
+        logger.info("Uploading %s (size=%d bytes)", fpath, size)
+        if size < 100:
+            logger.warning("File too small, skipping: %s (%d bytes)", fpath, size)
+            continue
         try:
             await msg.edit_text(
                 f"📤 Uploading {i}/{len(files)}…",
                 parse_mode=ParseMode.MARKDOWN,
             )
-            await send_file(uid, fpath, msg, ctx)
+            fname   = Path(fpath).name
+            ext     = Path(fpath).suffix.lower()
+            is_vid  = ext in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv"}
+            await send_file(
+                chat_id    = uid,
+                filepath   = fpath,
+                filename   = fname,
+                caption    = title,
+                status_msg = msg,
+                is_video   = is_vid,
+            )
             register_for_cleanup(fpath)
+            uploaded += 1
+            logger.info("Uploaded successfully: %s", fpath)
         except Exception as e:
-            logger.warning("Upload error for %s: %s", fpath, e)
+            logger.error("Upload error for %s: %s", fpath, e, exc_info=True)
+
+    if uploaded == 0:
+        await msg.edit_text(
+            "❌ Download succeeded but upload failed.\nCheck logs for details.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
 
     await msg.edit_text("✅ *Done!*", parse_mode=ParseMode.MARKDOWN)
 

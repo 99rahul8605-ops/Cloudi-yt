@@ -338,32 +338,71 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await msg.edit_text("❌ Could not parse Instagram URL.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Stories need login and different API — inform user
+    # ── Stories: completely different instaloader API
     if post_type == "story":
-        await msg.edit_text(
-            "📖 *Story detected.*\nStory downloads require the bot account to be logged in and follow the user. Trying…",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await msg.edit_text("📖 *Story* — downloading…", parse_mode=ParseMode.MARKDOWN)
+        m_user = re.search(r"/stories/([^/]+)/", url)
+        username = m_user.group(1) if m_user else None
 
-    await msg.edit_text("📸 *Instagram* — fetching info…", parse_mode=ParseMode.MARKDOWN)
+        def _download_story():
+            import shutil
+            L2 = _make_insta_loader()
+            if not username:
+                raise ValueError("Could not extract username from story URL")
+            target_dir = DOWNLOAD_DIR / shortcode
+            target_dir.mkdir(parents=True, exist_ok=True)
+            L2.dirname_pattern  = str(DOWNLOAD_DIR / "{target}")
+            L2.filename_pattern = "{mediaid}"
+            profile = instaloader.Profile.from_username(L2.context, username)
+            for story in L2.get_stories(userids=[profile.userid]):
+                for item in story.get_items():
+                    if str(item.mediaid) == shortcode:
+                        L2.download_storyitem(item, target=shortcode)
+                        break
+            media = []
+            for f in sorted(target_dir.rglob("*")):
+                if f.is_file() and f.suffix.lower() in (".jpg",".jpeg",".png",".webp",".mp4",".mov"):
+                    dest = DOWNLOAD_DIR / f"{shortcode}_{f.name}"
+                    shutil.move(str(f), str(dest))
+                    media.append(str(dest))
+            shutil.rmtree(str(target_dir), ignore_errors=True)
+            return media
 
-    # ── Step 1: Fetch post metadata via instaloader
-    def _fetch():
-        L = _make_insta_loader()
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
-        return post
+        try:
+            files = await loop.run_in_executor(None, _download_story)
+        except instaloader.exceptions.LoginRequiredException:
+            await msg.edit_text(
+                "🔒 *Login required for stories.*\nEnsure valid Instagram cookies are set.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        except Exception as e:
+            logger.error("Story download error: %s", e)
+            await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+            return
 
-    try:
-        post = await loop.run_in_executor(None, _fetch)
-    except instaloader.exceptions.LoginRequiredException:
-        await msg.edit_text(
-            "🔒 *Followers-only or private post.*\nThe bot's Instagram account must follow this user.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        if not files:
+            await msg.edit_text(
+                "❌ Story not found or expired.\nStories expire after 24 hours.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        for i, fpath in enumerate(files, 1):
+            try:
+                await msg.edit_text(f"📤 Uploading {i}/{len(files)}…", parse_mode=ParseMode.MARKDOWN)
+                ext = Path(fpath).suffix.lower()
+                await send_file(
+                    chat_id=uid, filepath=fpath, filename=Path(fpath).name,
+                    caption="", status_msg=msg, is_video=ext in {".mp4",".mov"},
+                )
+                register_for_cleanup(fpath, get_settings(uid)["cleanup_minutes"])
+            except Exception as e:
+                logger.error("Story upload error: %s", e, exc_info=True)
+        await msg.edit_text("✅ *Done!*", parse_mode=ParseMode.MARKDOWN)
         return
-    except Exception as e:
-        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
-        return
+
+
 
     is_video    = post.is_video
     is_carousel = post.typename == "GraphSidecar"

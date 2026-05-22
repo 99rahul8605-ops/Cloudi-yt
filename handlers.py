@@ -102,20 +102,15 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    is_owner = (OWNER_ID is not None and uid == OWNER_ID)
-    logger.info(">>> /cookiecheck from uid=%d | OWNER_ID=%s | is_owner=%s", uid, OWNER_ID, is_owner)
-    
-    if OWNER_ID is not None:
-        logger.info(">>> Check: uid(%d) == OWNER_ID(%d) ? %s", uid, OWNER_ID, uid == OWNER_ID)
-        if uid != OWNER_ID:
-            logger.warning(">>> BLOCKING /cookiecheck: %d != %d", uid, OWNER_ID)
-            await update.message.reply_text(
-                "🔒 *Owner only.*\nThis command is restricted to the bot owner.",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-            return
-    
-    logger.info(">>> ALLOWING /cookiecheck for uid=%d", uid)
+    if OWNER_ID is None or uid != OWNER_ID:
+        logger.warning("/cookiecheck denied for uid=%d (OWNER_ID=%s)", uid, OWNER_ID)
+        await update.message.reply_text(
+            "🔒 *Owner only.*\nThis command is restricted to the bot owner.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    logger.info("/cookiecheck allowed for uid=%d", uid)
 
     yt = youtube_cookie_status()
     fb = facebook_cookie_status()
@@ -154,12 +149,12 @@ async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if OWNER_ID is not None and uid != OWNER_ID:
+    if OWNER_ID is None or uid != OWNER_ID:
+        logger.warning("/stats denied for uid=%d (OWNER_ID=%s)", uid, OWNER_ID)
         await update.message.reply_text(
             "🔒 *Owner only.*\nThis command is restricted to the bot owner.",
             parse_mode=ParseMode.MARKDOWN,
         )
-        logger.warning("DENIED /stats from user %d (owner=%d)", uid, OWNER_ID)
         return
 
     ytdlp_ver          = get_ytdlp_version()

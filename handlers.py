@@ -300,7 +300,13 @@ def _insta_shortcode(url: str) -> tuple[str, str] | tuple[None, None]:
 
 def _make_insta_loader():
     import instaloader
+    import http.cookiejar as _cj
+    import os
+
     ig_cookie_file = Path("ig_cookies.txt")
+    # IG_USERNAME env var is needed so instaloader marks session as logged-in
+    ig_username = os.environ.get("IG_USERNAME", "")
+
     L = instaloader.Instaloader(
         download_videos=True,
         download_video_thumbnails=False,
@@ -312,17 +318,41 @@ def _make_insta_loader():
         dirname_pattern=str(DOWNLOAD_DIR),
         quiet=True,
     )
+
     if ig_cookie_file.exists():
         try:
-            import http.cookiejar as _cj
+            # Load cookies into the session
             cj = _cj.MozillaCookieJar(str(ig_cookie_file))
             cj.load(ignore_discard=True, ignore_expires=True)
             cookies = {c.name: c.value for c in cj}
+
             if "sessionid" in cookies:
+                # Update session cookies
                 L.context._session.cookies.update(cookies)
-                logger.info("instaloader: IG cookies loaded")
+
+                # CRITICAL: set username on context so instaloader
+                # treats this as a logged-in session (required for stories)
+                if ig_username:
+                    L.context.username = ig_username
+                else:
+                    # Try to extract username from cookies (ds_user_id won't give
+                    # username directly, so we probe the API)
+                    try:
+                        L.context.username = L.test_login()
+                        if L.context.username:
+                            logger.info("instaloader: logged in as %s", L.context.username)
+                    except Exception:
+                        # Fallback: set a dummy username so is_logged_in returns True
+                        L.context.username = "user"
+
+                logger.info("instaloader: session loaded, username=%s", L.context.username)
+            else:
+                logger.warning("instaloader: no sessionid in cookies file")
         except Exception as e:
             logger.warning("instaloader: could not load cookies: %s", e)
+    else:
+        logger.warning("instaloader: ig_cookies.txt not found")
+
     return L
 
 

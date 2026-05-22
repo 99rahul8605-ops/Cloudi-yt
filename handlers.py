@@ -35,7 +35,7 @@ import config
 from config import (
     DOWNLOAD_DIR, get_settings, register_for_cleanup,
     user_settings, cleanup_registry, BOT_START_TIME, _pyro_bot,
-    TELEGRAM_API_ID, TELEGRAM_API_HASH, OWNER_ID,
+    TELEGRAM_API_ID, TELEGRAM_API_HASH,
 )
 from cookies import (
     youtube_cookie_status, facebook_cookie_status, instagram_cookie_status,
@@ -102,8 +102,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if OWNER_ID is None or uid != OWNER_ID:
-        logger.warning("/cookiecheck denied for uid=%d (OWNER_ID=%s)", uid, OWNER_ID)
+    owner_id = config.OWNER_ID
+    logger.info("/cookiecheck from uid=%d | config.OWNER_ID=%s", uid, owner_id)
+    if owner_id is None or uid != owner_id:
+        logger.warning("/cookiecheck denied for uid=%d (OWNER_ID=%s)", uid, owner_id)
         await update.message.reply_text(
             "🔒 *Owner only.*\nThis command is restricted to the bot owner.",
             parse_mode=ParseMode.MARKDOWN,
@@ -149,8 +151,10 @@ async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if OWNER_ID is None or uid != OWNER_ID:
-        logger.warning("/stats denied for uid=%d (OWNER_ID=%s)", uid, OWNER_ID)
+    owner_id = config.OWNER_ID
+    logger.info("/stats from uid=%d | config.OWNER_ID=%s", uid, owner_id)
+    if owner_id is None or uid != owner_id:
+        logger.warning("/stats denied for uid=%d (OWNER_ID=%s)", uid, owner_id)
         await update.message.reply_text(
             "🔒 *Owner only.*\nThis command is restricted to the bot owner.",
             parse_mode=ParseMode.MARKDOWN,

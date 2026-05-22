@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN         = os.environ["BOT_TOKEN"]
 TELEGRAM_API_ID   = int(os.environ.get("TELEGRAM_API_ID", "0"))
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
+OWNER_ID          = int(os.environ.get("OWNER_ID", "0")) or None  # Owner user ID for restricted commands
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DOWNLOAD_DIR = Path("downloads")

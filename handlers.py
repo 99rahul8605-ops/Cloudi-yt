@@ -53,6 +53,15 @@ from utils import (
 
 logger = logging.getLogger(__name__)
 
+# Owner ID for restricted commands (set via OWNER_ID env var)
+import os
+_owner_id_str = os.environ.get("OWNER_ID", "").strip()
+OWNER_ID = int(_owner_id_str) if _owner_id_str else None
+if OWNER_ID:
+    logger.info("✅ OWNER_ID set to %d — /stats and /cookiecheck restricted", OWNER_ID)
+else:
+    logger.info("⚠️ OWNER_ID not set — /stats and /cookiecheck open to all users")
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  COMMANDS
@@ -101,18 +110,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    owner_id = config.OWNER_ID
-    logger.info("/cookiecheck from uid=%d | config.OWNER_ID=%s", uid, owner_id)
-    if owner_id is None or uid != owner_id:
-        logger.warning("/cookiecheck denied for uid=%d (OWNER_ID=%s)", uid, owner_id)
+    # Restrict to owner only
+    if OWNER_ID is not None and update.effective_user.id != OWNER_ID:
         await update.message.reply_text(
             "🔒 *Owner only.*\nThis command is restricted to the bot owner.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
-
-    logger.info("/cookiecheck allowed for uid=%d", uid)
 
     yt = youtube_cookie_status()
     fb = facebook_cookie_status()
@@ -150,11 +154,8 @@ async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    owner_id = config.OWNER_ID
-    logger.info("/stats from uid=%d | config.OWNER_ID=%s", uid, owner_id)
-    if owner_id is None or uid != owner_id:
-        logger.warning("/stats denied for uid=%d (OWNER_ID=%s)", uid, owner_id)
+    # Restrict to owner only
+    if OWNER_ID is not None and update.effective_user.id != OWNER_ID:
         await update.message.reply_text(
             "🔒 *Owner only.*\nThis command is restricted to the bot owner.",
             parse_mode=ParseMode.MARKDOWN,
@@ -299,14 +300,290 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if is_supported_url(text):
         await handle_url(update, ctx, text)
+    # Silently ignore non-link messages (no reply)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  INSTAGRAM — hybrid handler
+#  • Reels / Videos  → yt-dlp (fast, reliable)
+#  • Photos / Carousel → instaloader (handles image posts correctly)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _insta_shortcode(url: str) -> tuple[str, str] | tuple[None, None]:
+    """Return (shortcode, type) where type is 'post', 'reel', or 'story'."""
+    # Story URLs: /stories/username/media_id/
+    m = re.search(r"/stories/([^/]+)/(\d+)", url)
+    if m:
+        return m.group(2), "story"
+    # Post/reel/tv URLs: /p/shortcode/ or /reel/shortcode/
+    m = re.search(r"/(?:p|reel|tv)/([A-Za-z0-9_-]+)", url)
+    if m:
+        return m.group(1), "post"
+    return None, None
+
+
+def _make_insta_loader():
+    import instaloader
+    import http.cookiejar as _cj
+    import os
+
+    ig_cookie_file = Path("ig_cookies.txt")
+    # IG_USERNAME env var is needed so instaloader marks session as logged-in
+    ig_username = os.environ.get("IG_USERNAME", "")
+
+    L = instaloader.Instaloader(
+        download_videos=True,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        post_metadata_txt_pattern="",
+        filename_pattern="{shortcode}",
+        dirname_pattern=str(DOWNLOAD_DIR),
+        quiet=True,
+    )
+
+    if ig_cookie_file.exists():
+        try:
+            # Load cookies into the session
+            cj = _cj.MozillaCookieJar(str(ig_cookie_file))
+            cj.load(ignore_discard=True, ignore_expires=True)
+            cookies = {c.name: c.value for c in cj}
+
+            if "sessionid" in cookies:
+                # Update session cookies
+                L.context._session.cookies.update(cookies)
+
+                # CRITICAL: set username on context so instaloader
+                # treats this as a logged-in session (required for stories)
+                if ig_username:
+                    L.context.username = ig_username
+                else:
+                    # Try to extract username from cookies (ds_user_id won't give
+                    # username directly, so we probe the API)
+                    try:
+                        L.context.username = L.test_login()
+                        if L.context.username:
+                            logger.info("instaloader: logged in as %s", L.context.username)
+                    except Exception:
+                        # Fallback: set a dummy username so is_logged_in returns True
+                        L.context.username = "user"
+
+                logger.info("instaloader: session loaded, username=%s", L.context.username)
+            else:
+                logger.warning("instaloader: no sessionid in cookies file")
+        except Exception as e:
+            logger.warning("instaloader: could not load cookies: %s", e)
     else:
-        await handle_search(update, ctx, text)
+        logger.warning("instaloader: ig_cookies.txt not found")
+
+    return L
+
+
+async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                       url: str, msg):
+    """Handle all Instagram URLs — yt-dlp for video/reels, instaloader for images."""
+    import instaloader
+    loop = asyncio.get_event_loop()
+    uid  = update.effective_user.id
+
+    shortcode, post_type = _insta_shortcode(url)
+    if not shortcode:
+        await msg.edit_text("❌ Could not parse Instagram URL.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # ── Stories: completely different instaloader API
+    if post_type == "story":
+        await msg.edit_text("📖 *Story* — downloading…", parse_mode=ParseMode.MARKDOWN)
+        m_user = re.search(r"/stories/([^/]+)/", url)
+        username = m_user.group(1) if m_user else None
+
+        def _download_story():
+            import shutil
+            L2 = _make_insta_loader()
+            if not username:
+                raise ValueError("Could not extract username from story URL")
+            target_dir = DOWNLOAD_DIR / shortcode
+            target_dir.mkdir(parents=True, exist_ok=True)
+            L2.dirname_pattern  = str(DOWNLOAD_DIR / "{target}")
+            L2.filename_pattern = "{mediaid}"
+            profile = instaloader.Profile.from_username(L2.context, username)
+            for story in L2.get_stories(userids=[profile.userid]):
+                for item in story.get_items():
+                    if str(item.mediaid) == shortcode:
+                        L2.download_storyitem(item, target=shortcode)
+                        break
+            media = []
+            for f in sorted(target_dir.rglob("*")):
+                if f.is_file() and f.suffix.lower() in (".jpg",".jpeg",".png",".webp",".mp4",".mov"):
+                    dest = DOWNLOAD_DIR / f"{shortcode}_{f.name}"
+                    shutil.move(str(f), str(dest))
+                    media.append(str(dest))
+            shutil.rmtree(str(target_dir), ignore_errors=True)
+            return media
+
+        try:
+            files = await loop.run_in_executor(None, _download_story)
+        except instaloader.exceptions.LoginRequiredException:
+            await msg.edit_text(
+                "🔒 *Login required for stories.*\nEnsure valid Instagram cookies are set.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        except Exception as e:
+            logger.error("Story download error: %s", e)
+            await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+            return
+
+        if not files:
+            await msg.edit_text(
+                "❌ Story not found or expired.\nStories expire after 24 hours.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+        for i, fpath in enumerate(files, 1):
+            try:
+                await msg.edit_text(f"📤 Uploading {i}/{len(files)}…", parse_mode=ParseMode.MARKDOWN)
+                ext = Path(fpath).suffix.lower()
+                await send_file(
+                    chat_id=uid, filepath=fpath, filename=Path(fpath).name,
+                    caption="", status_msg=msg, is_video=ext in {".mp4",".mov"},
+                )
+                register_for_cleanup(fpath, get_settings(uid)["cleanup_minutes"])
+            except Exception as e:
+                logger.error("Story upload error: %s", e, exc_info=True)
+        await msg.edit_text("✅ *Done!*", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    await msg.edit_text("📸 *Instagram* — fetching info…", parse_mode=ParseMode.MARKDOWN)
+
+    def _fetch():
+        L = _make_insta_loader()
+        return instaloader.Post.from_shortcode(L.context, shortcode)
+
+    try:
+        post = await loop.run_in_executor(None, _fetch)
+    except instaloader.exceptions.LoginRequiredException:
+        await msg.edit_text(
+            "🔒 *Followers-only or private post.*\nThe bot's Instagram account must follow this user.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    except Exception as e:
+        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    is_video    = post.is_video
+    is_carousel = post.typename == "GraphSidecar"
+    caption     = (post.caption or "")[:80].replace("*","").replace("`","").strip()
+    title       = caption or f"Instagram post {shortcode}"
+
+    # ── Step 2: Download everything via instaloader (videos, reels, images, carousels)
+    # yt-dlp is NOT used for Instagram — Instagram blocks its GraphQL endpoint (403).
+    await msg.edit_text(
+        f"📸 *{title}*\n\n⬇️ Downloading…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    def _download_all():
+        import shutil
+        L2 = _make_insta_loader()
+        post2 = instaloader.Post.from_shortcode(L2.context, shortcode)
+
+        target_dir = DOWNLOAD_DIR / shortcode
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        L2.dirname_pattern  = str(DOWNLOAD_DIR / "{target}")
+        L2.filename_pattern = "{shortcode}"
+        L2.download_post(post2, target=shortcode)
+
+        media = []
+        for f in sorted(target_dir.rglob("*")):
+            logger.info("instaloader: found %s (size=%d)", f.name,
+                        f.stat().st_size if f.is_file() else -1)
+            if f.is_file() and f.suffix.lower() in (
+                    ".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"):
+                dest = DOWNLOAD_DIR / f"{shortcode}_{f.name}"
+                shutil.move(str(f), str(dest))
+                media.append(str(dest))
+                logger.info("instaloader: moved to %s", dest.name)
+
+        try:
+            shutil.rmtree(str(target_dir), ignore_errors=True)
+        except Exception:
+            pass
+
+        logger.info("instaloader: total %d file(s)", len(media))
+        return media
+
+    try:
+        files = await loop.run_in_executor(None, _download_all)
+    except Exception as e:
+        logger.error("instaloader download error: %s", e)
+        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if not files:
+        await msg.edit_text(
+            "❌ No images downloaded.\nThe post may be private or removed.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # ── Step 4: Upload all files
+    uploaded = 0
+    for i, fpath in enumerate(files, 1):
+        p = Path(fpath)
+        if not p.exists():
+            logger.error("File does not exist before upload: %s", fpath)
+            continue
+        size = p.stat().st_size
+        logger.info("Uploading %s (size=%d bytes)", fpath, size)
+        if size < 100:
+            logger.warning("File too small, skipping: %s (%d bytes)", fpath, size)
+            continue
+        try:
+            await msg.edit_text(
+                f"📤 Uploading {i}/{len(files)}…",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            fname   = Path(fpath).name
+            ext     = Path(fpath).suffix.lower()
+            is_vid  = ext in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv"}
+            await send_file(
+                chat_id    = uid,
+                filepath   = fpath,
+                filename   = fname,
+                caption    = title,
+                status_msg = msg,
+                is_video   = is_vid,
+            )
+            register_for_cleanup(fpath, get_settings(uid)["cleanup_minutes"])
+            uploaded += 1
+            logger.info("Uploaded successfully: %s", fpath)
+        except Exception as e:
+            logger.error("Upload error for %s: %s", fpath, e, exc_info=True)
+
+    if uploaded == 0:
+        await msg.edit_text(
+            "❌ Download succeeded but upload failed.\nCheck logs for details.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await msg.edit_text("✅ *Done!*", parse_mode=ParseMode.MARKDOWN)
 
 
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
     platform = detect_platform(url)
     label    = platform_label(url)
     msg = await update.message.reply_text(f"{label} — 🔍 Fetching info…")
+
+    # ── Instagram: instaloader handles everything (photos, videos, reels, stories, carousels)
+    if platform == "instagram":
+        await insta_handle(update, ctx, url, msg)
+        return
 
     try:
         info = await extract_info(url)
@@ -320,6 +597,19 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
     if not info:
         await msg.edit_text("❌ Could not fetch info for this URL.", parse_mode=ParseMode.MARKDOWN)
         return
+
+    # Instagram image posts come back as a playlist — flatten first entry for display
+    # but keep all entries so do_image can download all carousel images.
+    entries = info.get("entries") or []
+    if entries and not info.get("formats") and not info.get("url"):
+        # It's a playlist/carousel — use first entry for metadata
+        first = entries[0] if entries else {}
+        if not info.get("thumbnail") and first.get("thumbnail"):
+            info["thumbnail"] = first.get("thumbnail")
+        if not info.get("thumbnails") and first.get("thumbnails"):
+            info["thumbnails"] = first.get("thumbnails")
+        logger.info("Playlist post: %d entries, first thumbnail=%s",
+                    len(entries), bool(info.get("thumbnail")))
 
     title    = info.get("title", "Unknown")
     duration = info.get("duration", 0)
@@ -362,7 +652,18 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
     is_image_post = (not has_video_formats and not duration) or has_image_formats
 
     if is_image_post:
-        # ── Image post: show image download button (+ thumbnail if different)
+        # Non-YouTube image post: auto-download immediately, no menu.
+        if platform != "youtube":
+            await msg.edit_text(
+                f"{emoji} *{title}*\n\n📷 Image post — downloading…",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            class _FakeQ:
+                message = msg
+                async def answer(self): pass
+            await do_image(_FakeQ(), ctx, update.effective_user.id)
+            return
+        # YouTube fallback: show image download button
         buttons = [
             [InlineKeyboardButton("🖼 Download Image", callback_data="dl:image")],
         ]
@@ -376,7 +677,23 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
         )
         return
 
-    # ── Video / audio post: normal flow
+    # ── Video / audio post
+    # Non-YouTube: skip the menu and auto-download video at best quality immediately.
+    # YouTube: show the full Video / Audio / Thumbnail menu so user can pick quality.
+    if platform != "youtube":
+        await msg.edit_text(
+            f"{emoji} *{title}*\n⏱ `{dur_str}`\n\n⬇️ Downloading at best quality…",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        # Reuse do_video but we need a fake CallbackQuery-like object.
+        # Simplest: store state and trigger download directly.
+        class _FakeQ:
+            message = msg
+            async def answer(self): pass
+        await do_video(_FakeQ(), ctx, update.effective_user.id, "best")
+        return
+
+    # YouTube: show full menu
     buttons = [
         [InlineKeyboardButton("🎬 Video",     callback_data="dl:video")],
         [InlineKeyboardButton("🎵 Audio MP3", callback_data="dl:audio")],
@@ -411,16 +728,11 @@ async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await do_audio(q, ctx, uid); return
     if action == "video":
         platform = ctx.user_data.get("platform", "generic")
-        s        = get_settings(uid)
-        # Quality picker only makes sense for YouTube (adaptive streams with many resolutions).
-        # All other platforms: download immediately at best available quality.
+        # YouTube: always show quality picker so user can choose resolution.
+        # All other platforms: skip picker and download at best available quality immediately.
         if platform == "youtube":
-            if s["mode"] == "fixed":
-                await do_video(q, ctx, uid, s["quality"])
-            else:
-                await show_quality_menu(q, ctx)
+            await show_quality_menu(q, ctx)
         else:
-            # Non-YouTube: always best quality, no picker needed
             await do_video(q, ctx, uid, "best")
         return
     if action == "quality" and len(parts) == 3:
@@ -617,26 +929,104 @@ async def do_image(q, ctx, uid: int):
     # Pick the highest-resolution thumbnail available.
     thumb_url = None
     thumbnails = info.get("thumbnails") or []
+    logger.info("do_image: platform=%s vid_id=%s thumbnails=%d thumbnail=%s",
+                platform, vid_id, len(thumbnails), bool(info.get("thumbnail")))
     if thumbnails:
         best = sorted(thumbnails, key=lambda t: t.get("width") or 0, reverse=True)
         thumb_url = best[0].get("url")
+        logger.info("do_image: best thumbnail url=%s", (thumb_url or "")[:80])
     if not thumb_url:
         thumb_url = info.get("thumbnail")
+        logger.info("do_image: fallback thumbnail url=%s", (thumb_url or "")[:80])
 
     downloaded_files: list[str] = []
 
     if thumb_url:
         outpath = str(DOWNLOAD_DIR / f"{vid_id}_img.jpg")
         try:
-            urllib.request.urlretrieve(thumb_url, outpath)
-            if Path(outpath).stat().st_size > 2000:   # sanity: >2 KB means real image
+            # Use requests with a session so we can attach Instagram cookies if available
+            import requests as _requests
+            from pathlib import Path as _Path
+            session = _requests.Session()
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                "Referer": "https://www.instagram.com/",
+            })
+            # Attach Instagram cookies from file if present
+            ig_cookie_file = _Path("ig_cookies.txt")
+            if ig_cookie_file.exists():
+                import http.cookiejar as _cookiejar
+                cj = _cookiejar.MozillaCookieJar(str(ig_cookie_file))
+                try:
+                    cj.load(ignore_discard=True, ignore_expires=True)
+                    session.cookies.update({c.name: c.value for c in cj})
+                except Exception as ce:
+                    logger.debug("Could not load IG cookies for image fetch: %s", ce)
+            resp = session.get(thumb_url, timeout=30, stream=True)
+            resp.raise_for_status()
+            with open(outpath, "wb") as f:
+                for chunk in resp.iter_content(8192):
+                    f.write(chunk)
+            if Path(outpath).stat().st_size > 2000:
                 downloaded_files = [outpath]
                 logger.info("Image downloaded via thumbnail URL: %s", outpath)
         except Exception as e:
             logger.warning("Thumbnail URL fetch failed: %s", e)
 
-    # ── Step 2: If thumbnail fetch didn't work, try yt-dlp (handles carousels)
-    if not downloaded_files:
+    logger.info("do_image: after step1 downloaded_files=%s", downloaded_files)
+    # ── Step 2: Instagram image post — use yt-dlp with format=jpg/png
+    # Instagram image posts come back as a playlist of entries; each entry has
+    # a direct image URL. We download with format selector targeting images.
+    if not downloaded_files and platform == "instagram":
+        loop2 = asyncio.get_event_loop()
+        try:
+            from yt_dlp import YoutubeDL
+            from platforms import ydl_opts_for
+
+            class _SilentLogger:
+                def debug(self, msg): pass
+                def info(self, msg): pass
+                def warning(self, msg): logger.debug("yt-dlp: %s", msg)
+                def error(self, msg): logger.debug("yt-dlp: %s", msg)
+
+            ig_opts = ydl_opts_for(url)
+            ig_opts.update({
+                "format":                  "bestvideo[ext=jpg]/bestvideo[ext=png]/bestvideo[ext=webp]/best[ext=jpg]/best[ext=png]/best[ext=webp]/best",
+                "ignore_no_formats_error": True,
+                "outtmpl":                 str(DOWNLOAD_DIR / f"{vid_id}_%(autonumber)03d.%(ext)s"),
+                "logger":                  _SilentLogger(),
+                "noplaylist":              False,  # allow playlist so carousel works
+            })
+
+            def _dl_ig_image():
+                before = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
+                with YoutubeDL(ig_opts) as ydl:
+                    ydl.extract_info(url, download=True)
+                after = set(DOWNLOAD_DIR.glob(f"{vid_id}_*"))
+                return sorted([
+                    str(f) for f in (after - before)
+                    if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".gif")
+                ])
+
+            ig_files = await loop2.run_in_executor(None, _dl_ig_image)
+            if ig_files:
+                downloaded_files = ig_files
+                logger.info("Instagram image(s) downloaded via yt-dlp: %s", ig_files)
+            else:
+                logger.warning("yt-dlp returned no image files for Instagram post")
+        except Exception as e:
+            logger.warning("Instagram yt-dlp image download failed: %s", e)
+
+    logger.info("do_image: after step2 downloaded_files=%s", downloaded_files)
+
+    # ── Step 3: Pinterest / other platforms — yt-dlp direct
+    _image_only_platforms = {"instagram", "pinterest"}
+    if not downloaded_files and platform not in _image_only_platforms:
         loop = asyncio.get_event_loop()
         from utils import build_progress_hook
         hook = build_progress_hook(loop, status, "🖼 image")
@@ -649,6 +1039,8 @@ async def do_image(q, ctx, uid: int):
                 "format":         "best",
                 "outtmpl":        str(DOWNLOAD_DIR / f"{vid_id}_%(autonumber)s.%(ext)s"),
                 "progress_hooks": [hook],
+                "quiet":          True,
+                "no_warnings":    True,
             })
 
             def _download():
@@ -784,6 +1176,20 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: s
 
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     import traceback
+    from telegram.error import Conflict, NetworkError
+
+    # 409 Conflict = two bot instances running simultaneously (Render redeploy overlap).
+    # Log as warning only — not an actionable error.
+    if isinstance(ctx.error, Conflict):
+        logger.warning("409 Conflict — another bot instance is running (redeploy overlap). "
+                       "Will resolve automatically in a few seconds.")
+        return
+
+    # Transient network errors — log quietly, don't spam user
+    if isinstance(ctx.error, NetworkError):
+        logger.warning("Network error (transient): %s", ctx.error)
+        return
+
     tb = "".join(traceback.format_exception(type(ctx.error), ctx.error,
                                              ctx.error.__traceback__))
     logger.error("Unhandled exception:\n%s", tb)

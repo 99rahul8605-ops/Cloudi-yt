@@ -432,7 +432,23 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await msg.edit_text("✅ *Done!*", parse_mode=ParseMode.MARKDOWN)
         return
 
+    await msg.edit_text("📸 *Instagram* — fetching info…", parse_mode=ParseMode.MARKDOWN)
 
+    def _fetch():
+        L = _make_insta_loader()
+        return instaloader.Post.from_shortcode(L.context, shortcode)
+
+    try:
+        post = await loop.run_in_executor(None, _fetch)
+    except instaloader.exceptions.LoginRequiredException:
+        await msg.edit_text(
+            "🔒 *Followers-only or private post.*\nThe bot's Instagram account must follow this user.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    except Exception as e:
+        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+        return
 
     is_video    = post.is_video
     is_carousel = post.typename == "GraphSidecar"

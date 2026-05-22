@@ -57,6 +57,10 @@ logger = logging.getLogger(__name__)
 import os
 _owner_id_str = os.environ.get("OWNER_ID", "").strip()
 OWNER_ID = int(_owner_id_str) if _owner_id_str else None
+if OWNER_ID:
+    logger.info("✅ OWNER_ID set to %d — /stats and /cookiecheck restricted", OWNER_ID)
+else:
+    logger.info("⚠️ OWNER_ID not set — /stats and /cookiecheck open to all users")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

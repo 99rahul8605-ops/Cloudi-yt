@@ -275,8 +275,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if is_supported_url(text):
         await handle_url(update, ctx, text)
-    else:
-        await handle_search(update, ctx, text)
+    # Silently ignore non-link messages (no reply)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

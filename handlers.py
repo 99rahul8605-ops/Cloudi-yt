@@ -35,7 +35,7 @@ import config
 from config import (
     DOWNLOAD_DIR, get_settings, register_for_cleanup,
     user_settings, cleanup_registry, BOT_START_TIME, _pyro_bot,
-    TELEGRAM_API_ID, TELEGRAM_API_HASH,
+    TELEGRAM_API_ID, TELEGRAM_API_HASH, OWNER_ID,
 )
 from cookies import (
     youtube_cookie_status, facebook_cookie_status, instagram_cookie_status,
@@ -53,10 +53,6 @@ from utils import (
 
 logger = logging.getLogger(__name__)
 
-# Owner ID for restricted commands (set via OWNER_ID env var)
-import os
-_owner_id_str = os.environ.get("OWNER_ID", "").strip()
-OWNER_ID = int(_owner_id_str) if _owner_id_str else None
 if OWNER_ID:
     logger.info("✅ OWNER_ID set to %d — /stats and /cookiecheck restricted", OWNER_ID)
 else:
@@ -110,14 +106,16 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    logger.info("🔐 cmd_cookiecheck: user_id=%s | owner_id=%s", uid, OWNER_ID)
     # Restrict to owner only
-    if OWNER_ID is not None and update.effective_user.id != OWNER_ID:
+    if OWNER_ID is not None and uid != OWNER_ID:
+        logger.warning("❌ BLOCKED /cookiecheck: user %s (owner=%s)", uid, OWNER_ID)
         await update.message.reply_text(
             "🔒 *Owner only.*\nThis command is restricted to the bot owner.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
-
     yt = youtube_cookie_status()
     fb = facebook_cookie_status()
     ig = instagram_cookie_status()
@@ -152,14 +150,16 @@ async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-
-async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    logger.info("🔐 cmd_stats: user_id=%s | owner_id=%s", uid, OWNER_ID)
     # Restrict to owner only
-    if OWNER_ID is not None and update.effective_user.id != OWNER_ID:
+    if OWNER_ID is not None and uid != OWNER_ID:
+        logger.warning("❌ BLOCKED /stats: user %s (owner=%s)", uid, OWNER_ID)
         await update.message.reply_text(
             "🔒 *Owner only.*\nThis command is restricted to the bot owner.",
             parse_mode=ParseMode.MARKDOWN,
         )
+        return
         return
 
     ytdlp_ver          = get_ytdlp_version()

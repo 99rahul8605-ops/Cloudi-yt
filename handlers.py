@@ -53,6 +53,10 @@ from utils import (
 
 logger = logging.getLogger(__name__)
 
+# Owner ID for restricted commands (set via OWNER_ID env var, default: None)
+import os
+OWNER_ID = int(os.environ.get("OWNER_ID", "0")) or None
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  COMMANDS
@@ -101,6 +105,14 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Restrict to owner only
+    if OWNER_ID and update.effective_user.id != OWNER_ID:
+        await update.message.reply_text(
+            "🔒 *Owner only.*\nThis command is restricted to the bot owner.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
     yt = youtube_cookie_status()
     fb = facebook_cookie_status()
     ig = instagram_cookie_status()
@@ -137,6 +149,14 @@ async def cmd_cookiecheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Restrict to owner only
+    if OWNER_ID and update.effective_user.id != OWNER_ID:
+        await update.message.reply_text(
+            "🔒 *Owner only.*\nThis command is restricted to the bot owner.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
     ytdlp_ver          = get_ytdlp_version()
     ffmpeg_ver         = get_ffmpeg_version()
     python_ver         = sys.version.split()[0]

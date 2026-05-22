@@ -384,8 +384,9 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                        url: str, msg):
     """Handle all Instagram URLs — yt-dlp for video/reels, instaloader for images."""
     import instaloader
-    loop = asyncio.get_event_loop()
-    uid  = update.effective_user.id
+    loop    = asyncio.get_event_loop()
+    uid     = update.effective_user.id
+    chat_id = update.effective_chat.id
 
     shortcode, post_type = _insta_shortcode(url)
     if not shortcode:
@@ -447,7 +448,7 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                 await msg.edit_text(f"📤 Uploading {i}/{len(files)}…", parse_mode=ParseMode.MARKDOWN)
                 ext = Path(fpath).suffix.lower()
                 await send_file(
-                    chat_id=uid, filepath=fpath, filename=Path(fpath).name,
+                    chat_id=chat_id, filepath=fpath, filename=Path(fpath).name,
                     caption="", status_msg=msg, is_video=ext in {".mp4",".mov"},
                 )
                 register_for_cleanup(fpath, get_settings(uid)["cleanup_minutes"])
@@ -552,7 +553,7 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             ext     = Path(fpath).suffix.lower()
             is_vid  = ext in {".mp4", ".mov", ".mkv", ".avi", ".webm", ".flv"}
             await send_file(
-                chat_id    = uid,
+                chat_id    = chat_id,
                 filepath   = fpath,
                 filename   = fname,
                 caption    = title,

@@ -37,6 +37,7 @@ from config import (
     user_settings, cleanup_registry, BOT_START_TIME, _pyro_bot,
     TELEGRAM_API_ID, TELEGRAM_API_HASH,
 )
+import queue_manager
 from cookies import (
     youtube_cookie_status, facebook_cookie_status, instagram_cookie_status,
     COOKIES_FILE, FB_COOKIES_FILE, IG_COOKIES_FILE,
@@ -583,7 +584,11 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
 
     # ── Instagram: instaloader handles everything (photos, videos, reels, stories, carousels)
     if platform == "instagram":
-        await insta_handle(update, ctx, url, msg)
+        await queue_manager.enqueue(
+            coro_fn    = lambda: insta_handle(update, ctx, url, msg),
+            status_msg = msg,
+            user_label = f"instagram:{url[:60]}",
+        )
         return
 
     try:
@@ -662,7 +667,13 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
             class _FakeQ:
                 message = msg
                 async def answer(self): pass
-            await do_image(_FakeQ(), ctx, update.effective_user.id)
+            _fq = _FakeQ()
+            _uid = update.effective_user.id
+            await queue_manager.enqueue(
+                coro_fn    = lambda: do_image(_fq, ctx, _uid),
+                status_msg = msg,
+                user_label = f"image:{title[:40]}",
+            )
             return
         # YouTube fallback: show image download button
         buttons = [
@@ -686,12 +697,16 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, url: str):
             f"{emoji} *{title}*\n⏱ `{dur_str}`\n\n⬇️ Downloading at best quality…",
             parse_mode=ParseMode.MARKDOWN,
         )
-        # Reuse do_video but we need a fake CallbackQuery-like object.
-        # Simplest: store state and trigger download directly.
         class _FakeQ:
             message = msg
             async def answer(self): pass
-        await do_video(_FakeQ(), ctx, update.effective_user.id, "best")
+        _fq  = _FakeQ()
+        _uid = update.effective_user.id
+        await queue_manager.enqueue(
+            coro_fn    = lambda: do_video(_fq, ctx, _uid, "best"),
+            status_msg = msg,
+            user_label = f"video:{title[:40]}",
+        )
         return
 
     # YouTube: show full menu
@@ -722,22 +737,48 @@ async def download_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "cancel":
         await q.message.edit_text("❌ Download cancelled."); return
     if action == "thumb":
-        await do_thumbnail(q, ctx, uid); return
+        await do_thumbnail(q, ctx, uid); return   # thumbnail is fast, no queue needed
     if action == "image":
-        await do_image(q, ctx, uid); return
+        info  = ctx.user_data.get("info", {})
+        title = info.get("title", "image")
+        await queue_manager.enqueue(
+            coro_fn    = lambda: do_image(q, ctx, uid),
+            status_msg = q.message,
+            user_label = f"image:{title[:40]}",
+        )
+        return
     if action == "audio":
-        await do_audio(q, ctx, uid); return
+        info  = ctx.user_data.get("info", {})
+        title = info.get("title", "audio")
+        await queue_manager.enqueue(
+            coro_fn    = lambda: do_audio(q, ctx, uid),
+            status_msg = q.message,
+            user_label = f"audio:{title[:40]}",
+        )
+        return
     if action == "video":
         platform = ctx.user_data.get("platform", "generic")
-        # YouTube: always show quality picker so user can choose resolution.
-        # All other platforms: skip picker and download at best available quality immediately.
         if platform == "youtube":
             await show_quality_menu(q, ctx)
         else:
-            await do_video(q, ctx, uid, "best")
+            info  = ctx.user_data.get("info", {})
+            title = info.get("title", "video")
+            await queue_manager.enqueue(
+                coro_fn    = lambda: do_video(q, ctx, uid, "best"),
+                status_msg = q.message,
+                user_label = f"video:{title[:40]}",
+            )
         return
     if action == "quality" and len(parts) == 3:
-        await do_video(q, ctx, uid, parts[2]); return
+        quality = parts[2]
+        info    = ctx.user_data.get("info", {})
+        title   = info.get("title", "video")
+        await queue_manager.enqueue(
+            coro_fn    = lambda: do_video(q, ctx, uid, quality),
+            status_msg = q.message,
+            user_label = f"video@{quality}:{title[:40]}",
+        )
+        return
     if action == "search" and len(parts) == 3:
         results = ctx.user_data.get("search_results", [])
         idx = int(parts[2])

@@ -22,6 +22,7 @@ from config import BOT_TOKEN
 from cookies import init_cookies_from_env, youtube_cookie_status
 from uploader import start_pyro_bot, stop_pyro_bot
 from utils import launch_health_server, cleanup_worker
+import queue_manager
 from handlers import (
     cmd_start, cmd_help, cmd_settings, cmd_cookiecheck, cmd_stats,
     settings_callback, download_callback,
@@ -53,7 +54,12 @@ def main():
     launch_health_server()
 
     # ── Build PTB Application ────────────────────────────────────────────────
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)   # allow handlers to run concurrently
+        .build()
+    )
 
     # Commands
     app.add_handler(CommandHandler("start",       cmd_start))
@@ -82,6 +88,7 @@ def main():
             BotCommand("stats",       "Bot & dependency info"),
         ])
         await start_pyro_bot()           # Pyrogram MTProto (2 GB uploads)
+        queue_manager.setup()            # initialise download task queue
         asyncio.create_task(cleanup_worker())
 
     async def post_shutdown(application: Application):

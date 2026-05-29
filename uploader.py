@@ -235,7 +235,7 @@ async def send_file(
 
     async def _progress(current: int, total: int) -> None:
         now = time.time()
-        if now - _last_edit[0] < 3:
+        if now - _last_edit[0] < 5:
             return
         _last_edit[0] = now
         elapsed = now - _start_time[0]

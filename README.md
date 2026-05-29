@@ -51,7 +51,7 @@ nano .env
 Fill in your values:
 
 ```
-BOT_TOKEN=your_bot_token_here
+BOT_TOKEN=your_real_bot_token_here
 API_ID=your_api_id
 API_HASH=your_api_hash
 ```
@@ -88,8 +88,15 @@ cat > ~/start3.sh << 'EOF'
 screen -X -S cloudi quit 2>/dev/null
 
 cd ~/Cloudi-yt
+
+# .env backup karo (force pull se delete ho jata hai)
+cp .env /tmp/cloudi_env_backup
+
 git fetch --all
 git reset --hard origin/main
+
+# .env restore karo
+cp /tmp/cloudi_env_backup .env
 
 # Restore dotenv fix
 sed -i '1s/^/from dotenv import load_dotenv\nload_dotenv()\n/' main.py
@@ -106,6 +113,8 @@ Restart karne ke liye:
 ```bash
 ~/start3.sh
 ```
+
+> ⚠️ `.env` file kabhi GitHub pe push mat karo — `start3.sh` khud backup aur restore karta hai!
 
 ---
 

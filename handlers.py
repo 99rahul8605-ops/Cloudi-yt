@@ -220,36 +220,36 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     top_str = ""
     for rank, (uid, info) in enumerate(top_users, 1):
         uname = f"@{info['username']}" if info["username"] else info["name"]
-        top_str += f"  {rank}. {uname} — `{info['downloads']}` downloads\n"
+        top_str += f"  {rank}. {uname} \u2014 <code>{info['downloads']}</code> downloads\n"
     if not top_str:
         top_str = "  No data yet.\n"
 
     msg = (
-        "📊 *Bot Statistics*\n"
+        "📊 <b>Bot Statistics</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🔧 *Dependencies*\n"
-        f"  • yt-dlp:  `{ytdlp_ver}`\n"
-        f"  • FFmpeg:  `{ffmpeg_ver}`\n"
-        f"  • Python:  `{python_ver}`\n"
-        f"  • OS:      `{os_info}`\n\n"
-        "⏱ *Runtime*\n"
-        f"  • Uptime:  `{uptime_str}`\n\n"
-        "👥 *Users*\n"
-        f"  • Total users seen:      `{total_users}`\n"
-        f"  • Active user profiles:  `{active_users}`\n"
-        f"  • Total downloads done:  `{total_downloads}`\n"
-        f"  • Files pending cleanup: `{queued_files}`\n\n"
-        "🏆 *Top Downloaders*\n"
+        "🔧 <b>Dependencies</b>\n"
+        f"  • yt-dlp:  <code>{ytdlp_ver}</code>\n"
+        f"  • FFmpeg:  <code>{ffmpeg_ver}</code>\n"
+        f"  • Python:  <code>{python_ver}</code>\n"
+        f"  • OS:      <code>{os_info}</code>\n\n"
+        "⏱ <b>Runtime</b>\n"
+        f"  • Uptime:  <code>{uptime_str}</code>\n\n"
+        "👥 <b>Users</b>\n"
+        f"  • Total users seen:      <code>{total_users}</code>\n"
+        f"  • Active user profiles:  <code>{active_users}</code>\n"
+        f"  • Total downloads done:  <code>{total_downloads}</code>\n"
+        f"  • Files pending cleanup: <code>{queued_files}</code>\n\n"
+        "🏆 <b>Top Downloaders</b>\n"
         f"{top_str}\n"
-        "💾 *Download Folder*\n"
-        f"  • Files: `{file_count}`  Size: `{dir_mb:.2f} MB`\n\n"
-        f"📤 *Upload engine:* {upload_str}\n\n"
-        "🍪 *Cookies*\n"
+        "💾 <b>Download Folder</b>\n"
+        f"  • Files: <code>{file_count}</code>  Size: <code>{dir_mb:.2f} MB</code>\n\n"
+        f"📤 <b>Upload engine:</b> {upload_str}\n\n"
+        "🍪 <b>Cookies</b>\n"
         f"  • YouTube:   {'✅' if yt_cs['ok'] else '❌'}\n"
         f"  • Instagram: {'✅' if ig_cs['ok'] else '❌'}\n"
         f"  • Facebook:  {'✅' if fb_cs['ok'] else '❌'}\n"
     )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
 # ═════════════════════════════════════════════════════════════════════════════

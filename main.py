@@ -25,6 +25,7 @@ from utils import launch_health_server, cleanup_worker
 import queue_manager
 from handlers import (
     cmd_start, cmd_help, cmd_settings, cmd_cookiecheck, cmd_stats,
+    cmd_broadcast,
     settings_callback, download_callback,
     handle_message, error_handler,
 )
@@ -67,6 +68,7 @@ def main():
     app.add_handler(CommandHandler("settings",    cmd_settings))
     app.add_handler(CommandHandler("cookiecheck", cmd_cookiecheck))
     app.add_handler(CommandHandler("stats",       cmd_stats))
+    app.add_handler(CommandHandler("broadcast",   cmd_broadcast))
 
     # Inline keyboard callbacks
     app.add_handler(CallbackQueryHandler(settings_callback, pattern=r"^s:"))
@@ -86,6 +88,7 @@ def main():
             BotCommand("settings",    "Manage preferences"),
             BotCommand("cookiecheck", "Diagnose cookie issues"),
             BotCommand("stats",       "Bot & dependency info"),
+            BotCommand("broadcast",   "Broadcast message to all users (owner only)"),
         ])
         await start_pyro_bot()           # Pyrogram MTProto (2 GB uploads)
         queue_manager.setup()            # initialise download task queue

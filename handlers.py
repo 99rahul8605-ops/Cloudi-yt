@@ -63,12 +63,38 @@ if OWNER_ID:
 else:
     logger.info("⚠️ OWNER_ID not set — /stats and /cookiecheck open to all users")
 
+# ── User tracking (persists in memory for session) ───────────────────────────
+# Format: { user_id: {"name": str, "username": str, "first_seen": float, "downloads": int} }
+_user_db: dict[int, dict] = {}
+
+def _track_user(user):
+    """Register or update a user in the in-memory DB."""
+    if user is None:
+        return
+    uid = user.id
+    if uid not in _user_db:
+        _user_db[uid] = {
+            "name":       user.full_name,
+            "username":   user.username or "",
+            "first_seen": time.time(),
+            "downloads":  0,
+        }
+    else:
+        _user_db[uid]["name"]     = user.full_name
+        _user_db[uid]["username"] = user.username or ""
+
+def _inc_download(uid: int):
+    """Increment download count for a user."""
+    if uid in _user_db:
+        _user_db[uid]["downloads"] += 1
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  COMMANDS
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    _track_user(update.effective_user)
     await update.message.reply_text(
         "👋 *Welcome to Media Downloader Bot!*\n\n"
         "Send me a link from any of these platforms:\n\n"
@@ -185,6 +211,19 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         upload_str = "❌ TELEGRAM_API_ID / TELEGRAM_API_HASH not set"
 
+    # ── User stats ───────────────────────────────────────────────────────────
+    total_users     = len(_user_db)
+    total_downloads = sum(u["downloads"] for u in _user_db.values())
+
+    # Top 5 users by downloads
+    top_users = sorted(_user_db.items(), key=lambda x: x[1]["downloads"], reverse=True)[:5]
+    top_str = ""
+    for rank, (uid, info) in enumerate(top_users, 1):
+        uname = f"@{info['username']}" if info["username"] else info["name"]
+        top_str += f"  {rank}. {uname} — `{info['downloads']}` downloads\n"
+    if not top_str:
+        top_str = "  No data yet.\n"
+
     msg = (
         "📊 *Bot Statistics*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -195,9 +234,13 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"  • OS:      `{os_info}`\n\n"
         "⏱ *Runtime*\n"
         f"  • Uptime:  `{uptime_str}`\n\n"
-        "👥 *Usage*\n"
+        "👥 *Users*\n"
+        f"  • Total users seen:      `{total_users}`\n"
         f"  • Active user profiles:  `{active_users}`\n"
+        f"  • Total downloads done:  `{total_downloads}`\n"
         f"  • Files pending cleanup: `{queued_files}`\n\n"
+        "🏆 *Top Downloaders*\n"
+        f"{top_str}\n"
         "💾 *Download Folder*\n"
         f"  • Files: `{file_count}`  Size: `{dir_mb:.2f} MB`\n\n"
         f"📤 *Upload engine:* {upload_str}\n\n"
@@ -298,6 +341,7 @@ async def settings_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    _track_user(update.effective_user)
     text = update.message.text.strip()
     if is_supported_url(text):
         await handle_url(update, ctx, text)
@@ -1209,6 +1253,143 @@ async def handle_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query: s
         "🎵 *Top results — tap to select:*",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  BROADCAST COMMAND
+#  Usage:
+#    /broadcast Hello everyone!          — text broadcast
+#    /broadcast --p Hello!               — broadcast + pin message
+#    /broadcast --f Hello!               — forward original msg (no copy)
+#    /broadcast --p --f Hello!           — forward + pin
+#    Reply to any media/sticker with /broadcast [--p] [--f]
+# ═════════════════════════════════════════════════════════════════════════════
+
+async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+
+    # Owner only
+    if OWNER_ID is not None and uid != OWNER_ID:
+        await update.message.reply_text(
+            "🔒 *Owner only.*", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if not _user_db:
+        await update.message.reply_text("📭 No users to broadcast to yet.")
+        return
+
+    # ── Parse flags from command args ────────────────────────────────────────
+    raw_args = " ".join(ctx.args) if ctx.args else ""
+    pin_msg      = "--p" in raw_args
+    forward_mode = "--f" in raw_args
+
+    # Strip flags to get clean text
+    clean_text = raw_args.replace("--p", "").replace("--f", "").strip()
+
+    reply_msg = update.message.reply_to_message  # None if not a reply
+
+    # Validate: need either text or a replied-to message
+    if not clean_text and reply_msg is None:
+        await update.message.reply_text(
+            "❌ *Usage:*\n"
+            "`/broadcast [--p] [--f] <message>`\n"
+            "Or reply to a message/media with `/broadcast [--p] [--f]`\n\n"
+            "Flags:\n"
+            "  `--p` — pin the broadcast message\n"
+            "  `--f` — forward instead of copy (shows 'Forwarded from')",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    user_ids = list(_user_db.keys())
+    total    = len(user_ids)
+    success  = 0
+    failed   = 0
+
+    status = await update.message.reply_text(
+        f"📣 *Broadcasting to {total} users…*\n`0/{total}` done",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    for i, target_uid in enumerate(user_ids):
+        try:
+            sent_msg = None
+
+            if forward_mode and reply_msg:
+                # Forward the original replied message (keeps 'Forwarded from' header)
+                sent_msg = await ctx.bot.forward_message(
+                    chat_id     = target_uid,
+                    from_chat_id= reply_msg.chat_id,
+                    message_id  = reply_msg.message_id,
+                )
+
+            elif reply_msg:
+                # Copy replied message (no 'Forwarded from'), preserving all media/formatting
+                sent_msg = await ctx.bot.copy_message(
+                    chat_id     = target_uid,
+                    from_chat_id= reply_msg.chat_id,
+                    message_id  = reply_msg.message_id,
+                    caption     = clean_text if clean_text else None,
+                    parse_mode  = ParseMode.MARKDOWN if clean_text else None,
+                )
+
+            else:
+                # Plain text broadcast — preserve original formatting entities
+                entities = update.message.entities or []
+                # Shift entities: skip the command part "/broadcast [flags] "
+                offset_shift = len(update.message.text) - len(clean_text)
+                shifted_entities = []
+                for ent in entities:
+                    if ent.offset >= offset_shift:
+                        import copy as _copy
+                        new_ent = _copy.copy(ent)
+                        new_ent.offset = ent.offset - offset_shift
+                        shifted_entities.append(new_ent)
+
+                sent_msg = await ctx.bot.send_message(
+                    chat_id  = target_uid,
+                    text     = clean_text,
+                    entities = shifted_entities if shifted_entities else None,
+                )
+
+            # Pin if requested
+            if pin_msg and sent_msg:
+                try:
+                    await ctx.bot.pin_chat_message(
+                        chat_id    = target_uid,
+                        message_id = sent_msg.message_id,
+                        disable_notification=True,
+                    )
+                except Exception:
+                    pass  # Pinning may fail in groups where bot isn't admin
+
+            success += 1
+
+        except Exception as e:
+            logger.warning("Broadcast failed for uid %d: %s", target_uid, e)
+            failed += 1
+
+        # Update progress every 20 users
+        if (i + 1) % 20 == 0 or (i + 1) == total:
+            try:
+                await status.edit_text(
+                    f"📣 *Broadcasting…*\n`{i+1}/{total}` done",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+
+        await asyncio.sleep(0.05)  # gentle rate-limit
+
+    pin_note    = " + pinned 📌" if pin_msg else ""
+    fwd_note    = " (forwarded)" if forward_mode else ""
+    await status.edit_text(
+        f"✅ *Broadcast complete{fwd_note}{pin_note}!*\n\n"
+        f"  • Delivered: `{success}`\n"
+        f"  • Failed:    `{failed}`\n"
+        f"  • Total:     `{total}`",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 

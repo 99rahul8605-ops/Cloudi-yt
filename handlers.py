@@ -1308,9 +1308,8 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "🔒 *Owner only.*", parse_mode=ParseMode.MARKDOWN)
         return
 
-    if not _user_db:
-        await update.message.reply_text("📭 No users to broadcast to yet.")
-        return
+    # This check is now done after fetching from DB below
+    pass
 
     # ── Parse flags from command args ────────────────────────────────────────
     raw_args = " ".join(ctx.args) if ctx.args else ""
@@ -1335,14 +1334,21 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    user_ids = list(_user_db.keys())
-    total    = len(user_ids)
-    success  = 0
-    failed   = 0
+    # Get users from MongoDB or memory fallback
+    all_users = _get_all_users()
+    user_ids  = [u["user_id"] for u in all_users if "user_id" in u]
+
+    if not user_ids:
+        await update.message.reply_text("📭 No users found in database yet.")
+        return
+
+    total   = len(user_ids)
+    success = 0
+    failed  = 0
 
     status = await update.message.reply_text(
-        f"📣 *Broadcasting to {total} users…*\n`0/{total}` done",
-        parse_mode=ParseMode.MARKDOWN,
+        f"📣 <b>Broadcasting to {total} users…</b>\n<code>0/{total}</code> done",
+        parse_mode=ParseMode.HTML,
     )
 
     for i, target_uid in enumerate(user_ids):
@@ -1407,8 +1413,8 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if (i + 1) % 20 == 0 or (i + 1) == total:
             try:
                 await status.edit_text(
-                    f"📣 *Broadcasting…*\n`{i+1}/{total}` done",
-                    parse_mode=ParseMode.MARKDOWN,
+                    f"📣 <b>Broadcasting…</b>\n<code>{i+1}/{total}</code> done",
+                    parse_mode=ParseMode.HTML,
                 )
             except Exception:
                 pass
@@ -1418,11 +1424,11 @@ async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pin_note    = " + pinned 📌" if pin_msg else ""
     fwd_note    = " (forwarded)" if forward_mode else ""
     await status.edit_text(
-        f"✅ *Broadcast complete{fwd_note}{pin_note}!*\n\n"
-        f"  • Delivered: `{success}`\n"
-        f"  • Failed:    `{failed}`\n"
-        f"  • Total:     `{total}`",
-        parse_mode=ParseMode.MARKDOWN,
+        f"✅ <b>Broadcast complete{fwd_note}{pin_note}!</b>\n\n"
+        f"  • Delivered: <code>{success}</code>\n"
+        f"  • Failed:    <code>{failed}</code>\n"
+        f"  • Total:     <code>{total}</code>",
+        parse_mode=ParseMode.HTML,
     )
 
 

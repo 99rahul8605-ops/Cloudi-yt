@@ -174,8 +174,7 @@ async def ffmpeg_merge(video_path: str, audio_path: str, out_path: str) -> None:
         "-i", video_path,
         "-i", audio_path,
         "-c:v", "copy",
-        "-c:a", "aac",
-        "-b:a", "192k",
+        "-c:a", "copy",
         out_path,
     ]
     logger.info("ffmpeg merge: %s + %s → %s", video_path, audio_path, out_path)
@@ -208,7 +207,7 @@ async def download_video(url: str, quality: str, status_msg,
             import time as _t
             if d["status"] != "downloading": return
             now = _t.time()
-            if now - last[0] < 3: return
+            if now - last[0] < 5: return
             last[0] = now
             pct   = d.get("_percent_str",  "0%").strip()
             speed = d.get("_speed_str",    "?").strip()

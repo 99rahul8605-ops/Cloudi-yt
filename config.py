@@ -8,6 +8,8 @@ import time
 import logging
 from pathlib import Path
 from pyrogram import Client as PyroClient
+from pymongo import MongoClient
+from pymongo import MongoClient
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -67,3 +69,21 @@ BOT_START_TIME = time.time()
 # ── Pyrogram MTProto client (module-level singleton) ─────────────────────────
 # Started in post_init, stopped in post_shutdown.
 _pyro_bot: "PyroClient | None" = None
+
+# ── MongoDB ───────────────────────────────────────────────────────────────────
+MONGO_URI = os.environ.get("MONGO_URI", "").strip()
+_mongo_client    = None
+users_collection = None
+
+if MONGO_URI:
+    try:
+        _mongo_client    = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        _mongo_db        = _mongo_client["cloudi_bot"]
+        users_collection = _mongo_db["users"]
+        users_collection.create_index("user_id", unique=True)
+        logger.info("✅ MongoDB connected — users collection ready")
+    except Exception as e:
+        logger.warning("⚠️ MongoDB connection failed: %s", e)
+        users_collection = None
+else:
+    logger.warning("⚠️ MONGO_URI not set — user stats will not persist across restarts")

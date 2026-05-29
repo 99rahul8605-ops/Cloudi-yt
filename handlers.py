@@ -63,30 +63,59 @@ if OWNER_ID:
 else:
     logger.info("⚠️ OWNER_ID not set — /stats and /cookiecheck open to all users")
 
-# ── User tracking (persists in memory for session) ───────────────────────────
-# Format: { user_id: {"name": str, "username": str, "first_seen": float, "downloads": int} }
-_user_db: dict[int, dict] = {}
+# ── User tracking — MongoDB backed, falls back to in-memory ──────────────────
+from config import users_collection as _users_col
+_user_db: dict[int, dict] = {}   # fallback if MongoDB not available
 
 def _track_user(user):
-    """Register or update a user in the in-memory DB."""
+    """Register or update a user in MongoDB (or memory fallback)."""
     if user is None:
         return
-    uid = user.id
-    if uid not in _user_db:
-        _user_db[uid] = {
-            "name":       user.full_name,
-            "username":   user.username or "",
-            "first_seen": time.time(),
-            "downloads":  0,
-        }
+    uid  = user.id
+    data = {
+        "user_id":    uid,
+        "name":       user.full_name,
+        "username":   user.username or "",
+        "last_seen":  time.time(),
+    }
+    if _users_col is not None:
+        try:
+            _users_col.update_one(
+                {"user_id": uid},
+                {
+                    "$set":         {"name": data["name"], "username": data["username"], "last_seen": data["last_seen"]},
+                    "$setOnInsert": {"first_seen": time.time(), "downloads": 0},
+                },
+                upsert=True,
+            )
+        except Exception as e:
+            logger.warning("MongoDB _track_user failed: %s", e)
     else:
-        _user_db[uid]["name"]     = user.full_name
-        _user_db[uid]["username"] = user.username or ""
+        # In-memory fallback
+        if uid not in _user_db:
+            _user_db[uid] = {**data, "first_seen": time.time(), "downloads": 0}
+        else:
+            _user_db[uid].update({"name": data["name"], "username": data["username"]})
 
 def _inc_download(uid: int):
     """Increment download count for a user."""
-    if uid in _user_db:
-        _user_db[uid]["downloads"] += 1
+    if _users_col is not None:
+        try:
+            _users_col.update_one({"user_id": uid}, {"$inc": {"downloads": 1}})
+        except Exception as e:
+            logger.warning("MongoDB _inc_download failed: %s", e)
+    else:
+        if uid in _user_db:
+            _user_db[uid]["downloads"] += 1
+
+def _get_all_users() -> list[dict]:
+    """Return all users from MongoDB or memory fallback."""
+    if _users_col is not None:
+        try:
+            return list(_users_col.find({}, {"_id": 0}))
+        except Exception as e:
+            logger.warning("MongoDB _get_all_users failed: %s", e)
+    return list(_user_db.values())
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -211,18 +240,21 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         upload_str = "❌ TELEGRAM_API_ID / TELEGRAM_API_HASH not set"
 
-    # ── User stats ───────────────────────────────────────────────────────────
-    total_users     = len(_user_db)
-    total_downloads = sum(u["downloads"] for u in _user_db.values())
+    # ── User stats (MongoDB backed) ──────────────────────────────────────────
+    all_users       = _get_all_users()
+    total_users     = len(all_users)
+    total_downloads = sum(u.get("downloads", 0) for u in all_users)
 
     # Top 5 users by downloads
-    top_users = sorted(_user_db.items(), key=lambda x: x[1]["downloads"], reverse=True)[:5]
+    top_users = sorted(all_users, key=lambda x: x.get("downloads", 0), reverse=True)[:5]
     top_str = ""
-    for rank, (uid, info) in enumerate(top_users, 1):
-        uname = f"@{info['username']}" if info["username"] else info["name"]
-        top_str += f"  {rank}. {uname} \u2014 <code>{info['downloads']}</code> downloads\n"
+    for rank, info in enumerate(top_users, 1):
+        uname = f"@{info['username']}" if info.get("username") else info.get("name", "Unknown")
+        top_str += f"  {rank}. {uname} \u2014 <code>{info.get('downloads', 0)}</code> downloads\n"
     if not top_str:
         top_str = "  No data yet.\n"
+
+    db_status = "✅ MongoDB" if _users_col is not None else "⚠️ In-memory (MONGO_URI not set)"
 
     msg = (
         "📊 <b>Bot Statistics</b>\n"
@@ -244,6 +276,7 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "💾 <b>Download Folder</b>\n"
         f"  • Files: <code>{file_count}</code>  Size: <code>{dir_mb:.2f} MB</code>\n\n"
         f"📤 <b>Upload engine:</b> {upload_str}\n\n"
+        "🗄 <b>Database:</b> {db_status}\n\n"
         "🍪 <b>Cookies</b>\n"
         f"  • YouTube:   {'✅' if yt_cs['ok'] else '❌'}\n"
         f"  • Instagram: {'✅' if ig_cs['ok'] else '❌'}\n"

@@ -23,7 +23,7 @@ TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
 OWNER_ID          = int(os.environ.get("OWNER_ID", "0")) or None  # Owner user ID for restricted commands
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR = Path("/tmp/downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 COOKIES_FILE    = "cookies.txt"    # YouTube cookies (Netscape format)

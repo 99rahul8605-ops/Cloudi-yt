@@ -134,10 +134,9 @@ def friendly_error(e: Exception) -> str:
         return "🔒 This content is *private* or restricted."
     if "login" in msg or "sign in" in msg or "not a bot" in msg or "confirm" in msg:
         return (
-            "🔒 *Login required or bot-detection triggered.*\n\n"
-            "For YouTube: run /cookiecheck\n"
-            "For Instagram/Facebook: provide cookies via FB_COOKIES env var\n"
-            "For other sites: content may require authentication"
+            "🔒 *YouTube bot-detection triggered.*\n\n"
+            "Please try again — usually works on second attempt.\n"
+            "If problem persists, run /cookiecheck to refresh cookies."
         )
     if "copyright" in msg or "blocked" in msg:
         return "⛔ Blocked due to *copyright restrictions*."

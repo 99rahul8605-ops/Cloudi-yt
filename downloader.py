@@ -200,6 +200,26 @@ async def download_video(url: str, quality: str, status_msg,
     base_opts  = ydl_opts_for(url)
     out_path   = str(DOWNLOAD_DIR / f"{vid_id}_{quality}.%(ext)s")
 
+    # ── 150MB size limit check ────────────────────────────────────────────────
+    MAX_SIZE_BYTES = 150 * 1024 * 1024  # 150 MB
+    if cached_info:
+        filesize = cached_info.get("filesize") or cached_info.get("filesize_approx") or 0
+        if not filesize:
+            # formats se estimate karo
+            fmts = cached_info.get("formats") or []
+            for f in reversed(fmts):
+                s = f.get("filesize") or f.get("filesize_approx") or 0
+                if s:
+                    filesize = s
+                    break
+        if filesize and filesize > MAX_SIZE_BYTES:
+            size_mb = filesize / (1024 * 1024)
+            raise ValueError(
+                f"❌ *File too large!*\n"
+                f"Size: `{size_mb:.1f} MB` — limit is `150 MB`.\n"
+                f"Try a lower quality."
+            )
+
     def _download() -> str:
         last = [0.0]
         import time, asyncio as _asyncio

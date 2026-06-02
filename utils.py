@@ -198,7 +198,34 @@ def get_ytdlp_version() -> str:
 
 # ── Background cleanup worker ─────────────────────────────────────────────────
 
+def cleanup_old_downloads(max_age_minutes: int = 30) -> None:
+    """
+    Redeploy ke baad purani files delete karo.
+    Bot start hote hi downloads folder scan karta hai aur
+    max_age_minutes se purani files turant delete karta hai.
+    """
+    if not DOWNLOAD_DIR.exists():
+        return
+    now = time.time()
+    cutoff = now - (max_age_minutes * 60)
+    deleted = 0
+    for f in DOWNLOAD_DIR.iterdir():
+        if f.is_file():
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink(missing_ok=True)
+                    deleted += 1
+                    logger.info("Startup cleanup deleted old file: %s", f.name)
+            except Exception as exc:
+                logger.warning("Startup cleanup error %s: %s", f, exc)
+    if deleted:
+        logger.info("Startup cleanup: %d old file(s) removed from downloads/", deleted)
+
+
 async def cleanup_worker():
+    # Bot start hote hi purani files clean karo
+    cleanup_old_downloads(max_age_minutes=30)
+
     while True:
         await asyncio.sleep(60)
         now = time.time()

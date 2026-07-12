@@ -514,17 +514,18 @@ def _fetch_via_socialkit(url: str) -> dict | None:
         logger.warning("SocialKit fallback failed: %s", e)
         return None
 
-    # NOTE: field names below match SocialKit's documented response shape.
-    # If they change their API shape, adjust the keys here.
-    dl_url = data.get("download_url") or data.get("url") or data.get("media_url")
+    # NOTE: SocialKit nests results under "data", and the field is
+    # camelCase "downloadUrl" (confirmed against their docs).
+    result = data.get("data", {})
+    dl_url = result.get("downloadUrl")
     if not dl_url:
-        logger.warning("SocialKit fallback: no download_url in response: %s", str(data)[:300])
+        logger.warning("SocialKit fallback: no downloadUrl in response: %s", str(data)[:500])
         return None
 
     return {
         "download_url": dl_url,
-        "caption": data.get("caption", ""),
-        "is_video": data.get("format", "mp4") != "jpg" and data.get("is_video", True),
+        "caption": result.get("title", ""),
+        "is_video": result.get("format", "mp4") != "jpg",
     }
 
 

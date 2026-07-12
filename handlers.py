@@ -473,14 +473,95 @@ def _is_ig_block_error(e: Exception) -> bool:
     return "403" in msg or "graphql" in msg or "fetching post metadata failed" in msg
 
 
+# ── SnapInsta scraping helpers (free, no API key) ─────────────────────────────
+# Ported from a public, tested open-source tool (x404xx/Insta-Down). snapinsta.app
+# obfuscates its response with a small custom JS "cipher" — these two helpers
+# just reimplement that same decode in Python. If snapinsta.app changes its
+# page structure this will start failing; that's expected/acceptable since it's
+# a free, unofficial fallback (see SocialKit fallback below as the paid backup).
+
+def _sk_convert_base(d: str, e: int, f: int) -> str:
+    g = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
+    h, i = g[:e], g[:f]
+    j = sum(h.index(b) * e**c for c, b in enumerate(reversed(d)) if h.index(b) != -1)
+    k = ""
+    while j:
+        k = i[j % f] + k
+        j //= f
+    return k or "0"
+
+
+def _sk_deobfuscate(h: str, n: str, t: int, e: int) -> str:
+    r, i, lh = "", 0, len(h)
+    while i < lh:
+        s = ""
+        while i < lh and h[i] != n[e]:
+            s, i = s + h[i], i + 1
+        s = "".join(str(n.index(c)) for c in s)
+        r += chr(int(_sk_convert_base(s, e, 10)) - t)
+        i += 1
+    return r
+
+
+def _fetch_via_snapinsta(insta_url: str) -> str | None:
+    """
+    Free fallback (no API key, no proxy needed) — scrapes snapinsta.app the
+    same way their own website works. Returns a direct media URL, or None.
+    """
+    import httpx
+
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0 Safari/537.36"),
+    }
+    try:
+        with httpx.Client(headers=headers, timeout=15) as client:
+            # Step 1: grab the CSRF-style token from the homepage
+            resp = client.get("https://snapinsta.app/")
+            resp.raise_for_status()
+            m = re.search(r'name="token" value="(.*?)"', resp.text)
+            if not m:
+                logger.warning("SnapInsta fallback: token not found")
+                return None
+            token = m.group(1)
+
+            # Step 2: submit the Instagram URL
+            resp = client.post(
+                "https://snapinsta.app/action2.php",
+                headers={"Referer": "https://snapinsta.app/"},
+                data={"url": insta_url, "token": token},
+            )
+            resp.raise_for_status()
+            js_code = resp.text
+
+            # Step 3: extract + decode the obfuscated response
+            pattern = r'\("(\w+)",\d+,"(\w+)",(\d+),(\d+),\d+\)'
+            m2 = re.search(pattern, js_code)
+            if not m2:
+                logger.warning("SnapInsta fallback: could not parse response")
+                return None
+            h, n, t, e = m2.groups()
+            t, e = int(t), int(e)
+            html_source = _sk_deobfuscate(h, n, t, e)
+
+            m3 = re.search(r'href=\\"([^\\"]+)\\"', html_source)
+            if not m3 or "snapinsta" not in m3.group(1):
+                logger.warning("SnapInsta fallback: no download link in decoded HTML")
+                return None
+            return m3.group(1)
+    except Exception as e:
+        logger.warning("SnapInsta fallback failed: %s", e)
+        return None
+
+
 def _fetch_via_socialkit(url: str) -> dict | None:
     """
-    Fallback when instaloader gets blocked (403). Uses SocialKit's Instagram
-    Download API, which uses its own infra — not our AWS IP — so it isn't
-    affected by our datacenter-IP block.
+    Last-resort fallback when both instaloader and the free SnapInsta scrape
+    fail. Uses SocialKit's Instagram Download API (own infra, not our AWS IP).
 
-    Requires SOCIALKIT_ACCESS_KEY env var (free tier available at socialkit.dev).
-    Returns {"download_url": ..., "caption": ..., "is_video": bool} or None.
+    Requires SOCIALKIT_ACCESS_KEY env var (free tier: 20 requests/month at
+    socialkit.dev). Returns {"download_url": ..., "caption": ..., "is_video": bool} or None.
     """
     import json
     import urllib.request as _ur
@@ -686,15 +767,29 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         logger.warning("instaloader download blocked, trying SocialKit fallback: %s", e)
 
     # ── Fallback: instaloader got blocked (403) at either step above.
-    # Try SocialKit's Instagram Download API instead — it uses its own
-    # infra so our AWS IP being flagged doesn't matter here.
+    # 1) Try the free SnapInsta scrape first (no key, no limit, less reliable).
+    # 2) If that also fails, try SocialKit (needs API key, 20 free req/month).
     if not files:
         await msg.edit_text(
             f"📸 *{title}*\n\n⚠️ Instagram blocked the direct request — trying fallback…",
             parse_mode=ParseMode.MARKDOWN,
         )
 
-        def _fetch_fallback():
+        def _fetch_free_fallback():
+            dl_url = _fetch_via_snapinsta(url)
+            if not dl_url:
+                return []
+            dest = DOWNLOAD_DIR / f"{shortcode}_fallback.mp4"
+            _download_file(dl_url, dest)
+            return [str(dest)]
+
+        try:
+            files = await loop.run_in_executor(None, _fetch_free_fallback)
+        except Exception as e:
+            logger.warning("SnapInsta fallback download error: %s", e)
+
+    if not files:
+        def _fetch_paid_fallback():
             result = _fetch_via_socialkit(url)
             if not result:
                 return []
@@ -703,13 +798,13 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             return [str(dest)]
 
         try:
-            files = await loop.run_in_executor(None, _fetch_fallback)
+            files = await loop.run_in_executor(None, _fetch_paid_fallback)
         except Exception as e:
             logger.error("SocialKit fallback download error: %s", e)
 
     if not files:
         await msg.edit_text(
-            "❌ *Instagram blocked this download and the fallback also failed.*\n\n"
+            "❌ *Instagram blocked this download and all fallbacks also failed.*\n\n"
             "This usually means the server's IP is flagged by Instagram. "
             "Setting `IG_PROXY` (residential proxy) or `SOCIALKIT_ACCESS_KEY` "
             "(see /cookiecheck) can fix this.",

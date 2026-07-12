@@ -467,6 +467,44 @@ def _make_insta_loader():
     return L
 
 
+def _fetch_via_ytdlp(insta_url: str) -> list[str]:
+    """
+    Preferred method — yt-dlp's Instagram extractor doesn't hit the
+    graphql/query endpoint that's getting 403'd, so it works even when
+    instaloader is blocked. Uses the same ig_cookies.txt. Works well for
+    reels/videos; may not catch every carousel/photo post (instaloader
+    remains the fallback for those).
+    """
+    import yt_dlp as _ytdlp
+
+    ig_cookie_file = Path("ig_cookies.txt")
+    outtmpl = str(DOWNLOAD_DIR / "%(id)s_ytdlp.%(ext)s")
+
+    ydl_opts = {
+        "outtmpl": outtmpl,
+        "quiet": True,
+        "no_warnings": True,
+        "merge_output_format": "mp4",
+    }
+    if ig_cookie_file.exists():
+        ydl_opts["cookiefile"] = str(ig_cookie_file)
+
+    with _ytdlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(insta_url, download=True)
+        entries = info.get("entries") if info.get("_type") == "playlist" else [info]
+
+        files = []
+        for entry in entries:
+            if not entry:
+                continue
+            fp = Path(ydl.prepare_filename(entry))
+            if not fp.exists():
+                fp = fp.with_suffix(".mp4")  # merge_output_format may change extension
+            if fp.exists():
+                files.append(str(fp))
+        return files
+
+
 def _is_ig_block_error(e: Exception) -> bool:
     """True if the exception looks like an Instagram-side block (403/graphql)."""
     msg = str(e).lower()
@@ -695,6 +733,40 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         return
 
     await msg.edit_text("📸 *Instagram* — fetching info…", parse_mode=ParseMode.MARKDOWN)
+
+    # ── Try yt-dlp first — it doesn't hit the blocked graphql endpoint,
+    # so it works even when instaloader gets a 403.
+    def _try_ytdlp():
+        try:
+            return _fetch_via_ytdlp(url)
+        except Exception as e:
+            logger.warning("yt-dlp Instagram fetch failed, falling back to instaloader: %s", e)
+            return []
+
+    ytdlp_files = await loop.run_in_executor(None, _try_ytdlp)
+    if ytdlp_files:
+        title = f"Instagram post {shortcode}"
+        uploaded = 0
+        for i, fpath in enumerate(ytdlp_files, 1):
+            p = Path(fpath)
+            if not p.exists() or p.stat().st_size < 100:
+                continue
+            try:
+                await msg.edit_text(f"📤 Uploading {i}/{len(ytdlp_files)}…", parse_mode=ParseMode.MARKDOWN)
+                ext = p.suffix.lower()
+                await send_file(
+                    chat_id=chat_id, filepath=fpath, filename=p.name,
+                    caption="", status_msg=msg, is_video=ext in {".mp4", ".mov"},
+                )
+                register_for_cleanup(fpath, get_settings(uid)["cleanup_minutes"])
+                uploaded += 1
+            except Exception as e:
+                logger.error("yt-dlp upload error: %s", e, exc_info=True)
+        if uploaded:
+            _inc_download(uid)
+            await msg.edit_text("✅ *Done!*", parse_mode=ParseMode.MARKDOWN)
+            return
+        # If nothing actually uploaded, fall through to instaloader path below.
 
     def _fetch():
         L = _make_insta_loader()

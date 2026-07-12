@@ -467,6 +467,42 @@ def _make_insta_loader():
     return L
 
 
+def _embed_scrape(shortcode: str) -> dict | None:
+    """
+    Fallback used only when instaloader's graphql/query call is blocked (403).
+    Scrapes Instagram's public embed page, which is served from a different
+    endpoint than graphql/query and is sometimes still reachable even when
+    graphql is IP-blocked (it's designed to be publicly embeddable, e.g. on
+    blogs). LIMITATIONS: only works for single public video/image posts —
+    does NOT support carousels, private posts, or stories.
+    """
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    }
+    for path in (f"/reel/{shortcode}/embed/captioned/", f"/p/{shortcode}/embed/captioned/"):
+        url = f"https://www.instagram.com{path}"
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+        except Exception as e:
+            logger.warning("embed fallback fetch failed (%s): %s", path, e)
+            continue
+
+        vid_m = re.search(r'"video_url":"([^"]+)"', html)
+        img_m = re.search(r'"display_url":"([^"]+)"', html)
+        if not vid_m and not img_m:
+            continue
+
+        video_url = vid_m.group(1).replace('\\/', '/') if vid_m else None
+        image_url = img_m.group(1).replace('\\/', '/') if img_m else None
+        logger.info("embed fallback: got media for %s (video=%s)", shortcode, bool(video_url))
+        return {"video_url": video_url, "image_url": image_url,
+                "is_video": bool(video_url), "caption": ""}
+    return None
+
+
 async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                        url: str, msg):
     """Handle all Instagram URLs — yt-dlp for video/reels, instaloader for images."""
@@ -548,10 +584,22 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 
     def _fetch():
         L = _make_insta_loader()
-        return instaloader.Post.from_shortcode(L.context, shortcode)
+        try:
+            post = instaloader.Post.from_shortcode(L.context, shortcode)
+            return {"mode": "instaloader", "post": post}
+        except instaloader.exceptions.LoginRequiredException:
+            raise
+        except Exception as e:
+            err_l = str(e).lower()
+            if "403" in err_l or "graphql" in err_l or "metadata failed" in err_l:
+                logger.warning("instaloader graphql blocked (%s) — trying embed fallback", e)
+                fb = _embed_scrape(shortcode)
+                if fb:
+                    return {"mode": "embed", "data": fb}
+            raise
 
     try:
-        post = await loop.run_in_executor(None, _fetch)
+        result = await loop.run_in_executor(None, _fetch)
     except instaloader.exceptions.LoginRequiredException:
         await msg.edit_text(
             "🔒 *Followers-only or private post.*\nThe bot's Instagram account must follow this user.",
@@ -562,13 +610,21 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
         return
 
-    is_video    = post.is_video
-    is_carousel = post.typename == "GraphSidecar"
-    caption     = (post.caption or "")[:80].replace("*","").replace("`","").strip()
-    title       = caption or f"Instagram post {shortcode}"
+    if result["mode"] == "instaloader":
+        post        = result["post"]
+        is_video    = post.is_video
+        is_carousel = post.typename == "GraphSidecar"
+        caption     = (post.caption or "")[:80].replace("*","").replace("`","").strip()
+    else:
+        is_video    = result["data"]["is_video"]
+        is_carousel = False
+        caption     = ""
+    title = caption or f"Instagram post {shortcode}"
 
     # ── Step 2: Download everything via instaloader (videos, reels, images, carousels)
     # yt-dlp is NOT used for Instagram — Instagram blocks its GraphQL endpoint (403).
+    # If graphql was blocked, `result["mode"] == "embed"` and we download the
+    # media URL directly instead (single video/image only — no carousel support).
     await msg.edit_text(
         f"📸 *{title}*\n\n⬇️ Downloading…",
         parse_mode=ParseMode.MARKDOWN,
@@ -576,6 +632,23 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 
     def _download_all():
         import shutil
+
+        if result["mode"] == "embed":
+            data      = result["data"]
+            media_url = data.get("video_url") or data.get("image_url")
+            if not media_url:
+                return []
+            ext  = ".mp4" if data["is_video"] else ".jpg"
+            dest = DOWNLOAD_DIR / f"{shortcode}{ext}"
+            req  = urllib.request.Request(media_url, headers={
+                "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+            })
+            with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "wb") as out:
+                shutil.copyfileobj(resp, out)
+            logger.info("embed fallback: downloaded %s (size=%d)", dest.name, dest.stat().st_size)
+            return [str(dest)]
+
         L2 = _make_insta_loader()
         post2 = instaloader.Post.from_shortcode(L2.context, shortcode)
 

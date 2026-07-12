@@ -421,6 +421,15 @@ def _make_insta_loader():
         quiet=True,
     )
 
+    # Optional proxy — Instagram frequently 403s the graphql/query endpoint for
+    # datacenter/cloud IPs (Render, Railway, etc.) even with valid session cookies.
+    # Set IG_PROXY to a residential/mobile proxy URL to route around this, e.g.:
+    #   IG_PROXY=http://user:pass@proxy-host:port
+    ig_proxy = os.environ.get("IG_PROXY", "").strip()
+    if ig_proxy:
+        L.context._session.proxies.update({"http": ig_proxy, "https": ig_proxy})
+        logger.info("instaloader: using proxy %s", ig_proxy.split("@")[-1])
+
     if ig_cookie_file.exists():
         try:
             # Load cookies into the session

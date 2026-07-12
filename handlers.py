@@ -421,6 +421,15 @@ def _make_insta_loader():
         quiet=True,
     )
 
+    # ── Route requests through a proxy (fixes 403s from datacenter/cloud IPs
+    # like AWS/Railway — Instagram trusts residential IPs far more).
+    # Set IG_PROXY env var to something like:
+    #   http://user:pass@proxyhost:port
+    ig_proxy = os.environ.get("IG_PROXY", "").strip()
+    if ig_proxy:
+        L.context._session.proxies.update({"http": ig_proxy, "https": ig_proxy})
+        logger.info("instaloader: using proxy for requests")
+
     if ig_cookie_file.exists():
         try:
             # Load cookies into the session
@@ -456,6 +465,74 @@ def _make_insta_loader():
         logger.warning("instaloader: ig_cookies.txt not found")
 
     return L
+
+
+def _is_ig_block_error(e: Exception) -> bool:
+    """True if the exception looks like an Instagram-side block (403/graphql)."""
+    msg = str(e).lower()
+    return "403" in msg or "graphql" in msg or "fetching post metadata failed" in msg
+
+
+def _fetch_via_socialkit(url: str) -> dict | None:
+    """
+    Fallback when instaloader gets blocked (403). Uses SocialKit's Instagram
+    Download API, which uses its own infra — not our AWS IP — so it isn't
+    affected by our datacenter-IP block.
+
+    Requires SOCIALKIT_ACCESS_KEY env var (free tier available at socialkit.dev).
+    Returns {"download_url": ..., "caption": ..., "is_video": bool} or None.
+    """
+    import json
+    import urllib.request as _ur
+    import urllib.error as _ue
+
+    access_key = os.environ.get("SOCIALKIT_ACCESS_KEY", "").strip()
+    if not access_key:
+        logger.warning("SocialKit fallback skipped: SOCIALKIT_ACCESS_KEY not set")
+        return None
+
+    payload = json.dumps({
+        "access_key": access_key,
+        "url": url,
+        "format": "mp4",
+        "quality": "720p",
+    }).encode()
+
+    req = _ur.Request(
+        "https://api.socialkit.dev/instagram/download",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with _ur.urlopen(req, timeout=25) as resp:
+            data = json.loads(resp.read().decode())
+    except _ue.HTTPError as e:
+        logger.warning("SocialKit fallback HTTP error: %s — %s", e.code, e.read()[:300])
+        return None
+    except Exception as e:
+        logger.warning("SocialKit fallback failed: %s", e)
+        return None
+
+    # NOTE: field names below match SocialKit's documented response shape.
+    # If they change their API shape, adjust the keys here.
+    dl_url = data.get("download_url") or data.get("url") or data.get("media_url")
+    if not dl_url:
+        logger.warning("SocialKit fallback: no download_url in response: %s", str(data)[:300])
+        return None
+
+    return {
+        "download_url": dl_url,
+        "caption": data.get("caption", ""),
+        "is_video": data.get("format", "mp4") != "jpg" and data.get("is_video", True),
+    }
+
+
+def _download_file(url: str, dest: Path) -> None:
+    """Plain HTTP(S) download of a direct media URL to a local file."""
+    import urllib.request as _ur
+    with _ur.urlopen(url, timeout=60) as resp, open(dest, "wb") as f:
+        f.write(resp.read())
 
 
 async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
@@ -541,8 +618,11 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         L = _make_insta_loader()
         return instaloader.Post.from_shortcode(L.context, shortcode)
 
+    title = f"Instagram post {shortcode}"
+    post  = None
     try:
         post = await loop.run_in_executor(None, _fetch)
+        title = (post.caption or "")[:80].replace("*", "").replace("`", "").strip() or title
     except instaloader.exceptions.LoginRequiredException:
         await msg.edit_text(
             "🔒 *Followers-only or private post.*\nThe bot's Instagram account must follow this user.",
@@ -550,16 +630,14 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         )
         return
     except Exception as e:
-        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
-        return
-
-    is_video    = post.is_video
-    is_carousel = post.typename == "GraphSidecar"
-    caption     = (post.caption or "")[:80].replace("*","").replace("`","").strip()
-    title       = caption or f"Instagram post {shortcode}"
+        if not _is_ig_block_error(e):
+            await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+            return
+        # 403 / graphql block — instaloader metadata fetch itself is blocked.
+        # Fall straight through to the SocialKit fallback below.
+        logger.warning("instaloader metadata fetch blocked, trying SocialKit fallback: %s", e)
 
     # ── Step 2: Download everything via instaloader (videos, reels, images, carousels)
-    # yt-dlp is NOT used for Instagram — Instagram blocks its GraphQL endpoint (403).
     await msg.edit_text(
         f"📸 *{title}*\n\n⬇️ Downloading…",
         parse_mode=ParseMode.MARKDOWN,
@@ -596,16 +674,44 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         logger.info("instaloader: total %d file(s)", len(media))
         return media
 
+    files = []
     try:
         files = await loop.run_in_executor(None, _download_all)
     except Exception as e:
-        logger.error("instaloader download error: %s", e)
-        await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
-        return
+        if not _is_ig_block_error(e):
+            logger.error("instaloader download error: %s", e)
+            await msg.edit_text(friendly_error(e), parse_mode=ParseMode.MARKDOWN)
+            return
+        logger.warning("instaloader download blocked, trying SocialKit fallback: %s", e)
+
+    # ── Fallback: instaloader got blocked (403) at either step above.
+    # Try SocialKit's Instagram Download API instead — it uses its own
+    # infra so our AWS IP being flagged doesn't matter here.
+    if not files:
+        await msg.edit_text(
+            f"📸 *{title}*\n\n⚠️ Instagram blocked the direct request — trying fallback…",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+        def _fetch_fallback():
+            result = _fetch_via_socialkit(url)
+            if not result:
+                return []
+            dest = DOWNLOAD_DIR / f"{shortcode}_fallback{'.mp4' if result['is_video'] else '.jpg'}"
+            _download_file(result["download_url"], dest)
+            return [str(dest)]
+
+        try:
+            files = await loop.run_in_executor(None, _fetch_fallback)
+        except Exception as e:
+            logger.error("SocialKit fallback download error: %s", e)
 
     if not files:
         await msg.edit_text(
-            "❌ No images downloaded.\nThe post may be private or removed.",
+            "❌ *Instagram blocked this download and the fallback also failed.*\n\n"
+            "This usually means the server's IP is flagged by Instagram. "
+            "Setting `IG_PROXY` (residential proxy) or `SOCIALKIT_ACCESS_KEY` "
+            "(see /cookiecheck) can fix this.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return

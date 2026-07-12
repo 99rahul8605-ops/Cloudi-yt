@@ -120,13 +120,9 @@ def friendly_error(e: Exception) -> str:
         return "❌ *No downloadable formats found.* The content may be private or region-locked."
     if "fetching post metadata failed" in msg or "403" in msg or "graphql" in msg:
         return (
-            "❌ *Instagram blocked this request (403).*\n\n"
-            "This is usually Instagram rate-limiting or blocking the server's "
-            "IP address on its graphql endpoint — it happens even with valid, "
-            "freshly-logged-in cookies, so re-uploading cookies alone often "
-            "won't fix it.\n\n"
-            "Try again in a few minutes, or ask the bot owner to route "
-            "Instagram requests through a residential/mobile proxy."
+            "❌ *Instagram blocked the request.*\n\n"
+            "This usually means the cookies are expired or invalid.\n"
+            "Please update your Instagram cookies and try again."
         )
     if "only available for registered users who follow" in msg or "follow this account" in msg:
         return (

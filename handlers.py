@@ -467,7 +467,7 @@ def _make_insta_loader():
     return L
 
 
-def _fetch_via_ytdlp(insta_url: str) -> list[str]:
+def _fetch_via_ytdlp(insta_url: str) -> tuple[list[str], str]:
     """
     Preferred method — yt-dlp's Instagram extractor doesn't hit the
     graphql/query endpoint that's getting 403'd, so it works even when
@@ -493,6 +493,10 @@ def _fetch_via_ytdlp(insta_url: str) -> list[str]:
         info = ydl.extract_info(insta_url, download=True)
         entries = info.get("entries") if info.get("_type") == "playlist" else [info]
 
+        # Instagram's caption comes through as "description" (title is often
+        # just a generic "Post by <user>" string).
+        caption = (info.get("description") or info.get("title") or "").strip()
+
         files = []
         for entry in entries:
             if not entry:
@@ -502,7 +506,7 @@ def _fetch_via_ytdlp(insta_url: str) -> list[str]:
                 fp = fp.with_suffix(".mp4")  # merge_output_format may change extension
             if fp.exists():
                 files.append(str(fp))
-        return files
+        return files, caption
 
 
 def _is_ig_block_error(e: Exception) -> bool:
@@ -741,11 +745,12 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             return _fetch_via_ytdlp(url)
         except Exception as e:
             logger.warning("yt-dlp Instagram fetch failed, falling back to instaloader: %s", e)
-            return []
+            return [], ""
 
-    ytdlp_files = await loop.run_in_executor(None, _try_ytdlp)
+    ytdlp_files, ytdlp_caption = await loop.run_in_executor(None, _try_ytdlp)
     if ytdlp_files:
-        title = f"Instagram post {shortcode}"
+        # Telegram caption limit is 1024 chars; keep it safely under that.
+        caption_text = (ytdlp_caption or "")[:1000]
         uploaded = 0
         for i, fpath in enumerate(ytdlp_files, 1):
             p = Path(fpath)
@@ -756,7 +761,7 @@ async def insta_handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                 ext = p.suffix.lower()
                 await send_file(
                     chat_id=chat_id, filepath=fpath, filename=p.name,
-                    caption="", status_msg=msg, is_video=ext in {".mp4", ".mov"},
+                    caption=caption_text, status_msg=msg, is_video=ext in {".mp4", ".mov"},
                 )
                 register_for_cleanup(fpath, get_settings(uid)["cleanup_minutes"])
                 uploaded += 1

@@ -484,6 +484,7 @@ def _fetch_via_ytdlp(insta_url: str) -> tuple[list[str], str]:
         "outtmpl": outtmpl,
         "quiet": True,
         "no_warnings": True,
+        "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
     }
     if ig_cookie_file.exists():

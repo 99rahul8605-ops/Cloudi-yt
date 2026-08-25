@@ -117,8 +117,10 @@ def fix_audio_only(filepath: str) -> str:
         logger.info("[FFMPEG] %s — vcodec=%s acodec=%s size=%.1f MB",
                     p.name, vcodec or "?", acodec or "?", src_mb)
 
-        # Already compatible
-        if acodec in ("aac", "mp3", ""):
+        # Already compatible (only when an audio stream actually exists —
+        # an empty acodec means no audio track at all, which must fall
+        # through to the silent-track-add logic below, not be treated as OK)
+        if as_ and acodec in ("aac", "mp3"):
             logger.info("[FFMPEG] audio already compatible, uploading directly")
             return filepath
 

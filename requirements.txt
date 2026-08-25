@@ -4,3 +4,4 @@ pyrogram
 tgcrypto
 instaloader
 dotenv
+motor

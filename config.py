@@ -20,6 +20,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress httpx/httpcore INFO logs — they print full request URLs,
+# which include the bot token (e.g. https://api.telegram.org/bot<TOKEN>/getMe).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # ── Telegram credentials ──────────────────────────────────────────────────────
 BOT_TOKEN         = os.environ["BOT_TOKEN"]
 TELEGRAM_API_ID   = int(os.environ.get("TELEGRAM_API_ID", "0"))

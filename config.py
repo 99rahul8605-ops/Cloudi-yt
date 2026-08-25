@@ -10,6 +10,8 @@ from pathlib import Path
 from pyrogram import Client as PyroClient
 from pymongo import MongoClient
 from pymongo import MongoClient
+from dotenv import load_dotenv
+load_dotenv()
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(

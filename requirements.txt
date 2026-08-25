@@ -3,3 +3,4 @@ yt-dlp[default]
 pyrogram
 tgcrypto
 instaloader
+dotenv

@@ -89,13 +89,23 @@ def get_video_meta(filepath: str) -> dict:
 
 def fix_audio_only(filepath: str) -> str:
     """
-    Fix audio codec if incompatible with Telegram (opus/vorbis → aac).
-    Video stream is NEVER re-encoded — only audio is transcoded.
+    Fix audio codec if incompatible with Telegram (opus/vorbis → aac), and
+    always ensure the moov atom is at the front of the file (-movflags
+    +faststart).
 
-    No -movflags +faststart: that flag rewrites the entire file to relocate
-    the moov atom, which takes minutes on large files. Omitting it keeps this
-    step to ~5-15 seconds regardless of video resolution or file size.
-    Telegram uploads work fine without faststart.
+    Why faststart matters even when the audio codec is already fine:
+    Telegram plays videos via progressive/streaming reads from its CDN.
+    If the moov atom (which indexes both video AND audio tracks) sits at
+    the END of the file — the default when yt-dlp/ffmpeg merge with
+    "-c copy" — some Telegram clients start rendering before that index
+    has downloaded, and silently drop the audio track even though the
+    file is 100% intact (ffprobe reads the whole file, so it always sees
+    the audio fine — this is a client-side streaming quirk, not a
+    missing/corrupt audio stream).
+
+    This remux is a stream-copy (-c copy), so it's fast — a few seconds
+    even near the bot's 150MB size limit, not "minutes" — since ffmpeg
+    only rewrites container structure, not audio/video data.
     """
     try:
         p = Path(filepath)
@@ -117,15 +127,32 @@ def fix_audio_only(filepath: str) -> str:
         logger.info("[FFMPEG] %s — vcodec=%s acodec=%s size=%.1f MB",
                     p.name, vcodec or "?", acodec or "?", src_mb)
 
-        # Already compatible (only when an audio stream actually exists —
-        # an empty acodec means no audio track at all, which must fall
-        # through to the silent-track-add logic below, not be treated as OK)
+        timeout = max(60, int(src_mb * 2))
+
+        # Already compatible audio-wise (only when an audio stream actually
+        # exists — an empty acodec means no audio track at all, which must
+        # fall through to the silent-track-add logic below). Still needs a
+        # faststart remux for reliable playback with audio on Telegram.
         if as_ and acodec in ("aac", "mp3"):
-            logger.info("[FFMPEG] audio already compatible, uploading directly")
+            out_path = str(p.parent / (p.stem + "_fs.mp4"))
+            cmd = [
+                "ffmpeg", "-y", "-i", filepath,
+                "-c", "copy", "-movflags", "+faststart",
+                out_path,
+            ]
+            logger.info("[FFMPEG] audio codec OK — remuxing for faststart only")
+            rc = subprocess.call(cmd, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, timeout=timeout)
+            if rc == 0 and Path(out_path).exists():
+                logger.info("[FFMPEG] faststart remux OK (%.1f MB → %.1f MB)",
+                            src_mb, Path(out_path).stat().st_size / 1024**2)
+                try: p.unlink()
+                except Exception: pass
+                return out_path
+            logger.warning("[FFMPEG] faststart remux failed (rc=%d), uploading original", rc)
             return filepath
 
         out_path = str(p.parent / (p.stem + "_fix.mp4"))
-        timeout  = max(120, int(src_mb * 2))
 
         if not as_:
             # No audio — add silent AAC track so Telegram doesn't convert to GIF
@@ -134,6 +161,7 @@ def fix_audio_only(filepath: str) -> str:
                 "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
                 "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
                 "-map", "0:v:0", "-map", "1:a:0", "-shortest",
+                "-movflags", "+faststart",
                 out_path,
             ]
         else:
@@ -141,10 +169,11 @@ def fix_audio_only(filepath: str) -> str:
                 "ffmpeg", "-y", "-i", filepath,
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
                 out_path,
             ]
 
-        logger.info("[FFMPEG] audio fix: %s → aac (video stream-copy, no faststart)", acodec)
+        logger.info("[FFMPEG] audio fix: %s → aac (video stream-copy + faststart)", acodec)
         rc = subprocess.call(cmd, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, timeout=timeout)
 
